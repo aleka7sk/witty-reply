@@ -113,6 +113,66 @@ CREATE TABLE IF NOT EXISTS generations (
 
 CREATE INDEX IF NOT EXISTS idx_generations_user_created ON generations (telegram_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS thread_drafts (
+    id BIGSERIAL PRIMARY KEY,
+    telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+    voice TEXT NOT NULL CHECK (voice IN ('belcanto', 'alisher')),
+    goal TEXT NOT NULL CHECK (char_length(btrim(goal)) BETWEEN 1 AND 120),
+    preview_text TEXT NOT NULL CHECK (
+        char_length(btrim(preview_text)) >= 1
+        AND char_length(preview_text) <= 500
+    ),
+    provider TEXT NOT NULL CHECK (char_length(btrim(provider)) BETWEEN 1 AND 100),
+    model TEXT NOT NULL CHECK (char_length(btrim(model)) BETWEEN 1 AND 160),
+    revision BIGINT NOT NULL CHECK (revision > 0 AND revision <= 4294967295),
+    state TEXT NOT NULL DEFAULT 'draft'
+        CHECK (state IN ('draft', 'publishing', 'published', 'failed', 'unknown', 'cancelled')),
+    is_current BOOLEAN NOT NULL DEFAULT TRUE,
+    container_id TEXT NOT NULL DEFAULT '' CHECK (char_length(container_id) <= 255),
+    post_id TEXT NOT NULL DEFAULT '' CHECK (char_length(post_id) <= 255),
+    permalink TEXT NOT NULL DEFAULT '' CHECK (char_length(permalink) <= 2048),
+    error_code TEXT NOT NULL DEFAULT '' CHECK (char_length(error_code) <= 160),
+    claim_token TEXT NOT NULL DEFAULT '' CHECK (char_length(claim_token) <= 128),
+    claim_expires_at TIMESTAMPTZ,
+    publish_started_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at TIMESTAMPTZ,
+    CHECK (
+        (state = 'published' AND published_at IS NOT NULL)
+        OR (state <> 'published' AND published_at IS NULL)
+    )
+);
+
+-- The migration is intentionally idempotent because v2 installations rerun
+-- this file at startup. Existing pre-recovery tables gain the fencing fields
+-- without requiring a destructive migration.
+ALTER TABLE thread_drafts
+    ADD COLUMN IF NOT EXISTS claim_token TEXT NOT NULL DEFAULT '';
+ALTER TABLE thread_drafts
+    ADD COLUMN IF NOT EXISTS claim_expires_at TIMESTAMPTZ;
+ALTER TABLE thread_drafts
+    ADD COLUMN IF NOT EXISTS publish_started_at TIMESTAMPTZ;
+
+-- A row left in the old unphased publishing state cannot prove whether Meta
+-- was called. Fail closed once during upgrade instead of blindly retrying it.
+UPDATE thread_drafts
+SET state = 'unknown', error_code = 'legacy_publish_interrupted',
+    claim_token = '', claim_expires_at = NULL, updated_at = now()
+WHERE state = 'publishing'
+  AND (claim_token = '' OR claim_expires_at IS NULL);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_thread_drafts_one_current_per_user
+    ON thread_drafts (telegram_id)
+    WHERE is_current;
+
+CREATE INDEX IF NOT EXISTS idx_thread_drafts_user_recent
+    ON thread_drafts (telegram_id, created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_thread_drafts_publish_lease
+    ON thread_drafts (claim_expires_at)
+    WHERE state = 'publishing';
+
 CREATE TABLE IF NOT EXISTS feedback (
     id BIGSERIAL PRIMARY KEY,
     generation_id BIGINT NOT NULL REFERENCES generations(id) ON DELETE CASCADE,

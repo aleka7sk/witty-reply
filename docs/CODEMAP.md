@@ -22,10 +22,16 @@ The signed callback chooses `reply` or `comment`, starts a new revision, and sen
 
 Feedback is explicit: Telegram does not reveal native copy-button clicks. A positive or negative callback is stored against the generation only after ownership is checked. Saving a candidate as “my style” is a separate explicit action for reply mode. Comment keyboards omit this global save action so public-joke examples cannot contaminate private-reply style.
 
+## When `/threads` is used
+
+The Belcanto workspace is separate from ordinary reply/comment sessions and quotas. The command first verifies the exact Telegram-ID operator allowlist and normal consent. A dedicated AI contract chooses an evergreen premise and returns one Russian WYSIWYG post; it knows only that Belcanto is a vocal school in Astana. A semantic validator blocks digits, invented mutable facts, direct sales pressure, repetition, and text over 500 Unicode characters.
+
+Every optional refinement writes a new durable revision and makes the previous signed keyboard stale. Pressing `✅ Опубликовать` atomically claims the current owner/revision with a short token-fenced lease before any external call. The Threads adapter creates a text container with the exact preview, stores the container ID, waits for readiness, and writes a separate attempt marker immediately before publishing. An expired lease before that marker can be reclaimed safely; after the marker, only a later `PUBLISHED` status can prove success. Otherwise the draft becomes `unknown`, and the publish request is not repeated. This keeps double taps, stale workers, redelivery, and process crashes from creating a duplicate.
+
 ## When data is deleted
 
-The user confirms deletion through a signed callback. Active in-memory context is cancelled, and PostgreSQL cascades deletion through generations, feedback, usage, entitlements, and style examples. The bot sends confirmation only after deletion succeeds.
+The user confirms deletion through a signed callback. Active in-memory context is cancelled, and PostgreSQL cascades deletion through generations, feedback, usage, entitlements, style examples, and Belcanto Threads drafts. The bot sends confirmation only after deletion succeeds.
 
 ## How AI providers differ
 
-Anthropic Messages API is the production path. Claude CLI exists for local/internal evaluation and uses one isolated subprocess per request, structured output, no session persistence, and no tools except read-only access to a per-request temporary image when needed. The fake provider makes tests and first-run smoke checks deterministic while still separating reply/comment output and reacting to every refinement/revision.
+Anthropic Messages API is the production path. It exposes independent structured contracts for three-candidate reply/comment generation and the one-post Belcanto editor. Claude CLI exists for local/internal reply/comment evaluation and uses one isolated subprocess per request, structured output, no session persistence, and no tools except read-only access to a per-request temporary image when needed. The fake providers make tests and first-run smoke checks deterministic, including a no-network Threads publication path.

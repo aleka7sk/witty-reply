@@ -46,10 +46,21 @@ type Provider interface {
 	Generate(context.Context, domain.GenerationRequest) (domain.GenerationResult, error)
 }
 
+// ThreadPostGenerator is deliberately separate from Provider. A Threads post
+// is first-party Belcanto content, not a reply to a person or a comment under
+// somebody else's publication, so it must never inherit Witty Reply's social
+// mode classification or prompt contract.
+type ThreadPostGenerator interface {
+	GenerateThreadPost(context.Context, ThreadPostRequest) (ThreadPostResult, error)
+}
+
 var (
 	_ Provider = (*AnthropicProvider)(nil)
 	_ Provider = (*ClaudeCLIProvider)(nil)
 	_ Provider = (*FakeProvider)(nil)
+
+	_ ThreadPostGenerator = (*AnthropicProvider)(nil)
+	_ ThreadPostGenerator = (*FakeProvider)(nil)
 )
 
 // ProviderError is safe to inspect with errors.As.  It intentionally does not

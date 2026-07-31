@@ -21,6 +21,7 @@ import (
 	"github.com/aleka7sk/witty-reply/internal/session"
 	"github.com/aleka7sk/witty-reply/internal/store"
 	"github.com/aleka7sk/witty-reply/internal/telegram"
+	threadspub "github.com/aleka7sk/witty-reply/internal/threads"
 	"github.com/aleka7sk/witty-reply/internal/transcribe"
 )
 
@@ -74,6 +75,10 @@ func runContext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	threadsPublisher, err := buildThreadsPublisher(cfg)
+	if err != nil {
+		return err
+	}
 	transcriber, err := buildTranscriber(cfg)
 	if err != nil {
 		return err
@@ -102,6 +107,7 @@ func runContext(ctx context.Context) error {
 		bot.Config{
 			ProviderTimeout: cfg.AI.Timeout, UsageLocation: usageLocation, CallbackSecret: cfg.Telegram.CallbackSecret,
 			PrivacyURL: cfg.PrivacyURL, SpeechProvider: cfg.Speech.Provider,
+			BelcantoOperatorIDs: cfg.Belcanto.OperatorIDs, ThreadsPublisher: threadsPublisher,
 			Limits: bot.Limits{
 				TextDaily: cfg.Limits.TextDaily, MediaDaily: cfg.Limits.MediaDaily, MemeDaily: cfg.Limits.MemeDaily,
 				RefinementDaily: cfg.Limits.RefinementDaily, StyleExamples: cfg.Limits.StyleExamples,
@@ -225,6 +231,26 @@ func buildProvider(cfg config.Config) (ai.Provider, error) {
 		return provider, nil
 	default:
 		return nil, fmt.Errorf("unknown AI provider %q", cfg.AI.Provider)
+	}
+}
+
+func buildThreadsPublisher(cfg config.Config) (threadspub.Publisher, error) {
+	switch cfg.Belcanto.ThreadsProvider {
+	case "disabled":
+		return threadspub.NewDisabled(), nil
+	case "fake":
+		return threadspub.NewFake(), nil
+	case "meta":
+		publisher, err := threadspub.NewMeta(threadspub.Config{
+			UserID: cfg.Belcanto.ThreadsUserID, AccessToken: cfg.Belcanto.ThreadsAccessToken,
+			BaseURL: cfg.Belcanto.ThreadsBaseURL, Timeout: cfg.Belcanto.ThreadsTimeout,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create Threads publisher: %w", err)
+		}
+		return publisher, nil
+	default:
+		return nil, fmt.Errorf("unknown Threads provider %q", cfg.Belcanto.ThreadsProvider)
 	}
 }
 

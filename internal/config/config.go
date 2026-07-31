@@ -15,7 +15,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const productionTelegramAPIHost = "api.telegram.org"
+const (
+	productionTelegramAPIHost = "api.telegram.org"
+	productionThreadsAPIHost  = "graph.threads.net"
+)
 
 type Config struct {
 	Environment string
@@ -29,6 +32,7 @@ type Config struct {
 	Limits   Limits
 	Meme     Meme
 	Speech   Speech
+	Belcanto Belcanto
 }
 
 type Telegram struct {
@@ -100,10 +104,26 @@ type Speech struct {
 	Timeout  time.Duration
 }
 
+// Belcanto configures the operator-only Threads copilot. It is optional so the
+// existing Witty Reply product can run without any Meta credentials.
+type Belcanto struct {
+	OperatorIDs        []int64
+	ThreadsProvider    string
+	ThreadsUserID      string
+	ThreadsAccessToken string
+	ThreadsBaseURL     string
+	ThreadsTimeout     time.Duration
+}
+
 func Load() (Config, error) {
 	level := slog.LevelInfo
 	if err := level.UnmarshalText([]byte(get("LOG_LEVEL", "info"))); err != nil {
 		return Config{}, fmt.Errorf("LOG_LEVEL: %w", err)
+	}
+
+	operatorIDs, err := int64List("BELCANTO_OPERATOR_IDS")
+	if err != nil {
+		return Config{}, err
 	}
 
 	cfg := Config{
@@ -145,6 +165,12 @@ func Load() (Config, error) {
 		Speech: Speech{
 			Provider: get("SPEECH_PROVIDER", "disabled"), BaseURL: strings.TrimRight(get("SPEECH_BASE_URL", "https://api.openai.com/v1"), "/"),
 			APIKey: get("SPEECH_API_KEY", ""), Model: get("SPEECH_MODEL", "whisper-1"), Timeout: duration("SPEECH_TIMEOUT", 60*time.Second),
+		},
+		Belcanto: Belcanto{
+			OperatorIDs: operatorIDs, ThreadsProvider: strings.ToLower(get("THREADS_PROVIDER", "disabled")),
+			ThreadsUserID: get("THREADS_USER_ID", ""), ThreadsAccessToken: get("THREADS_ACCESS_TOKEN", ""),
+			ThreadsBaseURL: strings.TrimRight(get("THREADS_API_BASE_URL", "https://graph.threads.net/v1.0"), "/"),
+			ThreadsTimeout: duration("THREADS_TIMEOUT", 20*time.Second),
 		},
 	}
 
@@ -219,6 +245,26 @@ func (c Config) Validate() error {
 	if c.Speech.Provider == "openai_compatible" && c.Speech.APIKey == "" {
 		errs = append(errs, errors.New("SPEECH_API_KEY is required for openai_compatible speech"))
 	}
+	switch c.Belcanto.ThreadsProvider {
+	case "disabled", "fake":
+	case "meta":
+		if len(c.Belcanto.OperatorIDs) == 0 {
+			errs = append(errs, errors.New("BELCANTO_OPERATOR_IDS is required when THREADS_PROVIDER=meta"))
+		}
+		if c.Belcanto.ThreadsUserID == "" {
+			errs = append(errs, errors.New("THREADS_USER_ID is required when THREADS_PROVIDER=meta"))
+		} else if !digitsOnly(c.Belcanto.ThreadsUserID) {
+			errs = append(errs, errors.New("THREADS_USER_ID must contain only digits"))
+		}
+		if c.Belcanto.ThreadsAccessToken == "" {
+			errs = append(errs, errors.New("THREADS_ACCESS_TOKEN is required when THREADS_PROVIDER=meta"))
+		}
+	default:
+		errs = append(errs, errors.New("THREADS_PROVIDER must be disabled, fake, or meta"))
+	}
+	if c.Belcanto.ThreadsTimeout < time.Second {
+		errs = append(errs, errors.New("THREADS_TIMEOUT must be at least one second"))
+	}
 	if c.Telegram.WorkerCount < 1 || c.Telegram.QueueSize < 1 {
 		errs = append(errs, errors.New("BOT_WORKERS and BOT_QUEUE_SIZE must be positive"))
 	}
@@ -256,6 +302,9 @@ func (c Config) Validate() error {
 		if c.Speech.Provider == "openai_compatible" && !isAbsoluteHTTPSURL(c.Speech.BaseURL, false) {
 			errs = append(errs, errors.New("production SPEECH_BASE_URL must be an absolute HTTPS URL without credentials, query, or fragment"))
 		}
+		if c.Belcanto.ThreadsProvider == "meta" && !isProductionThreadsAPIURL(c.Belcanto.ThreadsBaseURL) {
+			errs = append(errs, errors.New("production THREADS_API_BASE_URL must use https://graph.threads.net with a version path"))
+		}
 		if c.Store.Driver == "postgres" && c.Store.DatabaseURL != "" && !databaseRequiresTLS(c.Store.DatabaseURL) {
 			errs = append(errs, errors.New("production DATABASE_URL must require TLS (sslmode=require, verify-ca, or verify-full)"))
 		}
@@ -280,6 +329,18 @@ func isProductionTelegramAPIURL(raw string) bool {
 		return false
 	}
 	return parsed.Port() == "" || parsed.Port() == "443"
+}
+
+func isProductionThreadsAPIURL(raw string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Hostname(), productionThreadsAPIHost) {
+		return false
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Port() != "" && parsed.Port() != "443") {
+		return false
+	}
+	path := strings.Trim(parsed.Path, "/")
+	return strings.HasPrefix(path, "v") && len(path) > 1
 }
 
 func databaseRequiresTLS(databaseURL string) bool {
@@ -344,4 +405,38 @@ func duration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return parsed
+}
+
+func int64List(key string) ([]int64, error) {
+	raw := get(key, "")
+	if raw == "" {
+		return nil, nil
+	}
+	seen := make(map[int64]struct{})
+	values := make([]int64, 0)
+	for _, field := range strings.Split(raw, ",") {
+		field = strings.TrimSpace(field)
+		value, err := strconv.ParseInt(field, 10, 64)
+		if err != nil || value <= 0 {
+			return nil, fmt.Errorf("%s must be a comma-separated list of positive Telegram IDs", key)
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+	}
+	return values, nil
+}
+
+func digitsOnly(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }

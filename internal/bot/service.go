@@ -23,6 +23,7 @@ import (
 	"github.com/aleka7sk/witty-reply/internal/session"
 	"github.com/aleka7sk/witty-reply/internal/store"
 	"github.com/aleka7sk/witty-reply/internal/telegram"
+	threadspub "github.com/aleka7sk/witty-reply/internal/threads"
 	"github.com/aleka7sk/witty-reply/internal/transcribe"
 )
 
@@ -48,12 +49,14 @@ type Limits struct {
 }
 
 type Config struct {
-	ProviderTimeout time.Duration
-	UsageLocation   *time.Location
-	CallbackSecret  string
-	PrivacyURL      string
-	SpeechProvider  string
-	Limits          Limits
+	ProviderTimeout     time.Duration
+	UsageLocation       *time.Location
+	CallbackSecret      string
+	PrivacyURL          string
+	SpeechProvider      string
+	BelcantoOperatorIDs []int64
+	ThreadsPublisher    threadspub.Publisher
+	Limits              Limits
 }
 
 type Interaction struct {
@@ -117,17 +120,21 @@ func validateUpdateLease(ctx context.Context) error {
 }
 
 type Service struct {
-	telegram    TelegramClient
-	provider    ai.Provider
-	transcriber transcribe.Transcriber
-	store       store.Store
-	sessions    *session.Cache[interaction]
-	callbacks   *session.CallbackCodec
-	safety      *safety.Filter
-	renderer    *meme.Renderer
-	metrics     *observability.Metrics
-	logger      *slog.Logger
-	config      Config
+	telegram          TelegramClient
+	provider          ai.Provider
+	threadGenerator   ai.ThreadPostGenerator
+	threadPublisher   threadspub.Publisher
+	transcriber       transcribe.Transcriber
+	store             store.Store
+	sessions          *session.Cache[interaction]
+	callbacks         *session.CallbackCodec
+	safety            *safety.Filter
+	threadSafety      *safety.Filter
+	renderer          *meme.Renderer
+	metrics           *observability.Metrics
+	logger            *slog.Logger
+	config            Config
+	belcantoOperators map[int64]struct{}
 
 	chatActions sync.WaitGroup
 }
@@ -163,9 +170,18 @@ func NewService(
 	if config.Limits.TextDaily < 1 || config.Limits.MediaDaily < 1 || config.Limits.MemeDaily < 1 || config.Limits.RefinementDaily < 1 || config.Limits.StyleExamples < 1 {
 		return nil, errors.New("bot quota limits must be positive")
 	}
+	threadGenerator, _ := provider.(ai.ThreadPostGenerator)
+	operators := make(map[int64]struct{}, len(config.BelcantoOperatorIDs))
+	for _, id := range config.BelcantoOperatorIDs {
+		if id > 0 {
+			operators[id] = struct{}{}
+		}
+	}
 	return &Service{
-		telegram: telegramClient, provider: provider, transcriber: transcriber, store: dataStore, sessions: sessions,
-		callbacks: callbacks, safety: safetyFilter, renderer: renderer, metrics: metrics, logger: logger, config: config,
+		telegram: telegramClient, provider: provider, threadGenerator: threadGenerator, threadPublisher: config.ThreadsPublisher,
+		transcriber: transcriber, store: dataStore, sessions: sessions,
+		callbacks: callbacks, safety: safetyFilter, threadSafety: safety.New(safety.Config{MaxRunes: 500, CandidateCount: 1}),
+		renderer: renderer, metrics: metrics, logger: logger, config: config, belcantoOperators: operators,
 	}, nil
 }
 
@@ -397,6 +413,8 @@ func (b *Service) handleCommand(ctx context.Context, chatID int64, user domain.U
 			return err
 		}
 		return b.sendText(ctx, chatID, planText(lang, stats, nextDay(b.now())), nil)
+	case "belcanto", "threads":
+		return b.handleBelcantoCommand(ctx, chatID, user, lang)
 	case "delete_me", "delete_data":
 		keyboard, err := deleteKeyboard(b.callbacks, user.TelegramID, lang)
 		if err != nil {
@@ -426,6 +444,14 @@ func (b *Service) handleCallback(ctx context.Context, updateID int64, callback t
 	user, err := b.upsertUser(ctx, callback.From)
 	if err != nil {
 		return err
+	}
+	if threadActionRequiresConsent(payload.Action) && !user.HasConsent() {
+		consentLang := userLanguage(user.Language)
+		keyboard, keyboardErr := consentKeyboard(b.callbacks, user.TelegramID, consentLang)
+		if keyboardErr != nil {
+			return keyboardErr
+		}
+		return b.sendText(ctx, chatID, consentRequiredText(consentLang), keyboard)
 	}
 
 	switch payload.Action {
@@ -503,11 +529,46 @@ func (b *Service) handleCallback(ctx context.Context, updateID int64, callback t
 		return b.changeMode(ctx, updateID, chatID, user, lang, payload, domain.ScenarioReply)
 	case session.ActionModeComment:
 		return b.changeMode(ctx, updateID, chatID, user, lang, payload, domain.ScenarioComment)
+	case session.ActionThreadNewBelcanto:
+		return b.refineThreadDraft(ctx, chatID, user, payload, domain.ThreadVoiceBelcanto, "different_angle")
+	case session.ActionThreadNewAlisher:
+		return b.refineThreadDraft(ctx, chatID, user, payload, domain.ThreadVoiceAlisher, "different_angle")
+	case session.ActionThreadWittier:
+		return b.refineThreadDraft(ctx, chatID, user, payload, "", "wittier")
+	case session.ActionThreadWarmer:
+		return b.refineThreadDraft(ctx, chatID, user, payload, "", "warmer")
+	case session.ActionThreadShorter:
+		return b.refineThreadDraft(ctx, chatID, user, payload, "", "shorter")
+	case session.ActionThreadDifferentAngle:
+		return b.refineThreadDraft(ctx, chatID, user, payload, "", "different_angle")
+	case session.ActionThreadNoSell:
+		return b.refineThreadDraft(ctx, chatID, user, payload, "", "no_sell")
+	case session.ActionThreadPublish:
+		return b.publishThreadDraft(ctx, chatID, user, payload)
+	case session.ActionThreadCancel:
+		return b.cancelThreadDraft(ctx, chatID, user, payload)
 	case session.ActionCancel:
 		b.sessions.Cancel(user.TelegramID)
 		return b.sendText(ctx, chatID, cancelledText(lang), nil)
 	default:
 		return nil
+	}
+}
+
+func threadActionRequiresConsent(action session.Action) bool {
+	switch action {
+	case session.ActionThreadNewBelcanto,
+		session.ActionThreadNewAlisher,
+		session.ActionThreadWittier,
+		session.ActionThreadWarmer,
+		session.ActionThreadShorter,
+		session.ActionThreadDifferentAngle,
+		session.ActionThreadNoSell,
+		session.ActionThreadPublish,
+		session.ActionThreadCancel:
+		return true
+	default:
+		return false
 	}
 }
 

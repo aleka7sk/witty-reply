@@ -71,6 +71,7 @@ func (p *Postgres) Ping(ctx context.Context) error {
 		   AND to_regclass('telegram_update_jobs') IS NOT NULL
 		   AND to_regclass('quota_reservations') IS NOT NULL
 		   AND to_regclass('generations') IS NOT NULL
+		   AND to_regclass('thread_drafts') IS NOT NULL
 		   AND EXISTS (SELECT 1 FROM schema_migrations WHERE version = 1)`).Scan(&ready); err != nil {
 		return fmt.Errorf("check database schema: %w", err)
 	}
@@ -493,6 +494,306 @@ func (p *Postgres) GetGeneration(ctx context.Context, id, telegramID int64) (dom
 	return record, nil
 }
 
+func (p *Postgres) CreateThreadDraft(ctx context.Context, draft domain.ThreadDraft) (int64, error) {
+	if err := draft.ValidateForCreate(); err != nil {
+		return 0, err
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer rollback(tx)
+	var owner int64
+	if err := tx.QueryRow(ctx, `SELECT telegram_id FROM users WHERE telegram_id = $1 FOR UPDATE`, draft.TelegramID).Scan(&owner); err != nil {
+		return 0, mapNotFound(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE thread_drafts SET is_current = FALSE, updated_at = now()
+		WHERE telegram_id = $1 AND is_current`, draft.TelegramID); err != nil {
+		return 0, err
+	}
+	var id int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO thread_drafts (
+			telegram_id, voice, goal, preview_text, provider, model,
+			revision, state, is_current
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', TRUE)
+		RETURNING id`,
+		draft.TelegramID, draft.Voice, draft.Goal, draft.Text, draft.Provider, draft.Model, draft.Revision,
+	).Scan(&id); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func (p *Postgres) GetThreadDraft(ctx context.Context, id, telegramID int64) (domain.ThreadDraft, error) {
+	draft, err := scanThreadDraft(p.pool.QueryRow(ctx, threadDraftSelect+` WHERE id = $1 AND telegram_id = $2`, id, telegramID))
+	if err != nil {
+		return domain.ThreadDraft{}, mapNotFound(err)
+	}
+	return draft, nil
+}
+
+func (p *Postgres) ListRecentThreadTexts(ctx context.Context, telegramID int64, limit int) ([]string, error) {
+	if limit <= 0 {
+		return []string{}, nil
+	}
+	rows, err := p.pool.Query(ctx, `
+		SELECT preview_text FROM thread_drafts
+		WHERE telegram_id = $1
+		ORDER BY created_at DESC, id DESC
+		LIMIT $2`, telegramID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	texts := make([]string, 0, limit)
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			return nil, err
+		}
+		texts = append(texts, value)
+	}
+	return texts, rows.Err()
+}
+
+func (p *Postgres) ClaimThreadDraft(
+	ctx context.Context,
+	id, telegramID int64,
+	revision uint32,
+	claimToken string,
+	now time.Time,
+	lease time.Duration,
+) (domain.ThreadDraft, bool, error) {
+	if err := validateThreadClaim(claimToken, now, lease); err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	now = now.UTC()
+	expiresAt := now.Add(lease)
+	draft, err := scanThreadDraft(p.pool.QueryRow(ctx, `
+		UPDATE thread_drafts
+		SET state = CASE
+				WHEN state = 'publishing' AND publish_started_at IS NOT NULL THEN 'unknown'
+				ELSE 'publishing'
+			END,
+			error_code = CASE
+				WHEN state = 'publishing' AND publish_started_at IS NOT NULL THEN 'publish_lease_expired'
+				ELSE ''
+			END,
+			claim_token = CASE
+				WHEN state = 'publishing' AND publish_started_at IS NOT NULL THEN ''
+				ELSE $4
+			END,
+			claim_expires_at = CASE
+				WHEN state = 'publishing' AND publish_started_at IS NOT NULL THEN NULL
+				ELSE $6
+			END,
+			publish_started_at = CASE
+				WHEN state = 'publishing' AND publish_started_at IS NOT NULL THEN publish_started_at
+				ELSE NULL
+			END,
+			updated_at = $5
+		WHERE id = $1 AND telegram_id = $2 AND revision = $3
+		  AND is_current
+		  AND (
+			state IN ('draft', 'failed')
+			OR (
+				state = 'publishing'
+				AND (claim_expires_at IS NULL OR claim_expires_at <= $5)
+			)
+		  )
+		RETURNING `+threadDraftColumns, id, telegramID, revision, claimToken, now, expiresAt))
+	if err == nil {
+		return draft, draft.State == domain.ThreadDraftPublishing && draft.ClaimToken == claimToken, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return domain.ThreadDraft{}, false, err
+	}
+	draft, err = p.GetThreadDraft(ctx, id, telegramID)
+	if err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	return draft, false, nil
+}
+
+func (p *Postgres) SetThreadContainer(ctx context.Context, id, telegramID int64, claimToken, containerID string) error {
+	if err := validateThreadField("claim token", claimToken, maxThreadClaimTokenRunes, true); err != nil {
+		return err
+	}
+	if err := validateThreadField("container id", containerID, 255, true); err != nil {
+		return err
+	}
+	tag, err := p.pool.Exec(ctx, `
+		UPDATE thread_drafts
+		SET container_id = $4, updated_at = now()
+		WHERE id = $1 AND telegram_id = $2 AND state = 'publishing'
+		  AND claim_token = $3 AND claim_expires_at > now()
+		  AND publish_started_at IS NULL
+		  AND (container_id = '' OR container_id = $4)`, id, telegramID, claimToken, containerID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	draft, err := p.GetThreadDraft(ctx, id, telegramID)
+	if err != nil {
+		return err
+	}
+	if draft.State == domain.ThreadDraftPublishing && draft.ClaimToken == claimToken &&
+		draft.PublishStartedAt == nil && draft.ContainerID == containerID {
+		return nil
+	}
+	return ErrThreadDraftState
+}
+
+func (p *Postgres) BeginThreadPublish(
+	ctx context.Context,
+	id, telegramID int64,
+	claimToken string,
+	now time.Time,
+	lease time.Duration,
+) error {
+	if err := validateThreadClaim(claimToken, now, lease); err != nil {
+		return err
+	}
+	now = now.UTC()
+	tag, err := p.pool.Exec(ctx, `
+		UPDATE thread_drafts
+		SET publish_started_at = $4, claim_expires_at = $5, updated_at = $4
+		WHERE id = $1 AND telegram_id = $2 AND state = 'publishing'
+		  AND claim_token = $3 AND claim_expires_at > $4
+		  AND container_id <> '' AND publish_started_at IS NULL`,
+		id, telegramID, claimToken, now, now.Add(lease))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	if _, err := p.GetThreadDraft(ctx, id, telegramID); err != nil {
+		return err
+	}
+	return ErrThreadDraftState
+}
+
+func (p *Postgres) CompleteThreadDraft(ctx context.Context, id, telegramID int64, claimToken, postID, permalink string) error {
+	if err := validateThreadField("claim token", claimToken, maxThreadClaimTokenRunes, true); err != nil {
+		return err
+	}
+	if err := validateThreadField("post id", postID, 255, false); err != nil {
+		return err
+	}
+	if err := validateThreadField("permalink", permalink, 2048, false); err != nil {
+		return err
+	}
+	tag, err := p.pool.Exec(ctx, `
+		UPDATE thread_drafts
+		SET state = 'published', post_id = $4, permalink = $5,
+			error_code = '', claim_token = '', claim_expires_at = NULL,
+			published_at = now(), updated_at = now()
+		WHERE id = $1 AND telegram_id = $2 AND state = 'publishing'
+		  AND claim_token = $3 AND publish_started_at IS NOT NULL`,
+		id, telegramID, claimToken, postID, permalink)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	draft, err := p.GetThreadDraft(ctx, id, telegramID)
+	if err != nil {
+		return err
+	}
+	if draft.State == domain.ThreadDraftPublished && draft.PostID == postID && draft.Permalink == permalink {
+		return nil
+	}
+	return ErrThreadDraftState
+}
+
+func (p *Postgres) ConfirmThreadDraftPublished(ctx context.Context, id, telegramID int64, containerID string) error {
+	if err := validateThreadField("container id", containerID, 255, true); err != nil {
+		return err
+	}
+	tag, err := p.pool.Exec(ctx, `
+		UPDATE thread_drafts
+		SET state = 'published', error_code = '', claim_token = '', claim_expires_at = NULL,
+			published_at = now(), updated_at = now()
+		WHERE id = $1 AND telegram_id = $2 AND container_id = $3
+		  AND (state = 'unknown' OR (state = 'publishing' AND publish_started_at IS NOT NULL))`,
+		id, telegramID, containerID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	draft, err := p.GetThreadDraft(ctx, id, telegramID)
+	if err != nil {
+		return err
+	}
+	if draft.State == domain.ThreadDraftPublished && draft.ContainerID == containerID {
+		return nil
+	}
+	return ErrThreadDraftState
+}
+
+func (p *Postgres) FailThreadDraft(ctx context.Context, id, telegramID int64, claimToken, errorCode string, unknown bool) error {
+	if err := validateThreadField("claim token", claimToken, maxThreadClaimTokenRunes, true); err != nil {
+		return err
+	}
+	errorCode = normalizeThreadErrorCode(errorCode)
+	target := domain.ThreadDraftFailed
+	if unknown {
+		target = domain.ThreadDraftUnknown
+	}
+	tag, err := p.pool.Exec(ctx, `
+		UPDATE thread_drafts
+		SET state = $4, error_code = $5, claim_token = '', claim_expires_at = NULL,
+			publish_started_at = CASE WHEN $4 = 'failed' THEN NULL ELSE publish_started_at END,
+			updated_at = now()
+		WHERE id = $1 AND telegram_id = $2 AND state = 'publishing'
+		  AND claim_token = $3
+		  AND ($4 <> 'unknown' OR publish_started_at IS NOT NULL)`,
+		id, telegramID, claimToken, target, errorCode)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	draft, err := p.GetThreadDraft(ctx, id, telegramID)
+	if err != nil {
+		return err
+	}
+	if draft.State == target && draft.ErrorCode == errorCode {
+		return nil
+	}
+	return ErrThreadDraftState
+}
+
+func (p *Postgres) CancelThreadDraft(ctx context.Context, id, telegramID int64, revision uint32) error {
+	tag, err := p.pool.Exec(ctx, `
+		UPDATE thread_drafts
+		SET state = 'cancelled', is_current = FALSE, error_code = '', updated_at = now()
+		WHERE id = $1 AND telegram_id = $2 AND revision = $3
+		  AND is_current AND state IN ('draft', 'failed')`, id, telegramID, revision)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	if _, err := p.GetThreadDraft(ctx, id, telegramID); err != nil {
+		return err
+	}
+	return ErrNotFound
+}
+
 func (p *Postgres) RecordFeedback(ctx context.Context, feedback domain.Feedback) error {
 	tag, err := p.pool.Exec(ctx, `
 		INSERT INTO feedback (generation_id, telegram_id, candidate, rating, action)
@@ -631,8 +932,26 @@ func (p *Postgres) Cleanup(ctx context.Context, before time.Time) (int64, error)
 		return 0, err
 	}
 	defer rollback(tx)
+	if _, err := tx.Exec(ctx, `
+		UPDATE thread_drafts
+		SET state = CASE
+				WHEN publish_started_at IS NULL THEN 'failed'
+				ELSE 'unknown'
+			END,
+			error_code = CASE
+				WHEN publish_started_at IS NULL THEN 'publish_lease_expired_before_attempt'
+				ELSE 'publish_lease_expired'
+			END,
+			claim_token = '', claim_expires_at = NULL, updated_at = now()
+		WHERE state = 'publishing'
+		  AND (claim_expires_at IS NULL OR claim_expires_at <= now())`); err != nil {
+		return 0, err
+	}
 	tag, err := tx.Exec(ctx, `DELETE FROM generations WHERE created_at < $1`, before)
 	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM thread_drafts WHERE updated_at < $1`, before); err != nil {
 		return 0, err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM processed_updates WHERE processed_at < $1`, before); err != nil {
@@ -686,4 +1005,35 @@ func rollback(tx pgx.Tx) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = tx.Rollback(ctx)
+}
+
+const threadDraftColumns = `
+	id, telegram_id, voice, goal, preview_text, provider, model, revision,
+	state, is_current, container_id, post_id, permalink, error_code,
+	claim_token, claim_expires_at, publish_started_at,
+	created_at, updated_at, published_at`
+
+const threadDraftSelect = `SELECT ` + threadDraftColumns + ` FROM thread_drafts`
+
+type threadDraftScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanThreadDraft(row threadDraftScanner) (domain.ThreadDraft, error) {
+	var draft domain.ThreadDraft
+	var revision int64
+	err := row.Scan(
+		&draft.ID, &draft.TelegramID, &draft.Voice, &draft.Goal, &draft.Text,
+		&draft.Provider, &draft.Model, &revision, &draft.State, &draft.Current,
+		&draft.ContainerID, &draft.PostID, &draft.Permalink, &draft.ErrorCode,
+		&draft.ClaimToken, &draft.ClaimExpiresAt, &draft.PublishStartedAt,
+		&draft.CreatedAt, &draft.UpdatedAt, &draft.PublishedAt,
+	)
+	if err == nil {
+		if revision < 1 || uint64(revision) > uint64(^uint32(0)) {
+			return domain.ThreadDraft{}, fmt.Errorf("invalid persisted thread draft revision %d", revision)
+		}
+		draft.Revision = uint32(revision)
+	}
+	return draft, err
 }

@@ -42,11 +42,11 @@ func startText(lang language, privacyURL string, voiceExternal bool) string {
 	policyEN := policyLink("Privacy policy", privacyURL)
 	switch lang {
 	case langKK:
-		return "Мен — Witty Reply. Хабарламаны, постты, скриншотты немесе дауыстық жазбаны жібер: адамға жауап керек пе, әлде постқа тапқыр пікір керек пе — өзім анықтап, үш нұсқа ұсынамын.\n\nБот жеке чаттарыңды өзі оқымайды және сенің орныңнан ешкімге жазбайды. Өңдеу үшін жіберген контент AI-провайдерге беріледі." + voiceKK + "\n\n" + policyKK + "\n\nЖалғастыруға келісесің бе?"
+		return "Мен — Witty Reply. Хабарламаны, постты, скриншотты немесе дауыстық жазбаны жібер: адамға жауап керек пе, әлде постқа тапқыр пікір керек пе — өзім анықтап, үш нұсқа ұсынамын.\n\nБот жеке чаттарыңды өзі оқымайды. Кәдімгі режим ештеңені жарияламайды; Belcanto операторлық режимі постты тек қолмен растағаннан кейін жариялайды. Өңдеу үшін жіберген контент AI-провайдерге беріледі." + voiceKK + "\n\n" + policyKK + "\n\nЖалғастыруға келісесің бе?"
 	case langEN:
-		return "I'm Witty Reply. Send a message, post, screenshot, or voice note. I'll detect whether you need a direct reply or a witty public comment and suggest three options.\n\nI cannot read your private chats and never send anything on your behalf. Submitted content is processed by the configured AI provider." + voiceEN + "\n\n" + policyEN + "\n\nDo you agree to continue?"
+		return "I'm Witty Reply. Send a message, post, screenshot, or voice note. I'll detect whether you need a direct reply or a witty public comment and suggest three options.\n\nI cannot read your private chats. The ordinary flow never publishes; the operator-only Belcanto workspace publishes a post only after an explicit confirmation. Submitted content is processed by the configured AI provider." + voiceEN + "\n\n" + policyEN + "\n\nDo you agree to continue?"
 	default:
-		return "Я — Ответочка. Пришли сообщение, пост, скриншот или голосовое. Я пойму, нужно ответить человеку или залететь с остроумным комментарием, и предложу три готовых варианта.\n\nБот не читает личные чаты сам и никому не пишет от твоего имени. Отправленный контент обрабатывается внешним AI-провайдером." + voiceRU + "\n\n" + policyRU + "\n\nСогласен продолжить?"
+		return "Я — Ответочка. Пришли сообщение, пост, скриншот или голосовое. Я пойму, нужно ответить человеку или залететь с остроумным комментарием, и предложу три готовых варианта.\n\nБот не читает личные чаты сам. Обычный режим ничего не публикует; операторский раздел Belcanto отправляет пост в Threads только после явного подтверждения. Отправленный контент обрабатывается внешним AI-провайдером." + voiceRU + "\n\n" + policyRU + "\n\nСогласен продолжить?"
 	}
 }
 
@@ -75,11 +75,11 @@ func consentRequiredText(lang language) string {
 func helpText(lang language) string {
 	switch lang {
 	case langKK:
-		return "Жіберуге болады:\n• жеке хабарлама, пост немесе қайта жіберілген мәтін;\n• чат не жарияланым скриншоты (10 МБ дейін);\n• дауыстық жазба (20 МБ дейін).\n\nРежим автоматты анықталады. Нақты таңдау үшін мәтінді «ответь:» немесе «коммент:» деп баста.\n\nКомандалар: /new, /cancel, /style, /plan, /privacy, /delete_me."
+		return "Жіберуге болады:\n• жеке хабарлама, пост немесе қайта жіберілген мәтін;\n• чат не жарияланым скриншоты (10 МБ дейін);\n• дауыстық жазба (20 МБ дейін).\n\nРежим автоматты анықталады. Нақты таңдау үшін мәтінді «ответь:» немесе «коммент:» деп баста. Belcanto командасы /threads арқылы дайын пост жасап, оны жариялау алдында растауды сұрай алады.\n\nКомандалар: /new, /cancel, /style, /plan, /privacy, /threads, /delete_me."
 	case langEN:
-		return "Send:\n• a private message, post, or forwarded text;\n• a chat or publication screenshot (up to 10 MB);\n• a voice note (up to 20 MB).\n\nThe mode is automatic. Start with “reply:” or “comment:” to force it.\n\nCommands: /new, /cancel, /style, /plan, /privacy, /delete_me."
+		return "Send:\n• a private message, post, or forwarded text;\n• a chat or publication screenshot (up to 10 MB);\n• a voice note (up to 20 MB).\n\nThe mode is automatic. Start with “reply:” or “comment:” to force it. Belcanto operators can use /threads for a publish-ready school post.\n\nCommands: /new, /cancel, /style, /plan, /privacy, /threads, /delete_me."
 	default:
-		return "Можно прислать:\n• личное сообщение, пост или пересланный текст;\n• скриншот переписки или публикации до 10 МБ;\n• голосовое до 20 МБ.\n\nРежим определяется автоматически. Для точного выбора начни текст с «ответь:» или «коммент:». После результата режим можно переключить без повторной отправки исходника.\n\nКоманды: /new, /cancel, /style, /plan, /privacy, /delete_me."
+		return "Можно прислать:\n• личное сообщение, пост или пересланный текст;\n• скриншот переписки или публикации до 10 МБ;\n• голосовое до 20 МБ.\n\nРежим определяется автоматически. Для точного выбора начни текст с «ответь:» или «коммент:». После результата режим можно переключить без повторной отправки исходника. Для команды Belcanto: /threads сам подготовит готовый пост и попросит только подтвердить публикацию.\n\nКоманды: /new, /cancel, /style, /plan, /privacy, /threads, /delete_me."
 	}
 }
 
@@ -94,11 +94,11 @@ func privacyText(lang language, privacyURL string, voiceExternal bool) string {
 	}
 	switch lang {
 	case langKK:
-		return "Құпиялылық: бастапқы контент кезекте шифрланған түрде қысқа уақыт сақталады, ал ашық мәтін логтарға жазылмайды. Жасалған жауаптар мен ашық feedback әдетте 7 күн сақталады." + voiceKK + " /delete_me барлық профиль деректерін жояды.\n\n" + policyLink("Толық саясат", privacyURL)
+		return "Құпиялылық: бастапқы контент кезекте шифрланған түрде қысқа уақыт сақталады, ал ашық мәтін логтарға жазылмайды. Жасалған жауаптар, Belcanto Threads нобайлары және ашық feedback әдетте 7 күн сақталады. Threads нобайының дәл мәтіні Meta-ға тек оператор растағаннан кейін жіберіледі." + voiceKK + " /delete_me барлық профиль деректерін жояды.\n\n" + policyLink("Толық саясат", privacyURL)
 	case langEN:
-		return "Privacy: submitted content is held briefly as an encrypted queue payload; plaintext content is never written to logs. Generated replies and explicit feedback are normally retained for 7 days." + voiceEN + " /delete_me removes all profile data.\n\n" + policyLink("Full policy", privacyURL)
+		return "Privacy: submitted content is held briefly as an encrypted queue payload; plaintext content is never written to logs. Generated replies, Belcanto Threads drafts, and explicit feedback are normally retained for 7 days. The exact Threads preview is sent to Meta only after an operator confirms publication." + voiceEN + " /delete_me removes all profile data.\n\n" + policyLink("Full policy", privacyURL)
 	default:
-		return "Приватность: отправленный контент кратковременно хранится в очереди только в зашифрованном виде; открытый текст не попадает в логи. Сгенерированные ответы и явный feedback обычно хранятся 7 дней." + voiceRU + " /delete_me удаляет все данные профиля.\n\n" + policyLink("Полная политика", privacyURL)
+		return "Приватность: отправленный контент кратковременно хранится в очереди только в зашифрованном виде; открытый текст не попадает в логи. Сгенерированные ответы, черновики Belcanto Threads и явный feedback обычно хранятся 7 дней. Точный текст Threads-поста передаётся Meta только после подтверждения оператора." + voiceRU + " /delete_me удаляет все данные профиля.\n\n" + policyLink("Полная политика", privacyURL)
 	}
 }
 

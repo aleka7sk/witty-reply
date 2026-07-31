@@ -21,6 +21,55 @@ func TestLoadMinimalFakeConfig(t *testing.T) {
 	if cfg.Limits.UsageTimezone != "Asia/Almaty" {
 		t.Fatalf("unexpected timezone: %q", cfg.Limits.UsageTimezone)
 	}
+	if cfg.Belcanto.ThreadsProvider != "disabled" {
+		t.Fatalf("Threads provider = %q, want disabled", cfg.Belcanto.ThreadsProvider)
+	}
+}
+
+func TestLoadBelcantoOperatorsAndFakeThreads(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", strings.Repeat("x", 32))
+	t.Setenv("TELEGRAM_CALLBACK_SECRET", strings.Repeat("y", 32))
+	t.Setenv("AI_PROVIDER", "fake")
+	t.Setenv("STORE_DRIVER", "memory")
+	t.Setenv("BELCANTO_OPERATOR_IDS", " 42,77,42 ")
+	t.Setenv("THREADS_PROVIDER", "fake")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.Belcanto.OperatorIDs) != 2 || cfg.Belcanto.OperatorIDs[0] != 42 || cfg.Belcanto.OperatorIDs[1] != 77 {
+		t.Fatalf("OperatorIDs = %#v", cfg.Belcanto.OperatorIDs)
+	}
+}
+
+func TestLoadRejectsInvalidBelcantoOperator(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", strings.Repeat("x", 32))
+	t.Setenv("TELEGRAM_CALLBACK_SECRET", strings.Repeat("y", 32))
+	t.Setenv("BELCANTO_OPERATOR_IDS", "42,not-an-id")
+
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "BELCANTO_OPERATOR_IDS") {
+		t.Fatalf("Load() error = %v, want operator validation", err)
+	}
+}
+
+func TestMetaThreadsRequiresCredentialsAndOperators(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", strings.Repeat("x", 32))
+	t.Setenv("TELEGRAM_CALLBACK_SECRET", strings.Repeat("y", 32))
+	t.Setenv("AI_PROVIDER", "fake")
+	t.Setenv("STORE_DRIVER", "memory")
+	t.Setenv("THREADS_PROVIDER", "meta")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("meta Threads config without credentials was accepted")
+	}
+	for _, expected := range []string{"BELCANTO_OPERATOR_IDS", "THREADS_USER_ID", "THREADS_ACCESS_TOKEN"} {
+		if !strings.Contains(err.Error(), expected) {
+			t.Fatalf("Load() error %q missing %q", err, expected)
+		}
+	}
 }
 
 func TestValidateProductionRequirements(t *testing.T) {
@@ -129,6 +178,17 @@ func TestProductionRejectsUnsafeTransportAndPrivacyConfig(t *testing.T) {
 				t.Setenv("SPEECH_BASE_URL", "http://speech.example.com/v1")
 			},
 			want: "SPEECH_BASE_URL",
+		},
+		{
+			name: "Threads host outside allowlist",
+			mutate: func(t *testing.T) {
+				t.Setenv("THREADS_PROVIDER", "meta")
+				t.Setenv("BELCANTO_OPERATOR_IDS", "42")
+				t.Setenv("THREADS_USER_ID", "17840000000000000")
+				t.Setenv("THREADS_ACCESS_TOKEN", "threads-secret")
+				t.Setenv("THREADS_API_BASE_URL", "https://graph.threads.net.example.com/v1.0")
+			},
+			want: "THREADS_API_BASE_URL",
 		},
 		{
 			name: "database permits plaintext fallback",

@@ -55,10 +55,19 @@ const (
 	ActionCommentBolder
 	ActionCommentAbsurd
 	ActionCommentDifferentAngle
+	ActionThreadNewBelcanto
+	ActionThreadNewAlisher
+	ActionThreadWittier
+	ActionThreadWarmer
+	ActionThreadShorter
+	ActionThreadDifferentAngle
+	ActionThreadNoSell
+	ActionThreadPublish
+	ActionThreadCancel
 )
 
 func (a Action) Valid() bool {
-	return a >= ActionFeedbackUp && a <= ActionCommentDifferentAngle
+	return a >= ActionFeedbackUp && a <= ActionThreadCancel
 }
 
 type CallbackPayload struct {

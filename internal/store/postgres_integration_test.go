@@ -190,6 +190,230 @@ func TestPostgresIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("thread drafts are durable owned current and publish idempotent", func(t *testing.T) {
+		firstID, err := postgres.CreateThreadDraft(ctx, testThreadDraft(ownerID, 1, "Первый Threads-пост"))
+		if err != nil {
+			t.Fatalf("CreateThreadDraft(): %v", err)
+		}
+		first, err := postgres.GetThreadDraft(ctx, firstID, ownerID)
+		if err != nil || !first.Current || first.State != domain.ThreadDraftReady || first.Text != "Первый Threads-пост" {
+			t.Fatalf("first draft = %+v, %v", first, err)
+		}
+		if _, err := postgres.GetThreadDraft(ctx, firstID, otherID); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("foreign GetThreadDraft() = %v", err)
+		}
+
+		const attempts = 24
+		start := make(chan struct{})
+		results := make(chan bool, attempts)
+		errorsFound := make(chan error, attempts)
+		var workers sync.WaitGroup
+		for index := range attempts {
+			workers.Add(1)
+			go func(claimToken string) {
+				defer workers.Done()
+				<-start
+				_, claimed, claimErr := postgres.ClaimThreadDraft(ctx, firstID, ownerID, 1, claimToken, now, 5*time.Minute)
+				if claimErr != nil {
+					errorsFound <- claimErr
+					return
+				}
+				results <- claimed
+			}(fmt.Sprintf("claim-%d", index))
+		}
+		close(start)
+		workers.Wait()
+		close(results)
+		close(errorsFound)
+		for claimErr := range errorsFound {
+			t.Errorf("ClaimThreadDraft(): %v", claimErr)
+		}
+		claimedCount := 0
+		for claimed := range results {
+			if claimed {
+				claimedCount++
+			}
+		}
+		if claimedCount != 1 {
+			t.Fatalf("successful publish claims = %d, want 1", claimedCount)
+		}
+		first, _ = postgres.GetThreadDraft(ctx, firstID, ownerID)
+		firstClaim := first.ClaimToken
+		if err := postgres.SetThreadContainer(ctx, firstID, ownerID, firstClaim, "container-1"); err != nil {
+			t.Fatal(err)
+		}
+		if err := postgres.SetThreadContainer(ctx, firstID, ownerID, firstClaim, "container-1"); err != nil {
+			t.Fatalf("idempotent SetThreadContainer(): %v", err)
+		}
+		if err := postgres.BeginThreadPublish(ctx, firstID, ownerID, firstClaim, now, 5*time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		permalink := "https://www.threads.net/@belcanto/post/1"
+		if err := postgres.CompleteThreadDraft(ctx, firstID, ownerID, firstClaim, "post-1", permalink); err != nil {
+			t.Fatal(err)
+		}
+		if err := postgres.CompleteThreadDraft(ctx, firstID, ownerID, firstClaim, "post-1", permalink); err != nil {
+			t.Fatalf("idempotent CompleteThreadDraft(): %v", err)
+		}
+		first, err = postgres.GetThreadDraft(ctx, firstID, ownerID)
+		if err != nil || first.State != domain.ThreadDraftPublished || first.PublishedAt == nil || first.ContainerID != "container-1" {
+			t.Fatalf("published draft = %+v, %v", first, err)
+		}
+		restartedPool, err := pgxpool.NewWithConfig(ctx, postgres.pool.Config())
+		if err != nil {
+			t.Fatalf("reopen PostgreSQL pool: %v", err)
+		}
+		restarted := &Postgres{pool: restartedPool}
+		reloaded, reloadErr := restarted.GetThreadDraft(ctx, firstID, ownerID)
+		restarted.Close()
+		if reloadErr != nil || reloaded.State != domain.ThreadDraftPublished || reloaded.PostID != "post-1" {
+			t.Fatalf("draft after store restart = %+v, %v", reloaded, reloadErr)
+		}
+
+		secondID, err := postgres.CreateThreadDraft(ctx, testThreadDraft(ownerID, 2, "Второй Threads-пост"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		first, _ = postgres.GetThreadDraft(ctx, firstID, ownerID)
+		if first.Current {
+			t.Fatal("replacement left the published draft current")
+		}
+		stale, claimed, err := postgres.ClaimThreadDraft(ctx, firstID, ownerID, 1, "stale-claim", now, 5*time.Minute)
+		if err != nil || claimed || stale.Current {
+			t.Fatalf("stale claim = %+v, %v, %v", stale, claimed, err)
+		}
+		texts, err := postgres.ListRecentThreadTexts(ctx, ownerID, 2)
+		if err != nil || len(texts) != 2 || texts[0] != "Второй Threads-пост" || texts[1] != "Первый Threads-пост" {
+			t.Fatalf("recent texts = %v, %v", texts, err)
+		}
+		if _, claimed, err := postgres.ClaimThreadDraft(ctx, secondID, ownerID, 2, "second-claim", now, 5*time.Minute); err != nil || !claimed {
+			t.Fatalf("claim second = %v, %v", claimed, err)
+		}
+		if err := postgres.SetThreadContainer(ctx, secondID, ownerID, "second-claim", "container-2"); err != nil {
+			t.Fatal(err)
+		}
+		if err := postgres.FailThreadDraft(ctx, secondID, ownerID, "second-claim", "temporary", false); err != nil {
+			t.Fatal(err)
+		}
+		if retried, claimed, err := postgres.ClaimThreadDraft(ctx, secondID, ownerID, 2, "retry-claim", now, 5*time.Minute); err != nil || !claimed || retried.ErrorCode != "" || retried.ContainerID != "container-2" {
+			t.Fatalf("retry claim = %+v, %v, %v", retried, claimed, err)
+		}
+		if err := postgres.BeginThreadPublish(ctx, secondID, ownerID, "retry-claim", now, 5*time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		if err := postgres.FailThreadDraft(ctx, secondID, ownerID, "retry-claim", "ambiguous", true); err != nil {
+			t.Fatal(err)
+		}
+		unknown, claimed, err := postgres.ClaimThreadDraft(ctx, secondID, ownerID, 2, "unknown-claim", now, 5*time.Minute)
+		if err != nil || claimed || unknown.State != domain.ThreadDraftUnknown {
+			t.Fatalf("unknown claim = %+v, %v, %v", unknown, claimed, err)
+		}
+
+		thirdID, err := postgres.CreateThreadDraft(ctx, testThreadDraft(ownerID, 3, "Третий Threads-пост"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := postgres.CancelThreadDraft(ctx, thirdID, ownerID, 3); err != nil {
+			t.Fatal(err)
+		}
+		cancelled, err := postgres.GetThreadDraft(ctx, thirdID, ownerID)
+		if err != nil || cancelled.State != domain.ThreadDraftCancelled || cancelled.Current {
+			t.Fatalf("cancelled draft = %+v, %v", cancelled, err)
+		}
+	})
+
+	t.Run("thread publish leases fence stale workers and recover by phase", func(t *testing.T) {
+		const recoveryOwner = int64(71004)
+		if _, err := postgres.UpsertUser(ctx, domain.User{TelegramID: recoveryOwner}); err != nil {
+			t.Fatal(err)
+		}
+		var claimNow time.Time
+		if err := postgres.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&claimNow); err != nil {
+			t.Fatal(err)
+		}
+		draftID, err := postgres.CreateThreadDraft(ctx, testThreadDraft(recoveryOwner, 1, "Recovery post"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, claimed, err := postgres.ClaimThreadDraft(ctx, draftID, recoveryOwner, 1, "old-worker", claimNow, 5*time.Minute); err != nil || !claimed {
+			t.Fatalf("old claim = %v, %v", claimed, err)
+		}
+		if err := postgres.SetThreadContainer(ctx, draftID, recoveryOwner, "old-worker", "recovery-container"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := postgres.pool.Exec(ctx, `UPDATE thread_drafts SET claim_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1`, draftID); err != nil {
+			t.Fatal(err)
+		}
+		if err := postgres.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&claimNow); err != nil {
+			t.Fatal(err)
+		}
+		recovered, claimed, err := postgres.ClaimThreadDraft(ctx, draftID, recoveryOwner, 1, "new-worker", claimNow, 5*time.Minute)
+		if err != nil || !claimed || recovered.ContainerID != "recovery-container" {
+			t.Fatalf("pre-publish recovery = %+v, %v, %v", recovered, claimed, err)
+		}
+		if err := postgres.BeginThreadPublish(ctx, draftID, recoveryOwner, "old-worker", claimNow, 5*time.Minute); !errors.Is(err, ErrThreadDraftState) {
+			t.Fatalf("stale worker began publish: %v", err)
+		}
+		if err := postgres.BeginThreadPublish(ctx, draftID, recoveryOwner, "new-worker", claimNow, 5*time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := postgres.pool.Exec(ctx, `UPDATE thread_drafts SET claim_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1`, draftID); err != nil {
+			t.Fatal(err)
+		}
+		if err := postgres.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&claimNow); err != nil {
+			t.Fatal(err)
+		}
+		unknown, claimed, err := postgres.ClaimThreadDraft(ctx, draftID, recoveryOwner, 1, "third-worker", claimNow, 5*time.Minute)
+		if err != nil || claimed || unknown.State != domain.ThreadDraftUnknown || unknown.PublishStartedAt == nil {
+			t.Fatalf("post-attempt recovery = %+v, %v, %v", unknown, claimed, err)
+		}
+		if err := postgres.CompleteThreadDraft(ctx, draftID, recoveryOwner, "new-worker", "duplicate", ""); !errors.Is(err, ErrThreadDraftState) {
+			t.Fatalf("expired worker completed after recovery: %v", err)
+		}
+		if err := postgres.ConfirmThreadDraftPublished(ctx, draftID, recoveryOwner, "recovery-container"); err != nil {
+			t.Fatalf("status reconciliation: %v", err)
+		}
+		published, err := postgres.GetThreadDraft(ctx, draftID, recoveryOwner)
+		if err != nil || published.State != domain.ThreadDraftPublished || published.PublishedAt == nil || published.ClaimToken != "" {
+			t.Fatalf("reconciled = %+v, %v", published, err)
+		}
+	})
+
+	t.Run("concurrent thread replacements leave one current draft", func(t *testing.T) {
+		const attempts = 12
+		start := make(chan struct{})
+		errorsFound := make(chan error, attempts)
+		var workers sync.WaitGroup
+		for index := range attempts {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				<-start
+				_, err := postgres.CreateThreadDraft(ctx, testThreadDraft(
+					otherID, uint32(index+1), fmt.Sprintf("Параллельный пост %d", index+1),
+				))
+				if err != nil {
+					errorsFound <- err
+				}
+			}()
+		}
+		close(start)
+		workers.Wait()
+		close(errorsFound)
+		for err := range errorsFound {
+			t.Errorf("CreateThreadDraft(): %v", err)
+		}
+		var total, current int
+		if err := postgres.pool.QueryRow(ctx, `
+			SELECT count(*), count(*) FILTER (WHERE is_current)
+			FROM thread_drafts WHERE telegram_id = $1`, otherID).Scan(&total, &current); err != nil {
+			t.Fatal(err)
+		}
+		if total != attempts || current != 1 {
+			t.Fatalf("thread replacements total=%d current=%d, want %d and 1", total, current, attempts)
+		}
+	})
+
 	t.Run("durable inbox serializes actors and recovers leases", func(t *testing.T) {
 		jobs := []domain.UpdateJob{
 			{UpdateID: 71701, ActorID: 71700, Payload: []byte("encrypted-one")},
@@ -327,7 +551,7 @@ func TestPostgresIntegration(t *testing.T) {
 		if _, err := postgres.GetUser(ctx, ownerID); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("GetUser() after deletion error = %v", err)
 		}
-		for _, table := range []string{"users", "entitlements", "daily_usage", "quota_reservations", "generations", "feedback", "style_examples"} {
+		for _, table := range []string{"users", "entitlements", "daily_usage", "quota_reservations", "generations", "thread_drafts", "feedback", "style_examples"} {
 			var count int
 			query := fmt.Sprintf("SELECT count(*) FROM %s WHERE telegram_id = $1", pgx.Identifier{table}.Sanitize())
 			if err := postgres.pool.QueryRow(ctx, query, ownerID).Scan(&count); err != nil {
@@ -359,12 +583,23 @@ func TestPostgresIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("save new generation: %v", err)
 		}
+		oldDraftID, err := postgres.CreateThreadDraft(ctx, testThreadDraft(retentionUserID, 1, "Старый Threads-пост"))
+		if err != nil {
+			t.Fatalf("save old thread draft: %v", err)
+		}
+		newDraftID, err := postgres.CreateThreadDraft(ctx, testThreadDraft(retentionUserID, 2, "Новый Threads-пост"))
+		if err != nil {
+			t.Fatalf("save new thread draft: %v", err)
+		}
 		if err := postgres.RecordFeedback(ctx, domain.Feedback{GenerationID: oldGenerationID, TelegramID: retentionUserID, Candidate: 0, Rating: 1, Action: "rating"}); err != nil {
 			t.Fatalf("record old feedback: %v", err)
 		}
 		oldTime := now.Add(-48 * time.Hour)
 		if _, err := postgres.pool.Exec(ctx, `UPDATE generations SET created_at = $2 WHERE id = $1`, oldGenerationID, oldTime); err != nil {
 			t.Fatalf("age generation: %v", err)
+		}
+		if _, err := postgres.pool.Exec(ctx, `UPDATE thread_drafts SET updated_at = $2 WHERE id = $1`, oldDraftID, oldTime); err != nil {
+			t.Fatalf("age thread draft: %v", err)
 		}
 		const oldUpdateID, newUpdateID = int64(71901), int64(71902)
 		for _, updateID := range []int64{oldUpdateID, newUpdateID} {
@@ -403,6 +638,12 @@ func TestPostgresIntegration(t *testing.T) {
 		}
 		if _, err := postgres.GetGeneration(ctx, newGenerationID, retentionUserID); err != nil {
 			t.Fatalf("new GetGeneration(): %v", err)
+		}
+		if _, err := postgres.GetThreadDraft(ctx, oldDraftID, retentionUserID); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("old GetThreadDraft() error = %v", err)
+		}
+		if _, err := postgres.GetThreadDraft(ctx, newDraftID, retentionUserID); err != nil {
+			t.Fatalf("new GetThreadDraft(): %v", err)
 		}
 		if inserted, err := postgres.EnqueueUpdate(ctx, domain.UpdateJob{UpdateID: oldUpdateID, ActorID: retentionUserID, Payload: []byte("encrypted")}); err != nil || !inserted {
 			t.Fatalf("expired update was not released: inserted=%v err=%v", inserted, err)

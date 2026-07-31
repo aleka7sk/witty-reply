@@ -12,6 +12,9 @@ flowchart TD
     MODE --> AI["Classify + generate"]
     B --> STT["Speech adapter"]
     B --> MEME["Meme renderer"]
+    B --> EDIT["Belcanto editor"]
+    EDIT --> TD["Durable Threads draft"]
+    TD --> TH["Threads API"]
     Q --> PG["PostgreSQL"]
     QI --> PG
     AI --> C["Anthropic API / Claude CLI"]
@@ -23,6 +26,8 @@ flowchart TD
 - `internal/bot` owns commands, consent, auto/explicit scenario transitions, quota selection, generation, and callbacks.
 - `internal/telegram` owns Bot API transport and Telegram-specific JSON types.
 - `internal/ai` exposes one provider interface with Anthropic API, Claude CLI, and deterministic fake implementations. One structured call resolves `reply`/`comment`, reports high/low confidence, drafts three candidates, and—in comment mode—performs an internal multi-angle ranking pass.
+- `internal/ai` also exposes a separate optional `ThreadPostGenerator`. Its system prompt, JSON schema, immutable fact boundary, validation, and repair retry are independent from reply/comment generation.
+- `internal/threads` owns the official Meta two-step text publication transport, disabled/fake modes, bounded responses, sanitized errors, and ambiguity classification. Access tokens never enter AI prompts, persistence, or logs.
 - `internal/store` owns durable metadata and opaque encrypted inbox payloads. It never receives plaintext source text, screenshots, voice bytes, or transcripts.
 - `internal/session` keeps private source context in memory with a short TTL and last-write-wins cancellation.
 - `internal/safety` provides an explicit deterministic moderation/filter stage before delivery. It normalizes common Unicode evasions and blocks high-confidence RU/KK/EN threats, doxxing, blackmail, self-harm encouragement, and hate/degradation.
@@ -45,6 +50,8 @@ flowchart TD
 11. Telegram receives scenario-specific native copy/refinement buttons and signed mode/feedback callbacks. A refinement includes the original source and previous three candidates. If Telegram accepts the response but job completion is not recorded, a retry can produce a duplicate response; the system does not claim exactly-once outbound delivery.
 12. Session source data expires automatically. Durable generated data is removed by the hourly retention cleanup job.
 
+The Belcanto path is separate: an allowlisted operator sends `/threads`; the post generator chooses an evergreen premise; last-mile fact and safety checks run; and PostgreSQL stores exactly the WYSIWYG preview as the only current draft for that operator. A signed publish callback atomically claims the current revision with a short fenced lease before the first Meta call, stores the returned container ID, waits for a ready status, and durably marks the irreversible phase immediately before `threads_publish`. A crash before that marker is safely recoverable with the known container; a crash or ambiguous result after it can only be reconciled from a later `PUBLISHED` status and is otherwise terminal `unknown`. Older revisions, stale workers, duplicate taps, queue redelivery, and restarts cannot publish the draft twice.
+
 ## Delivery modes
 
 Polling is the default local mode and permits one bot instance. Webhook is the production mode: the server checks `X-Telegram-Bot-Api-Secret-Token`, limits the body, enqueues work, and responds before AI processing.
@@ -57,6 +64,8 @@ Polling is the default local mode and permits one bot instance. Webhook is the p
 - Outbound acknowledgement ambiguity: a reply accepted by Telegram immediately before a worker crash may be sent again when the job is retried.
 - New input during generation: previous job is cancelled/obsolete and may not send a late result.
 - Provider timeout or malformed output: controlled user-facing retry message; raw provider output is never exposed.
+- Threads provider disabled: draft generation remains available, while confirmation makes zero Meta calls and explains how to connect the deployment. Selecting `meta` with incomplete credentials fails startup.
+- Definite Threads failure: the draft becomes retryable and keeps any known container ID. An expired pre-publish lease is recoverable; an expired or ambiguous post-attempt lease becomes `unknown`. Only a later `PUBLISHED` container status can reconcile it automatically; the service never repeats an unproven publish call.
 - Low-confidence scenario: no uncertain candidate is exposed; the signed choice callback reuses the same source and original input quota.
 - Wrong automatic scenario: the first signed correction is free, reuses the same source digest, and disables further free switches for that interaction.
 - Database unavailable: readiness fails and generation does not start.

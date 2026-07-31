@@ -21,7 +21,17 @@ Never place the bot token in a webhook URL, log, issue, screenshot, or committed
    - send `коммент: <публичный пост>` to see `🔥 Залететь в комменты`;
    - use the scenario-switch button and confirm that the original source is reused.
 6. In fake mode the scenarios, refinements, and revisions intentionally produce different deterministic demo text.
-7. Switch to `AI_PROVIDER=anthropic`, add an Anthropic API key, and restart for a real-provider test.
+7. Set `BELCANTO_OPERATOR_IDS` to your numeric Telegram ID and `THREADS_PROVIDER=fake`. Send `/threads`, inspect the exact preview, press publish twice, and verify that only the first confirmation succeeds.
+8. Switch to `AI_PROVIDER=anthropic`, add an Anthropic API key, and restart for a real-provider test.
+
+## Connect Threads
+
+1. Create a Meta app with the Threads API use case, add the Belcanto account as a tester during development, and accept that invitation in Threads.
+2. Authorize `threads_basic` and `threads_content_publish`; exchange the returned one-hour token for a long-lived token and arrange renewal before expiry.
+3. Store `THREADS_USER_ID` and `THREADS_ACCESS_TOKEN` only in the deployment secret store. Set `THREADS_PROVIDER=meta`, the operator allowlist, and `THREADS_API_BASE_URL=https://graph.threads.net/v1.0`.
+4. Restart, send `/threads`, and publish one deliberate test post. A successful confirmation must leave the draft in `published`; a double tap must not create a second Meta request.
+5. If the bot reports an unknown outcome, press the same publish button once to request a status-only reconciliation. The bot may mark it published only when Meta reports `PUBLISHED`; it will not issue another publish request.
+6. If the result remains unknown, inspect the Belcanto account manually. Do not reset the row or create another identical post until the external result is reconciled.
 
 ## Production checklist
 
@@ -34,6 +44,7 @@ Never place the bot token in a webhook URL, log, issue, screenshot, or committed
 - Secret-protected webhook on TLS 1.2+.
 - Unique 32+ byte callback and webhook secrets.
 - Voice provider either fully configured or deliberately disabled.
+- Threads is either deliberately disabled or configured with the Belcanto user ID, a long-lived token, an exact operator Telegram-ID allowlist, and the official HTTPS Graph host.
 - `/healthz`, `/readyz`, and `/metrics` monitored.
 - `/metrics` is restricted to the monitoring network or protected at the ingress.
 - Logs have a 30-day-or-shorter retention and contain no user content.
@@ -60,6 +71,7 @@ The queue is deliberately at least once. During incident review, treat a duplica
 3. Restart or roll the application.
 4. If the bot token changed, re-register the webhook.
 5. Before rotating the callback secret, pause intake and let the encrypted inbox drain. Rotation invalidates existing inline buttons and makes any still-pending inbox ciphertext intentionally unreadable.
+6. Rotate or refresh the Threads long-lived token independently; never place it in logs or a support message. Re-run Meta OAuth if its permission grant has expired.
 
 ## Rollback
 

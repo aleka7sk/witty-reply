@@ -35,6 +35,7 @@ type Memory struct {
 	usage        map[memoryUsageKey]int
 	reservations map[memoryQuotaReservationKey]memoryQuotaReservation
 	generations  map[int64]domain.GenerationRecord
+	threadDrafts map[int64]domain.ThreadDraft
 	feedback     []domain.Feedback
 	examples     map[int64][]string
 	nextID       int64
@@ -45,7 +46,8 @@ func NewMemory() *Memory {
 	return &Memory{
 		users: make(map[int64]domain.User), updates: make(map[int64]domain.UpdateJob), usage: make(map[memoryUsageKey]int),
 		reservations: make(map[memoryQuotaReservationKey]memoryQuotaReservation),
-		generations:  make(map[int64]domain.GenerationRecord), examples: make(map[int64][]string), nextID: 1, now: time.Now,
+		generations:  make(map[int64]domain.GenerationRecord), threadDrafts: make(map[int64]domain.ThreadDraft),
+		examples: make(map[int64][]string), nextID: 1, now: time.Now,
 	}
 }
 
@@ -373,6 +375,293 @@ func (m *Memory) GetGeneration(_ context.Context, id, telegramID int64) (domain.
 	return record, nil
 }
 
+func (m *Memory) CreateThreadDraft(_ context.Context, draft domain.ThreadDraft) (int64, error) {
+	if err := draft.ValidateForCreate(); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.users[draft.TelegramID]; !ok {
+		return 0, ErrNotFound
+	}
+	for id, previous := range m.threadDrafts {
+		if previous.TelegramID == draft.TelegramID && previous.Current {
+			previous.Current = false
+			previous.UpdatedAt = m.now().UTC()
+			m.threadDrafts[id] = previous
+		}
+	}
+	now := m.now().UTC()
+	draft.ID = m.nextID
+	m.nextID++
+	draft.State = domain.ThreadDraftReady
+	draft.Current = true
+	draft.ContainerID = ""
+	draft.PostID = ""
+	draft.Permalink = ""
+	draft.ErrorCode = ""
+	draft.ClaimToken = ""
+	draft.ClaimExpiresAt = nil
+	draft.PublishStartedAt = nil
+	draft.CreatedAt = now
+	draft.UpdatedAt = now
+	draft.PublishedAt = nil
+	m.threadDrafts[draft.ID] = draft
+	return draft.ID, nil
+}
+
+func (m *Memory) GetThreadDraft(_ context.Context, id, telegramID int64) (domain.ThreadDraft, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	draft, ok := m.threadDrafts[id]
+	if !ok || draft.TelegramID != telegramID {
+		return domain.ThreadDraft{}, ErrNotFound
+	}
+	return draft, nil
+}
+
+func (m *Memory) ListRecentThreadTexts(_ context.Context, telegramID int64, limit int) ([]string, error) {
+	if limit <= 0 {
+		return []string{}, nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	drafts := make([]domain.ThreadDraft, 0)
+	for _, draft := range m.threadDrafts {
+		if draft.TelegramID == telegramID {
+			drafts = append(drafts, draft)
+		}
+	}
+	sortThreadDraftsNewestFirst(drafts)
+	if len(drafts) > limit {
+		drafts = drafts[:limit]
+	}
+	texts := make([]string, 0, len(drafts))
+	for _, draft := range drafts {
+		texts = append(texts, draft.Text)
+	}
+	return texts, nil
+}
+
+func (m *Memory) ClaimThreadDraft(
+	_ context.Context,
+	id, telegramID int64,
+	revision uint32,
+	claimToken string,
+	now time.Time,
+	lease time.Duration,
+) (domain.ThreadDraft, bool, error) {
+	if err := validateThreadClaim(claimToken, now, lease); err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	draft, ok := m.threadDrafts[id]
+	if !ok || draft.TelegramID != telegramID {
+		return domain.ThreadDraft{}, false, ErrNotFound
+	}
+	if !draft.Current || draft.Revision != revision {
+		return draft, false, nil
+	}
+	now = now.UTC()
+	if draft.State == domain.ThreadDraftPublishing {
+		expired := draft.ClaimExpiresAt == nil || !draft.ClaimExpiresAt.After(now)
+		if !expired {
+			return draft, false, nil
+		}
+		if draft.PublishStartedAt != nil {
+			draft.State = domain.ThreadDraftUnknown
+			draft.ErrorCode = "publish_lease_expired"
+			draft.ClaimToken = ""
+			draft.ClaimExpiresAt = nil
+			draft.UpdatedAt = now
+			m.threadDrafts[id] = draft
+			return draft, false, nil
+		}
+	} else if draft.State != domain.ThreadDraftReady && draft.State != domain.ThreadDraftFailed {
+		return draft, false, nil
+	}
+	expiresAt := now.Add(lease)
+	draft.State = domain.ThreadDraftPublishing
+	draft.ErrorCode = ""
+	draft.ClaimToken = claimToken
+	draft.ClaimExpiresAt = &expiresAt
+	draft.PublishStartedAt = nil
+	draft.UpdatedAt = now
+	m.threadDrafts[id] = draft
+	return draft, true, nil
+}
+
+func (m *Memory) SetThreadContainer(_ context.Context, id, telegramID int64, claimToken, containerID string) error {
+	if err := validateThreadField("claim token", claimToken, maxThreadClaimTokenRunes, true); err != nil {
+		return err
+	}
+	if err := validateThreadField("container id", containerID, 255, true); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	draft, ok := m.threadDrafts[id]
+	if !ok || draft.TelegramID != telegramID {
+		return ErrNotFound
+	}
+	now := m.now().UTC()
+	if draft.State != domain.ThreadDraftPublishing || draft.ClaimToken != claimToken ||
+		draft.PublishStartedAt != nil || draft.ClaimExpiresAt == nil || !draft.ClaimExpiresAt.After(now) ||
+		(draft.ContainerID != "" && draft.ContainerID != containerID) {
+		return ErrThreadDraftState
+	}
+	draft.ContainerID = containerID
+	draft.UpdatedAt = now
+	m.threadDrafts[id] = draft
+	return nil
+}
+
+func (m *Memory) BeginThreadPublish(
+	_ context.Context,
+	id, telegramID int64,
+	claimToken string,
+	now time.Time,
+	lease time.Duration,
+) error {
+	if err := validateThreadClaim(claimToken, now, lease); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	draft, ok := m.threadDrafts[id]
+	if !ok || draft.TelegramID != telegramID {
+		return ErrNotFound
+	}
+	now = now.UTC()
+	if draft.State != domain.ThreadDraftPublishing || draft.ClaimToken != claimToken ||
+		draft.ContainerID == "" || draft.PublishStartedAt != nil ||
+		draft.ClaimExpiresAt == nil || !draft.ClaimExpiresAt.After(now) {
+		return ErrThreadDraftState
+	}
+	expiresAt := now.Add(lease)
+	draft.PublishStartedAt = &now
+	draft.ClaimExpiresAt = &expiresAt
+	draft.UpdatedAt = now
+	m.threadDrafts[id] = draft
+	return nil
+}
+
+func (m *Memory) CompleteThreadDraft(_ context.Context, id, telegramID int64, claimToken, postID, permalink string) error {
+	if err := validateThreadField("claim token", claimToken, maxThreadClaimTokenRunes, true); err != nil {
+		return err
+	}
+	if err := validateThreadField("post id", postID, 255, false); err != nil {
+		return err
+	}
+	if err := validateThreadField("permalink", permalink, 2048, false); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	draft, ok := m.threadDrafts[id]
+	if !ok || draft.TelegramID != telegramID {
+		return ErrNotFound
+	}
+	if draft.State == domain.ThreadDraftPublished && draft.PostID == postID && draft.Permalink == permalink {
+		return nil
+	}
+	if draft.State != domain.ThreadDraftPublishing || draft.ClaimToken != claimToken || draft.PublishStartedAt == nil {
+		return ErrThreadDraftState
+	}
+	now := m.now().UTC()
+	draft.State = domain.ThreadDraftPublished
+	draft.PostID = postID
+	draft.Permalink = permalink
+	draft.ErrorCode = ""
+	draft.ClaimToken = ""
+	draft.ClaimExpiresAt = nil
+	draft.UpdatedAt = now
+	draft.PublishedAt = &now
+	m.threadDrafts[id] = draft
+	return nil
+}
+
+func (m *Memory) ConfirmThreadDraftPublished(_ context.Context, id, telegramID int64, containerID string) error {
+	if err := validateThreadField("container id", containerID, 255, true); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	draft, ok := m.threadDrafts[id]
+	if !ok || draft.TelegramID != telegramID {
+		return ErrNotFound
+	}
+	if draft.State == domain.ThreadDraftPublished && draft.ContainerID == containerID {
+		return nil
+	}
+	if draft.ContainerID != containerID ||
+		(draft.State != domain.ThreadDraftUnknown &&
+			(draft.State != domain.ThreadDraftPublishing || draft.PublishStartedAt == nil)) {
+		return ErrThreadDraftState
+	}
+	now := m.now().UTC()
+	draft.State = domain.ThreadDraftPublished
+	draft.ErrorCode = ""
+	draft.ClaimToken = ""
+	draft.ClaimExpiresAt = nil
+	draft.UpdatedAt = now
+	draft.PublishedAt = &now
+	m.threadDrafts[id] = draft
+	return nil
+}
+
+func (m *Memory) FailThreadDraft(_ context.Context, id, telegramID int64, claimToken, errorCode string, unknown bool) error {
+	if err := validateThreadField("claim token", claimToken, maxThreadClaimTokenRunes, true); err != nil {
+		return err
+	}
+	errorCode = normalizeThreadErrorCode(errorCode)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	draft, ok := m.threadDrafts[id]
+	if !ok || draft.TelegramID != telegramID {
+		return ErrNotFound
+	}
+	target := domain.ThreadDraftFailed
+	if unknown {
+		target = domain.ThreadDraftUnknown
+	}
+	if draft.State == target && draft.ErrorCode == errorCode {
+		return nil
+	}
+	if draft.State != domain.ThreadDraftPublishing || draft.ClaimToken != claimToken || (unknown && draft.PublishStartedAt == nil) {
+		return ErrThreadDraftState
+	}
+	draft.State = target
+	draft.ErrorCode = errorCode
+	draft.ClaimToken = ""
+	draft.ClaimExpiresAt = nil
+	if !unknown {
+		draft.PublishStartedAt = nil
+	}
+	draft.UpdatedAt = m.now().UTC()
+	m.threadDrafts[id] = draft
+	return nil
+}
+
+func (m *Memory) CancelThreadDraft(_ context.Context, id, telegramID int64, revision uint32) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	draft, ok := m.threadDrafts[id]
+	if !ok || draft.TelegramID != telegramID {
+		return ErrNotFound
+	}
+	if !draft.Current || draft.Revision != revision || (draft.State != domain.ThreadDraftReady && draft.State != domain.ThreadDraftFailed) {
+		return ErrNotFound
+	}
+	draft.State = domain.ThreadDraftCancelled
+	draft.Current = false
+	draft.ErrorCode = ""
+	draft.UpdatedAt = m.now().UTC()
+	m.threadDrafts[id] = draft
+	return nil
+}
+
 func (m *Memory) RecordFeedback(_ context.Context, feedback domain.Feedback) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -480,6 +769,11 @@ func (m *Memory) DeleteUser(_ context.Context, telegramID int64) error {
 			delete(m.generations, id)
 		}
 	}
+	for id, draft := range m.threadDrafts {
+		if draft.TelegramID == telegramID {
+			delete(m.threadDrafts, id)
+		}
+	}
 	filtered := m.feedback[:0]
 	for _, item := range m.feedback {
 		if item.TelegramID != telegramID {
@@ -493,11 +787,31 @@ func (m *Memory) DeleteUser(_ context.Context, telegramID int64) error {
 func (m *Memory) Cleanup(_ context.Context, before time.Time) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := m.now().UTC()
 	var deleted int64
 	for id, record := range m.generations {
 		if record.CreatedAt.Before(before) {
 			delete(m.generations, id)
 			deleted++
+		}
+	}
+	for id, draft := range m.threadDrafts {
+		if draft.State == domain.ThreadDraftPublishing &&
+			(draft.ClaimExpiresAt == nil || !draft.ClaimExpiresAt.After(now)) {
+			if draft.PublishStartedAt == nil {
+				draft.State = domain.ThreadDraftFailed
+				draft.ErrorCode = "publish_lease_expired_before_attempt"
+			} else {
+				draft.State = domain.ThreadDraftUnknown
+				draft.ErrorCode = "publish_lease_expired"
+			}
+			draft.ClaimToken = ""
+			draft.ClaimExpiresAt = nil
+			draft.UpdatedAt = now
+			m.threadDrafts[id] = draft
+		}
+		if draft.UpdatedAt.Before(before) {
+			delete(m.threadDrafts, id)
 		}
 	}
 	for id, job := range m.updates {
@@ -526,5 +840,5 @@ func nextDay(now time.Time) time.Time {
 func (m *Memory) String() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return fmt.Sprintf("memory store: %d users, %d generations", len(m.users), len(m.generations))
+	return fmt.Sprintf("memory store: %d users, %d generations, %d thread drafts", len(m.users), len(m.generations), len(m.threadDrafts))
 }

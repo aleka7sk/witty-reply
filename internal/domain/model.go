@@ -165,6 +165,102 @@ type GenerationRecord struct {
 	CreatedAt   time.Time
 }
 
+// MaxThreadPostRunes is the public Threads limit for a text post. The exact
+// preview stored in ThreadDraft is the text sent to Threads after approval.
+const MaxThreadPostRunes = 500
+
+type ThreadVoice string
+
+const (
+	ThreadVoiceBelcanto ThreadVoice = "belcanto"
+	ThreadVoiceAlisher  ThreadVoice = "alisher"
+)
+
+func (v ThreadVoice) Valid() bool {
+	return v == ThreadVoiceBelcanto || v == ThreadVoiceAlisher
+}
+
+type ThreadDraftState string
+
+const (
+	ThreadDraftReady      ThreadDraftState = "draft"
+	ThreadDraftPublishing ThreadDraftState = "publishing"
+	ThreadDraftPublished  ThreadDraftState = "published"
+	ThreadDraftFailed     ThreadDraftState = "failed"
+	ThreadDraftUnknown    ThreadDraftState = "unknown"
+	ThreadDraftCancelled  ThreadDraftState = "cancelled"
+)
+
+func (s ThreadDraftState) Valid() bool {
+	switch s {
+	case ThreadDraftReady, ThreadDraftPublishing, ThreadDraftPublished,
+		ThreadDraftFailed, ThreadDraftUnknown, ThreadDraftCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// ThreadDraft is the durable, single-preview publication aggregate for the
+// Belcanto Threads copilot. Current is an ownership-scoped optimistic pointer:
+// creating a replacement makes every older signed keyboard stale without
+// deleting its audit and idempotency record.
+type ThreadDraft struct {
+	ID          int64
+	TelegramID  int64
+	Voice       ThreadVoice
+	Goal        string
+	Text        string
+	Provider    string
+	Model       string
+	Revision    uint32
+	State       ThreadDraftState
+	Current     bool
+	ContainerID string
+	PostID      string
+	Permalink   string
+	ErrorCode   string
+	// ClaimToken fences a single publisher worker. ClaimExpiresAt makes a
+	// pre-publish crash recoverable, while PublishStartedAt is the durable
+	// boundary after which an automatic retry could create a duplicate.
+	ClaimToken       string
+	ClaimExpiresAt   *time.Time
+	PublishStartedAt *time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	PublishedAt      *time.Time
+}
+
+// ValidateForCreate enforces the durable preview boundary without rewriting
+// any user-visible text. CreateThreadDraft supplies lifecycle fields itself.
+func (d ThreadDraft) ValidateForCreate() error {
+	if d.TelegramID <= 0 {
+		return errors.New("thread draft owner is required")
+	}
+	if !d.Voice.Valid() {
+		return errors.New("thread draft voice is invalid")
+	}
+	if !utf8.ValidString(d.Goal) || strings.ContainsRune(d.Goal, '\x00') || strings.TrimSpace(d.Goal) == "" || utf8.RuneCountInString(d.Goal) > 120 {
+		return errors.New("thread draft goal must contain 1 to 120 characters")
+	}
+	if !utf8.ValidString(d.Text) || strings.ContainsRune(d.Text, '\x00') || strings.TrimSpace(d.Text) == "" || utf8.RuneCountInString(d.Text) > MaxThreadPostRunes {
+		return errors.New("thread draft text must contain 1 to 500 characters")
+	}
+	if !utf8.ValidString(d.Provider) || strings.ContainsRune(d.Provider, '\x00') || strings.TrimSpace(d.Provider) == "" || utf8.RuneCountInString(d.Provider) > 100 {
+		return errors.New("thread draft provider must contain 1 to 100 characters")
+	}
+	if !utf8.ValidString(d.Model) || strings.ContainsRune(d.Model, '\x00') || strings.TrimSpace(d.Model) == "" || utf8.RuneCountInString(d.Model) > 160 {
+		return errors.New("thread draft model must contain 1 to 160 characters")
+	}
+	if d.Revision == 0 {
+		return errors.New("thread draft revision must be positive")
+	}
+	if d.State != "" && d.State != ThreadDraftReady {
+		return errors.New("new thread draft state must be draft")
+	}
+	return nil
+}
+
 type UserStats struct {
 	UsedToday  int
 	DailyLimit int

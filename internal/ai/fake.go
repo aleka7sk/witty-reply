@@ -42,6 +42,73 @@ func (provider *FakeProvider) Generate(ctx context.Context, request domain.Gener
 	return result, nil
 }
 
+func (provider *FakeProvider) GenerateThreadPost(ctx context.Context, request ThreadPostRequest) (ThreadPostResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ThreadPostResult{}, err
+	}
+	normalized, err := normalizeThreadPostRequest(request)
+	if err != nil {
+		return ThreadPostResult{}, err
+	}
+	bank := fakeThreadPostBank(normalized.Voice)
+	offset := int(normalized.Seed % uint32(len(bank)))
+	switch normalized.Transform {
+	case "wittier":
+		offset = (offset + 2) % len(bank)
+	case "warmer":
+		offset = (offset + 4) % len(bank)
+	case "shorter":
+		offset = (offset + 6) % len(bank)
+	case "different_angle":
+		offset = (offset + 8) % len(bank)
+	}
+	for attempt := 0; attempt < len(bank); attempt++ {
+		candidate := bank[(offset+attempt)%len(bank)]
+		result := ThreadPostResult{Goal: candidate.goal, Text: candidate.text}
+		if err := validateThreadPostResult(&result, normalized); err != nil {
+			continue
+		}
+		result.Provider = providerFake
+		result.Model = "deterministic-threads-v1"
+		return result, nil
+	}
+	return ThreadPostResult{}, fmt.Errorf("fake provider Threads freshness invariant: %w", ErrInvalidResponse)
+}
+
+type fakeThreadPost struct {
+	goal string
+	text string
+}
+
+func fakeThreadPostBank(voice string) []fakeThreadPost {
+	if voice == "alisher" {
+		return []fakeThreadPost{
+			{goal: "recognition", text: "Взрослая жизнь устроена странно: на созвоны голос находится всегда, на любимую песню — после внутреннего согласования."},
+			{goal: "discussion", text: "Мы так долго учимся говорить уверенно, а потом стесняемся спеть одну ноту."},
+			{goal: "recognition", text: "У взрослого человека есть отдельный талант: хотеть петь и одновременно ждать письменного разрешения от вселенной."},
+			{goal: "discussion", text: "Караоке быстро показывает, кто выбрал песню сердцем, а кто переоценил переговорные навыки."},
+			{goal: "recognition", text: "Самая сложная нота — та, перед которой успел придумать мнение всех соседей."},
+			{goal: "warmth", text: "Иногда «я не умею петь» означает «я ещё не слышал себя без внутреннего отдела критики»."},
+			{goal: "discussion", text: "Микрофон ничего не добавляет к характеру. Он просто перестаёт его скрывать."},
+			{goal: "recognition", text: "Перед первой нотой внутренний критик обычно просит слово вне очереди."},
+			{goal: "discussion", text: "Есть песни, которые человек выбирает сам. И есть песни, которые внезапно знают о нём больше."},
+			{goal: "warmth", text: "Уверенность редко приходит до голоса. Обычно она догоняет его где-то между вдохом и первой фразой."},
+		}
+	}
+	return []fakeThreadPost{
+		{goal: "warmth", text: "Иногда голосу нужен не новый диапазон, а разрешение звучать без извинений."},
+		{goal: "recognition", text: "Пение — редкий способ занять пространство и никого при этом не вытеснить."},
+		{goal: "warmth", text: "Есть дни, когда лучший разговор с собой начинается не со слов, а с ноты."},
+		{goal: "recognition", text: "Свой голос узнаётся не тогда, когда он идеален, а когда перестаёшь прятать его за чужими."},
+		{goal: "warmth", text: "Вокал начинается не с громкости. Он начинается с момента, когда перестаёшь уменьшать себя."},
+		{goal: "discussion", text: "Астана умеет быть громкой. Иногда особенно приятно ответить ей своей нотой."},
+		{goal: "warmth", text: "Музыка не требует быть готовым. Она просит быть настоящим."},
+		{goal: "recognition", text: "Голос — это единственный инструмент, который невозможно забыть дома."},
+		{goal: "discussion", text: "Какая песня первой вспоминается, когда никому ничего не нужно доказывать?"},
+		{goal: "warmth", text: "Иногда одна честная нота возвращает к себе быстрее, чем длинный внутренний разговор."},
+	}
+}
+
 func fakeResult(request domain.GenerationRequest) domain.GenerationResult {
 	mode, confidence := fakeScenario(request)
 	texts := fakeReplyBank(mode, request.Input.Text)

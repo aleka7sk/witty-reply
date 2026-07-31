@@ -16,6 +16,8 @@ The product supports witty teasing and firm boundaries. It is not an automated h
 - Reply refinements: funnier, sharper, softer, shorter, more, and meme.
 - Public-comment refinements: funnier, subtler, bolder, more absurd, shorter, a genuinely different angle, and three more.
 - Original 1080×1080 Cyrillic PNG meme cards rendered locally with DejaVu — no scraping or unlicensed template catalog.
+- Operator-only Belcanto Threads Copilot: `/threads` prepares one complete school post with no topic required, offers Belcanto/Alisher voices and optional refinements, and publishes only after an explicit `✅ Опубликовать` confirmation.
+- Two-step official Threads API publishing with durable draft state and an atomic claim that blocks duplicate publication after double taps, Telegram redelivery, or a process restart.
 - Consent gate, user-owned signed callbacks, atomic daily quotas, feedback, saved style examples, reset, and complete profile deletion.
 - AES-256-GCM encrypted durable Telegram inbox with per-user ordering, at-least-once processing, retries, lease recovery, dead-lettering, and payload scrubbing at a terminal state.
 - PostgreSQL production persistence and an in-memory development store.
@@ -120,6 +122,7 @@ For a public product, use a commercial Anthropic API key. Do not route user traf
 | `/style` | View/change the default tone, saved examples, or reset personalization |
 | `/plan` | Show plan and current daily use |
 | `/privacy` | Show the in-bot privacy summary |
+| `/threads` | Prepare a publish-ready Belcanto Threads post (operators only) |
 | `/delete_me` | Confirm and permanently delete profile data |
 | `/help` | Supported inputs and commands |
 
@@ -132,9 +135,43 @@ cancel - Отменить обработку
 style - Настроить стиль ответов
 plan - Лимиты и тариф
 privacy - Приватность
+threads - Подготовить пост Belcanto для Threads
 delete_me - Удалить мои данные
 help - Помощь
 ```
+
+## Belcanto Threads Copilot
+
+This is a separate, operator-only workspace inside the same Telegram bot. It does not change the ordinary reply/comment flow or consume its quotas.
+
+Send `/threads`. The bot chooses an evergreen editorial premise itself and returns one WYSIWYG Russian post. Normal use needs no topic and no editing: review the exact text and press `✅ Опубликовать`. Optional buttons can make it shorter, warmer, wittier, remove sales cues, choose a different premise, or switch between the Belcanto and Alisher voices.
+
+The first slice is deliberately fact-closed. It knows only that Belcanto is a vocal school in Astana. The model and application validator reject invented prices, discounts, trial terms, students, teachers, testimonials, results, events, schedules, availability, and current happenings.
+
+### Safe local smoke test
+
+```dotenv
+BELCANTO_OPERATOR_IDS=123456789
+THREADS_PROVIDER=fake
+```
+
+Restart the app, accept the normal consent gate, and send `/threads`. The fake publisher exercises the complete confirmation and durable idempotency flow without contacting Meta.
+
+### Connect the Belcanto Threads account
+
+Create a Meta app with the Threads API use case and grant the account at least `threads_basic` and `threads_content_publish`. Configure the long-lived user token and its returned Threads user ID:
+
+```dotenv
+BELCANTO_OPERATOR_IDS=123456789
+THREADS_PROVIDER=meta
+THREADS_USER_ID=17840000000000000
+THREADS_ACCESS_TOKEN=TH...
+THREADS_API_BASE_URL=https://graph.threads.net/v1.0
+```
+
+After restart, confirmation performs the official two-step flow: create a text container, wait until it is ready, persist its ID, then publish that exact preview. A short fenced lease makes a crash before the irreversible call safely recoverable. Once `threads_publish` has started, the bot reconciles only through container status and never repeats the call without proof that it is safe. A second tap cannot create a duplicate; an unprovable outcome becomes `unknown` and requires a manual account check.
+
+Meta setup references: [Get started](https://developers.facebook.com/documentation/threads/get-started), [publishing posts](https://developers.facebook.com/documentation/threads/posts), and [access tokens](https://developers.facebook.com/documentation/threads/get-started/get-access-tokens-and-permissions).
 
 ## Input limits
 
@@ -225,7 +262,7 @@ PostgreSQL integration tests use an isolated temporary schema and run whenever `
 
 ## Intentional v2 boundaries
 
-No automatic access to private chats, no automatic sending on the user's behalf, no group operation, no scraped memes, no Telegram Stars billing, no mobile app, and no fine-tuning on Claude outputs. Personalization uses only explicit profile settings and style examples at prompt time.
+No automatic access to private chats, no autonomous publication, no group operation, no scraped memes, no Telegram Stars billing, no mobile app, and no fine-tuning on Claude outputs. Ordinary Witty Reply never sends or publishes; the operator-only Belcanto workspace publishes only the exact preview whose `✅ Опубликовать` button was explicitly pressed. Personalization uses only explicit profile settings and style examples at prompt time.
 
 The codebase is a modular monolith on purpose. The first product goal is to validate response quality and repeat use; Kubernetes, Kafka, and microservices would add operating cost without improving that experiment.
 

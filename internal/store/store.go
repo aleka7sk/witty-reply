@@ -24,6 +24,16 @@ type Store interface {
 	RefundQuota(context.Context, int64, int64, domain.QuotaCategory) error
 	SaveGeneration(context.Context, domain.GenerationRecord) (int64, error)
 	GetGeneration(context.Context, int64, int64) (domain.GenerationRecord, error)
+	CreateThreadDraft(context.Context, domain.ThreadDraft) (int64, error)
+	GetThreadDraft(context.Context, int64, int64) (domain.ThreadDraft, error)
+	ListRecentThreadTexts(context.Context, int64, int) ([]string, error)
+	ClaimThreadDraft(context.Context, int64, int64, uint32, string, time.Time, time.Duration) (domain.ThreadDraft, bool, error)
+	SetThreadContainer(context.Context, int64, int64, string, string) error
+	BeginThreadPublish(context.Context, int64, int64, string, time.Time, time.Duration) error
+	CompleteThreadDraft(context.Context, int64, int64, string, string, string) error
+	ConfirmThreadDraftPublished(context.Context, int64, int64, string) error
+	FailThreadDraft(context.Context, int64, int64, string, string, bool) error
+	CancelThreadDraft(context.Context, int64, int64, uint32) error
 	RecordFeedback(context.Context, domain.Feedback) error
 	ListStyleExamples(context.Context, int64, int) ([]string, error)
 	SaveStyleExample(context.Context, int64, int64, string, int) (bool, error)
@@ -32,3 +42,8 @@ type Store interface {
 	DeleteUser(context.Context, int64) error
 	Cleanup(context.Context, time.Time) (int64, error)
 }
+
+var (
+	_ Store = (*Memory)(nil)
+	_ Store = (*Postgres)(nil)
+)

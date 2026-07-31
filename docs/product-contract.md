@@ -7,7 +7,7 @@ Witty Reply is a Telegram co-author with two products inside one frictionless fl
 - **Reply to the person** — write from the user's perspective to a specific conversation participant.
 - **Comment under the post** — write as an outside reader leaving a standalone, witty public comment.
 
-A user forwards a message, pastes text, sends a screenshot, or records a voice note. The service selects a scenario automatically, makes the selection visible, and returns three candidates. It never reads private chats automatically and never posts or replies on the user's behalf.
+A user forwards a message, pastes text, sends a screenshot, or records a voice note. The service selects a scenario automatically, makes the selection visible, and returns three candidates. It never reads private chats automatically. The ordinary reply/comment product never posts or replies on the user's behalf; the isolated Belcanto operator workspace can publish only the exact first-party post explicitly confirmed with its signed publish button.
 
 The product is deliberately positioned as “answer without losing face,” not as a harassment or insult generator.
 
@@ -49,6 +49,16 @@ Inbound updates are deduplicated by Telegram `update_id` and processed in strict
 
 The profile stores a default reply tone and replies the user explicitly saves as style examples. Comment results deliberately do not show the global style-save buttons so public jokes cannot silently contaminate private-reply personalization. This is not model fine-tuning. Generated Claude outputs and private conversations are not a training dataset for a competing model.
 
+## Belcanto Threads workspace
+
+`/threads` is available only to a configured allowlist of Belcanto Telegram operators who have accepted the normal AI-processing consent. It prepares one complete WYSIWYG Russian post without requiring a topic. Optional signed controls request a new premise, shorter/warmer/wittier treatment, removal of sales cues, or a switch between the Belcanto and Alisher voices. The primary path is one explicit `✅ Опубликовать` confirmation.
+
+This first slice is fact-closed: the generator knows only that Belcanto is a vocal school in Astana. It must not invent or imply prices, discounts, trial terms, students, teachers, testimonials, results, events, schedules, availability, addresses, promotions, or current happenings. A dedicated schema, semantic validator, 500-character safety filter, and one repair attempt apply before a draft becomes publishable.
+
+Every preview is stored as an owned, versioned durable draft. Creating a refinement makes prior keyboards stale. Publishing atomically changes the current draft from `draft` or retryable `failed` to `publishing` and issues a fenced short lease before any Meta call. The official Threads client creates a text container, persists its ID, waits for readiness, and durably marks the attempt immediately before the irreversible publish call. A stale worker cannot finalize a newer claim. A crash before the attempt marker is recoverable; a crash or ambiguous result afterward is never blindly retried and becomes `unknown` unless a later container status proves it was published.
+
+With `THREADS_PROVIDER=disabled`, missing Meta credentials do not prevent Witty Reply or draft generation from running. Confirmation fails closed without making an HTTP request. Selecting `meta` is an explicit production configuration and therefore fails startup when its required credentials are incomplete. Generated Threads drafts and their publication identifiers are removed by `/delete_me` and normal content-retention cleanup.
+
 ## Consent and deletion
 
 Before the first external request, the user must explicitly agree that submitted content will be processed by the configured AI provider and that voice notes, when enabled, first pass through the configured speech-to-text provider. The consent surface links to the deployment's public `PRIVACY_URL`. `/delete_me` uses a confirmation step, cancels active context, and deletes the user's profile, generations, feedback, usage linkage, and style examples.
@@ -75,4 +85,4 @@ PostgreSQL entitlements can override limits without changing application code. B
 
 ## Definition of done
 
-The release must prove: consent gating, an encrypted durable at-least-once inbox with deduplicated Telegram updates, ownership-checked callbacks, exact three-candidate output, auto/explicit scenario routing, low-confidence clarification, no-resend mode switching, scenario-specific refinements and fallbacks, input/output safety, atomic/free-correction quota semantics, explicit feedback, profile reset, complete deletion, polling and secret-protected webhook modes, no raw-content logging, HTTPS-only production processors and database transport, controlled provider failures, unit and PostgreSQL integration tests with the race detector, static analysis, container build, and a documented production runbook.
+The release must prove: consent gating, an encrypted durable at-least-once inbox with deduplicated Telegram updates, ownership-checked callbacks, exact three-candidate reply/comment output, auto/explicit scenario routing, low-confidence clarification, no-resend mode switching, scenario-specific refinements and fallbacks, input/output safety, atomic/free-correction quota semantics, explicit feedback, profile reset, complete deletion, polling and secret-protected webhook modes, no raw-content logging, HTTPS-only production processors and database transport, controlled provider failures, unit and PostgreSQL integration tests with the race detector, static analysis, container build, and a documented production runbook. The Belcanto slice additionally proves operator authorization, autonomous fact-safe draft generation, stale-revision rejection, fenced publish leases, recovery before the irreversible phase, no-repeat handling afterward, a persisted Threads container ID, safe disabled configuration, and an `unknown` terminal state for an unprovable publication.

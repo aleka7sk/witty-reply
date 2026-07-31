@@ -288,3 +288,250 @@ func TestMemoryDeleteUserRemovesActorQueueAndFinalizationIsIdempotent(t *testing
 		t.Fatalf("finalize deleted job = %v", err)
 	}
 }
+
+func TestMemoryThreadDraftLifecycleIsOwnedCurrentAndIdempotent(t *testing.T) {
+	ctx := context.Background()
+	memory := NewMemory()
+	now := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	memory.now = func() time.Time { return now }
+	for _, owner := range []int64{42, 99} {
+		if _, err := memory.UpsertUser(ctx, domain.User{TelegramID: owner}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	first := testThreadDraft(42, 1, "Первый пост")
+	firstID, err := memory.CreateThreadDraft(ctx, first)
+	if err != nil {
+		t.Fatalf("CreateThreadDraft(): %v", err)
+	}
+	stored, err := memory.GetThreadDraft(ctx, firstID, 42)
+	if err != nil || !stored.Current || stored.State != domain.ThreadDraftReady || stored.Text != first.Text {
+		t.Fatalf("stored first = %+v, %v", stored, err)
+	}
+	if _, err := memory.GetThreadDraft(ctx, firstID, 99); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign GetThreadDraft() = %v", err)
+	}
+
+	const claims = 24
+	start := make(chan struct{})
+	results := make(chan bool, claims)
+	var workers sync.WaitGroup
+	for index := range claims {
+		workers.Add(1)
+		go func(claimToken string) {
+			defer workers.Done()
+			<-start
+			_, claimed, claimErr := memory.ClaimThreadDraft(ctx, firstID, 42, 1, claimToken, now, time.Minute)
+			if claimErr != nil {
+				t.Errorf("ClaimThreadDraft(): %v", claimErr)
+			}
+			results <- claimed
+		}(fmt.Sprintf("claim-%d", index))
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+	claimedCount := 0
+	for claimed := range results {
+		if claimed {
+			claimedCount++
+		}
+	}
+	if claimedCount != 1 {
+		t.Fatalf("successful claims = %d, want 1", claimedCount)
+	}
+	stored, _ = memory.GetThreadDraft(ctx, firstID, 42)
+	firstClaim := stored.ClaimToken
+	if err := memory.SetThreadContainer(ctx, firstID, 42, firstClaim, "container-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := memory.SetThreadContainer(ctx, firstID, 42, firstClaim, "container-1"); err != nil {
+		t.Fatalf("idempotent SetThreadContainer(): %v", err)
+	}
+	if err := memory.SetThreadContainer(ctx, firstID, 42, firstClaim, "different"); !errors.Is(err, ErrThreadDraftState) {
+		t.Fatalf("container replacement error = %v", err)
+	}
+	if err := memory.BeginThreadPublish(ctx, firstID, 42, firstClaim, now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := memory.CompleteThreadDraft(ctx, firstID, 42, firstClaim, "post-1", "https://www.threads.net/@belcanto/post/1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := memory.CompleteThreadDraft(ctx, firstID, 42, firstClaim, "post-1", "https://www.threads.net/@belcanto/post/1"); err != nil {
+		t.Fatalf("idempotent CompleteThreadDraft(): %v", err)
+	}
+	stored, _ = memory.GetThreadDraft(ctx, firstID, 42)
+	if stored.State != domain.ThreadDraftPublished || stored.PublishedAt == nil || stored.ContainerID != "container-1" {
+		t.Fatalf("published first = %+v", stored)
+	}
+
+	now = now.Add(time.Minute)
+	secondID, err := memory.CreateThreadDraft(ctx, testThreadDraft(42, 2, "Второй пост"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, _ := memory.GetThreadDraft(ctx, firstID, 42)
+	if old.Current {
+		t.Fatal("replacement left old draft current")
+	}
+	if stale, claimed, err := memory.ClaimThreadDraft(ctx, firstID, 42, 1, "stale-claim", now, time.Minute); err != nil || claimed || stale.Current {
+		t.Fatalf("stale claim = %+v, %v, %v", stale, claimed, err)
+	}
+	texts, err := memory.ListRecentThreadTexts(ctx, 42, 2)
+	if err != nil || len(texts) != 2 || texts[0] != "Второй пост" || texts[1] != "Первый пост" {
+		t.Fatalf("recent texts = %v, %v", texts, err)
+	}
+
+	if _, claimed, err := memory.ClaimThreadDraft(ctx, secondID, 42, 2, "second-claim", now, time.Minute); err != nil || !claimed {
+		t.Fatalf("claim second = %v, %v", claimed, err)
+	}
+	if err := memory.SetThreadContainer(ctx, secondID, 42, "second-claim", "container-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := memory.FailThreadDraft(ctx, secondID, 42, "second-claim", "temporary", false); err != nil {
+		t.Fatal(err)
+	}
+	if retried, claimed, err := memory.ClaimThreadDraft(ctx, secondID, 42, 2, "retry-claim", now, time.Minute); err != nil || !claimed || retried.ErrorCode != "" || retried.ContainerID != "container-2" {
+		t.Fatalf("retry claim = %+v, %v, %v", retried, claimed, err)
+	}
+	if err := memory.BeginThreadPublish(ctx, secondID, 42, "retry-claim", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := memory.FailThreadDraft(ctx, secondID, 42, "retry-claim", "ambiguous", true); err != nil {
+		t.Fatal(err)
+	}
+	unknown, claimed, err := memory.ClaimThreadDraft(ctx, secondID, 42, 2, "unknown-claim", now, time.Minute)
+	if err != nil || claimed || unknown.State != domain.ThreadDraftUnknown {
+		t.Fatalf("unknown claim = %+v, %v, %v", unknown, claimed, err)
+	}
+
+	now = now.Add(time.Minute)
+	thirdID, err := memory.CreateThreadDraft(ctx, testThreadDraft(42, 3, "Третий пост"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := memory.CancelThreadDraft(ctx, thirdID, 42, 3); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, _ := memory.GetThreadDraft(ctx, thirdID, 42)
+	if cancelled.State != domain.ThreadDraftCancelled || cancelled.Current {
+		t.Fatalf("cancelled draft = %+v", cancelled)
+	}
+
+	if err := memory.DeleteUser(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := memory.GetThreadDraft(ctx, firstID, 42); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("draft survived DeleteUser(): %v", err)
+	}
+}
+
+func TestMemoryThreadDraftLeaseFencesStaleWorkersAndRecoversByPhase(t *testing.T) {
+	ctx := context.Background()
+	memory := NewMemory()
+	now := time.Date(2026, 8, 1, 11, 0, 0, 0, time.UTC)
+	memory.now = func() time.Time { return now }
+	for _, owner := range []int64{42, 99} {
+		if _, err := memory.UpsertUser(ctx, domain.User{TelegramID: owner}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	draftID, err := memory.CreateThreadDraft(ctx, testThreadDraft(42, 1, "Восстановимый пост"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := memory.ClaimThreadDraft(ctx, draftID, 42, 1, "old-worker", now, time.Minute); err != nil || !claimed {
+		t.Fatalf("old claim = %v, %v", claimed, err)
+	}
+	if err := memory.SetThreadContainer(ctx, draftID, 42, "old-worker", "container-reused"); err != nil {
+		t.Fatal(err)
+	}
+
+	now = now.Add(2 * time.Minute)
+	recovered, claimed, err := memory.ClaimThreadDraft(ctx, draftID, 42, 1, "new-worker", now, time.Minute)
+	if err != nil || !claimed || recovered.ContainerID != "container-reused" || recovered.ClaimToken != "new-worker" {
+		t.Fatalf("pre-publish recovery = %+v, %v, %v", recovered, claimed, err)
+	}
+	if err := memory.BeginThreadPublish(ctx, draftID, 42, "old-worker", now, time.Minute); !errors.Is(err, ErrThreadDraftState) {
+		t.Fatalf("stale worker began publish: %v", err)
+	}
+	if err := memory.BeginThreadPublish(ctx, draftID, 42, "new-worker", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	now = now.Add(2 * time.Minute)
+	unknown, claimed, err := memory.ClaimThreadDraft(ctx, draftID, 42, 1, "third-worker", now, time.Minute)
+	if err != nil || claimed || unknown.State != domain.ThreadDraftUnknown || unknown.PublishStartedAt == nil {
+		t.Fatalf("post-attempt recovery = %+v, %v, %v", unknown, claimed, err)
+	}
+	if err := memory.CompleteThreadDraft(ctx, draftID, 42, "new-worker", "post-duplicate", ""); !errors.Is(err, ErrThreadDraftState) {
+		t.Fatalf("expired worker completed after recovery: %v", err)
+	}
+	if err := memory.ConfirmThreadDraftPublished(ctx, draftID, 42, "container-reused"); err != nil {
+		t.Fatalf("status reconciliation: %v", err)
+	}
+	published, _ := memory.GetThreadDraft(ctx, draftID, 42)
+	if published.State != domain.ThreadDraftPublished || published.PublishedAt == nil || published.ClaimToken != "" {
+		t.Fatalf("reconciled draft = %+v", published)
+	}
+
+	cleanupID, err := memory.CreateThreadDraft(ctx, testThreadDraft(99, 1, "Cleanup recovery"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := memory.ClaimThreadDraft(ctx, cleanupID, 99, 1, "cleanup-worker", now, time.Minute); err != nil || !claimed {
+		t.Fatalf("cleanup claim = %v, %v", claimed, err)
+	}
+	now = now.Add(2 * time.Minute)
+	if _, err := memory.Cleanup(ctx, now.Add(-24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	recoveredByCleanup, _ := memory.GetThreadDraft(ctx, cleanupID, 99)
+	if recoveredByCleanup.State != domain.ThreadDraftFailed || recoveredByCleanup.ClaimToken != "" {
+		t.Fatalf("cleanup recovery = %+v", recoveredByCleanup)
+	}
+}
+
+func TestMemoryCleanupRemovesOldThreadDraftsWithoutChangingGenerationCount(t *testing.T) {
+	ctx := context.Background()
+	memory := NewMemory()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	memory.now = func() time.Time { return now }
+	_, _ = memory.UpsertUser(ctx, domain.User{TelegramID: 42})
+	oldID, err := memory.CreateThreadDraft(ctx, testThreadDraft(42, 1, "Старый"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(48 * time.Hour)
+	newID, err := memory.CreateThreadDraft(ctx, testThreadDraft(42, 2, "Новый"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := memory.threadDrafts[oldID]
+	old.UpdatedAt = now.Add(-48 * time.Hour)
+	memory.threadDrafts[oldID] = old
+	deleted, err := memory.Cleanup(ctx, now.Add(-24*time.Hour))
+	if err != nil || deleted != 0 {
+		t.Fatalf("Cleanup() = %d, %v", deleted, err)
+	}
+	if _, err := memory.GetThreadDraft(ctx, oldID, 42); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old draft survived cleanup: %v", err)
+	}
+	if _, err := memory.GetThreadDraft(ctx, newID, 42); err != nil {
+		t.Fatalf("fresh draft removed: %v", err)
+	}
+}
+
+func testThreadDraft(owner int64, revision uint32, text string) domain.ThreadDraft {
+	return domain.ThreadDraft{
+		TelegramID: owner,
+		Voice:      domain.ThreadVoiceBelcanto,
+		Goal:       "обсуждение",
+		Text:       text,
+		Provider:   "fake",
+		Model:      "deterministic",
+		Revision:   revision,
+	}
+}

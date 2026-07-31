@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -46,5 +47,60 @@ func TestParseScenarioMode(t *testing.T) {
 	}
 	if _, ok := ParseScenarioMode("ambiguous"); ok {
 		t.Fatal("unknown scenario mode was accepted")
+	}
+}
+
+func TestThreadDraftValidateForCreate(t *testing.T) {
+	valid := ThreadDraft{
+		TelegramID: 42,
+		Voice:      ThreadVoiceBelcanto,
+		Goal:       "обсуждение",
+		Text:       "Взрослость — это когда любимую песню уже не стесняешься хотя бы включать.",
+		Provider:   "fake",
+		Model:      "deterministic",
+		Revision:   1,
+	}
+	if err := valid.ValidateForCreate(); err != nil {
+		t.Fatalf("valid draft: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*ThreadDraft)
+	}{
+		{name: "owner", mutate: func(d *ThreadDraft) { d.TelegramID = 0 }},
+		{name: "voice", mutate: func(d *ThreadDraft) { d.Voice = "invented" }},
+		{name: "goal", mutate: func(d *ThreadDraft) { d.Goal = "  " }},
+		{name: "text", mutate: func(d *ThreadDraft) { d.Text = strings.Repeat("я", MaxThreadPostRunes+1) }},
+		{name: "provider", mutate: func(d *ThreadDraft) { d.Provider = "" }},
+		{name: "model", mutate: func(d *ThreadDraft) { d.Model = "" }},
+		{name: "revision", mutate: func(d *ThreadDraft) { d.Revision = 0 }},
+		{name: "state", mutate: func(d *ThreadDraft) { d.State = ThreadDraftPublished }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			draft := valid
+			test.mutate(&draft)
+			if err := draft.ValidateForCreate(); err == nil {
+				t.Fatal("invalid draft was accepted")
+			}
+		})
+	}
+}
+
+func TestThreadVoiceAndDraftStateValidity(t *testing.T) {
+	if !ThreadVoiceBelcanto.Valid() || !ThreadVoiceAlisher.Valid() || ThreadVoice("other").Valid() {
+		t.Fatal("thread voice validity contract is wrong")
+	}
+	for _, state := range []ThreadDraftState{
+		ThreadDraftReady, ThreadDraftPublishing, ThreadDraftPublished,
+		ThreadDraftFailed, ThreadDraftUnknown, ThreadDraftCancelled,
+	} {
+		if !state.Valid() {
+			t.Fatalf("state %q is not valid", state)
+		}
+	}
+	if ThreadDraftState("other").Valid() {
+		t.Fatal("unknown draft state was accepted")
 	}
 }
