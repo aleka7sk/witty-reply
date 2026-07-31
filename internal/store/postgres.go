@@ -185,9 +185,9 @@ func (p *Postgres) RetryUpdate(ctx context.Context, updateID int64, leaseToken s
 		UPDATE telegram_update_jobs
 		SET status = CASE WHEN attempts >= $6 THEN 'dead' ELSE 'pending' END,
 			payload = CASE WHEN attempts >= $6 THEN ''::bytea ELSE payload END,
-			available_at = CASE WHEN attempts >= $6 THEN $3 ELSE $4 END,
+			available_at = CASE WHEN attempts >= $6 THEN $3::timestamptz ELSE $4::timestamptz END,
 			lease_token = NULL, lease_until = NULL, last_error = $5,
-			completed_at = CASE WHEN attempts >= $6 THEN $3 ELSE NULL END
+			completed_at = CASE WHEN attempts >= $6 THEN $3::timestamptz ELSE NULL END
 		WHERE update_id = $1 AND status = 'processing' AND lease_token = $2
 		RETURNING status`,
 		updateID, leaseToken, now, retryAt, truncateErrorCode(errorCode), maxAttempts,
