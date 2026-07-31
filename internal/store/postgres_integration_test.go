@@ -33,7 +33,12 @@ func TestPostgresIntegration(t *testing.T) {
 		t.Fatalf("Ping(): %v", err)
 	}
 
-	now := time.Date(2026, 7, 31, 20, 0, 0, 0, time.UTC)
+	// Queue availability is written with PostgreSQL's clock. Use the same clock
+	// for deterministic claims and keep a small margin for the setup below.
+	var now time.Time
+	if err := postgres.pool.QueryRow(ctx, `SELECT clock_timestamp() + interval '1 minute'`).Scan(&now); err != nil {
+		t.Fatalf("read PostgreSQL clock: %v", err)
+	}
 	const (
 		ownerID      = int64(71001)
 		otherID      = int64(71002)
