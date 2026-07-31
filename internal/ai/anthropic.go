@@ -140,36 +140,48 @@ func (provider *AnthropicProvider) Generate(ctx context.Context, request domain.
 	}
 
 	var (
-		lastErr   error
-		nextDelay time.Duration
+		nextDelay        time.Duration
+		transportRetries int
+		repairUsed       bool
 	)
-	for attempt := 0; attempt <= provider.maxRetries; attempt++ {
+	for {
 		if err := ctx.Err(); err != nil {
 			return domain.GenerationResult{}, err
 		}
-		if attempt > 0 {
+		if nextDelay > 0 {
 			if err := sleepContext(ctx, nextDelay); err != nil {
 				return domain.GenerationResult{}, err
 			}
+			nextDelay = 0
 		}
 
 		result, retryAfter, retryable, callErr := provider.doRequest(ctx, body, normalized.Tone, normalized.Mode)
 		if callErr == nil {
 			if freshErr := validateFreshReplies(result.Replies, normalized.PreviousReplies); freshErr != nil {
-				return domain.GenerationResult{}, &ProviderError{Provider: providerAnthropic, Code: "invalid_output", Err: freshErr}
+				callErr = newInvalidOutputError(providerAnthropic, "", freshErr)
+			} else {
+				return result, nil
 			}
-			return result, nil
 		}
-		lastErr = callErr
-		if !retryable || attempt == provider.maxRetries {
+		var providerErr *ProviderError
+		if errors.As(callErr, &providerErr) && strings.HasPrefix(providerErr.Code, "invalid_output_") && !repairUsed {
+			repairUsed = true
+			repairPrompt := prompt + "\n\nThe previous generation was rejected by the service validator (" + providerErr.Code + "). Generate the answer again from the original user data. Obey the JSON schema and all semantic requirements exactly; return three distinct candidates and no extra text."
+			body, err = provider.requestBody(normalized, repairPrompt)
+			if err != nil {
+				return domain.GenerationResult{}, fmt.Errorf("%w: encode Anthropic repair request: %v", ErrInvalidRequest, err)
+			}
+			continue
+		}
+		if !retryable || transportRetries >= provider.maxRetries {
 			return domain.GenerationResult{}, callErr
 		}
+		transportRetries++
 		nextDelay = retryAfter
 		if nextDelay <= 0 {
-			nextDelay = provider.backoff(attempt + 1)
+			nextDelay = provider.backoff(transportRetries)
 		}
 	}
-	return domain.GenerationResult{}, lastErr
 }
 
 func (provider *AnthropicProvider) requestBody(request domain.GenerationRequest, prompt string) ([]byte, error) {
@@ -278,7 +290,7 @@ func (provider *AnthropicProvider) doRequest(ctx context.Context, body []byte, r
 	}
 	result, err := decodeGenerationResult(structured.Bytes(), requestedTone, requestedMode)
 	if err != nil {
-		return domain.GenerationResult{}, 0, false, &ProviderError{Provider: providerAnthropic, Code: "invalid_output", RequestID: response.Header.Get("request-id"), Err: err}
+		return domain.GenerationResult{}, 0, false, newInvalidOutputError(providerAnthropic, response.Header.Get("request-id"), err)
 	}
 	result.Provider = providerAnthropic
 	result.Model = envelope.Model

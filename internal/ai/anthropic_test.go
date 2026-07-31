@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -143,6 +144,87 @@ func TestAnthropicProviderMapsTruncation(t *testing.T) {
 	_, err = provider.Generate(context.Background(), textRequest(domain.ToneMix))
 	if !errors.Is(err, ErrTruncated) {
 		t.Fatalf("truncation error = %v", err)
+	}
+}
+
+func TestAnthropicProviderRepairsInvalidStructuredOutputOnce(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		call := calls.Add(1)
+		var payload struct {
+			Messages []struct {
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Errorf("decode request: %v", err)
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if len(payload.Messages) != 1 || len(payload.Messages[0].Content) == 0 {
+			t.Errorf("unexpected request messages: %#v", payload.Messages)
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if call == 2 && !strings.Contains(payload.Messages[0].Content[0].Text, "invalid_output_reply_count") {
+			t.Errorf("repair prompt does not contain safe failure category: %q", payload.Messages[0].Content[0].Text)
+		}
+
+		result := validMixedResult()
+		if call == 1 {
+			result.Replies = result.Replies[:2]
+		}
+		structured, _ := json.Marshal(result)
+		_ = json.NewEncoder(writer).Encode(map[string]any{
+			"model": "claude-sonnet-5", "stop_reason": "end_turn",
+			"content": []any{map[string]any{"type": "text", "text": string(structured)}},
+			"usage":   map[string]any{"input_tokens": 10, "output_tokens": 10},
+		})
+	}))
+	defer server.Close()
+
+	provider, err := NewAnthropic(AnthropicConfig{APIKey: "test", BaseURL: server.URL, Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := provider.Generate(context.Background(), textRequest(domain.ToneMix))
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if calls.Load() != 2 || len(result.Replies) != 3 {
+		t.Fatalf("calls = %d, replies = %d", calls.Load(), len(result.Replies))
+	}
+}
+
+func TestAnthropicProviderReportsSpecificInvalidOutputAfterRepair(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		result := validMixedResult()
+		result.Replies = result.Replies[:2]
+		structured, _ := json.Marshal(result)
+		_ = json.NewEncoder(writer).Encode(map[string]any{
+			"model": "claude-sonnet-5", "stop_reason": "end_turn",
+			"content": []any{map[string]any{"type": "text", "text": string(structured)}},
+			"usage":   map[string]any{"input_tokens": 10, "output_tokens": 10},
+		})
+	}))
+	defer server.Close()
+
+	provider, err := NewAnthropic(AnthropicConfig{APIKey: "test", BaseURL: server.URL, Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = provider.Generate(context.Background(), textRequest(domain.ToneMix))
+	var providerErr *ProviderError
+	if !errors.As(err, &providerErr) || providerErr.Code != "invalid_output_reply_count" {
+		t.Fatalf("error = %#v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls = %d, want one initial and one repair call", calls.Load())
 	}
 }
 

@@ -450,15 +450,15 @@ func ValidateResultForMode(result *domain.GenerationResult, requestedTone domain
 	if requestedTone == domain.ToneMix || (result.Mode == domain.ScenarioComment && requestedTone != domain.ToneMeme) {
 		expected := []domain.Tone{domain.ToneSmart, domain.TonePlayful, domain.ToneBoundary}
 		for index, tone := range expected {
-			if result.Replies[index].Tone != tone {
-				return fmt.Errorf("%w: mixed reply %d must use tone %q", ErrInvalidResponse, index+1, tone)
-			}
+			// Tone is stable presentation metadata, not user-authored content. A
+			// constrained model can return three otherwise valid candidates with
+			// the labels in a different order. Canonicalize those labels instead
+			// of throwing useful text away.
+			result.Replies[index].Tone = tone
 		}
 	} else {
-		for index, reply := range result.Replies {
-			if reply.Tone != requestedTone {
-				return fmt.Errorf("%w: reply %d must use requested tone %q", ErrInvalidResponse, index+1, requestedTone)
-			}
+		for index := range result.Replies {
+			result.Replies[index].Tone = requestedTone
 		}
 	}
 

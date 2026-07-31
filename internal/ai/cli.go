@@ -177,10 +177,10 @@ func (provider *ClaudeCLIProvider) Generate(ctx context.Context, request domain.
 
 	result, err := parseCLIResult(stdout.Bytes(), normalized.Tone, provider.model, normalized.Mode)
 	if err != nil {
-		return domain.GenerationResult{}, &ProviderError{Provider: providerClaudeCLI, Code: "invalid_output", Err: err}
+		return domain.GenerationResult{}, newInvalidOutputError(providerClaudeCLI, "", err)
 	}
 	if err := validateFreshReplies(result.Replies, normalized.PreviousReplies); err != nil {
-		return domain.GenerationResult{}, &ProviderError{Provider: providerClaudeCLI, Code: "invalid_output", Err: err}
+		return domain.GenerationResult{}, newInvalidOutputError(providerClaudeCLI, "", err)
 	}
 	return result, nil
 }

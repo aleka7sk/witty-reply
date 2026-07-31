@@ -63,6 +63,30 @@ type ProviderError struct {
 	Err       error
 }
 
+func invalidOutputCode(err error) string {
+	message := strings.ToLower(fmt.Sprint(err))
+	switch {
+	case strings.Contains(message, "expected exactly 3 replies"):
+		return "invalid_output_reply_count"
+	case strings.Contains(message, "duplicate reply"), strings.Contains(message, "repeated previous reply"):
+		return "invalid_output_duplicate_reply"
+	case strings.Contains(message, "exceeds"):
+		return "invalid_output_text_too_long"
+	case strings.Contains(message, "mode"), strings.Contains(message, "scenario"):
+		return "invalid_output_mode"
+	case strings.Contains(message, "tone"):
+		return "invalid_output_tone"
+	case strings.Contains(message, "decode structured output"), strings.Contains(message, "trailing"):
+		return "invalid_output_json"
+	default:
+		return "invalid_output_semantic"
+	}
+}
+
+func newInvalidOutputError(provider, requestID string, err error) *ProviderError {
+	return &ProviderError{Provider: provider, Code: invalidOutputCode(err), RequestID: requestID, Err: err}
+}
+
 func (e *ProviderError) Error() string {
 	if e == nil {
 		return "<nil>"
