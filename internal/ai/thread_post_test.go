@@ -284,7 +284,7 @@ func TestAnthropicThreadPostUsesDedicatedSchemaAndRepairsOnce(t *testing.T) {
 		if len(properties) != 2 || properties["goal"] == nil || properties["text"] == nil || properties["replies"] != nil || properties["mode"] != nil {
 			t.Errorf("schema properties = %#v", properties)
 		}
-		if call == 2 && (len(payload.Messages) == 0 || len(payload.Messages[0].Content) == 0 || !strings.Contains(payload.Messages[0].Content[0].Text, "invalid_output_semantic")) {
+		if call == 2 && (len(payload.Messages) == 0 || len(payload.Messages[0].Content) == 0 || !strings.Contains(payload.Messages[0].Content[0].Text, "invalid_output_thread_organization_experience")) {
 			t.Error("repair request omitted safe validation category")
 		}
 
@@ -326,7 +326,7 @@ func TestAnthropicThreadPostRepairsAtMostOnce(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
-		structured, _ := json.Marshal(ThreadPostResult{Goal: "discussion", Text: "Запишитесь прямо сейчас."})
+		structured, _ := json.Marshal(ThreadPostResult{Goal: "discussion", Text: "Запишитесь и разрешите голосу звучать."})
 		_ = json.NewEncoder(writer).Encode(map[string]any{
 			"model": defaultModel, "stop_reason": "end_turn",
 			"content": []any{map[string]any{"type": "text", "text": string(structured)}},
@@ -340,12 +340,51 @@ func TestAnthropicThreadPostRepairsAtMostOnce(t *testing.T) {
 	}
 	_, err = provider.GenerateThreadPost(context.Background(), ThreadPostRequest{Voice: domain.ThreadVoice("belcanto")})
 	var providerErr *ProviderError
-	if !errors.As(err, &providerErr) || !strings.HasPrefix(providerErr.Code, "invalid_output_") {
+	if !errors.As(err, &providerErr) || providerErr.Code != "invalid_output_thread_sales_pressure" {
 		t.Fatalf("error = %#v", err)
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("calls = %d, want exactly two", calls.Load())
 	}
+}
+
+func TestThreadPostValidationErrorsExposeSafeSpecificCodes(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{name: "digits", text: "Голосу иногда нужны 2 минуты тишины.", want: "invalid_output_thread_digits"},
+		{name: "language", text: "A voice needs room to become audible.", want: "invalid_output_thread_language"},
+		{name: "current anecdote", text: "Сегодня голос решил больше не извиняться.", want: "invalid_output_thread_current_anecdote"},
+		{name: "organization experience", text: "У нас голосу разрешают быть настоящим.", want: "invalid_output_thread_organization_experience"},
+		{name: "first person experience", text: "Мы часто слышали, как голос становится смелее.", want: "invalid_output_thread_first_person_experience"},
+		{name: "unverified fact", text: "Наши ученики перестают бояться собственного голоса.", want: "invalid_output_thread_unverified_fact"},
+		{name: "sales pressure", text: "Запишитесь и разрешите голосу звучать.", want: "invalid_output_thread_sales_pressure"},
+		{name: "commercial", text: "Цена молчания иногда выше цены урока.", want: "invalid_output_thread_commercial_claim"},
+	}
+
+	request, err := normalizeThreadPostRequest(ThreadPostRequest{Voice: domain.ThreadVoiceBelcanto, Language: "ru"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, validationErr := decodeThreadPostResult(mustMarshalThreadPost(t, ThreadPostResult{Goal: "warmth", Text: test.text}), request)
+			if got := invalidOutputCode(validationErr); got != test.want {
+				t.Fatalf("code = %q, want %q (error: %v)", got, test.want, validationErr)
+			}
+		})
+	}
+}
+
+func mustMarshalThreadPost(t *testing.T, result ThreadPostResult) []byte {
+	t.Helper()
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 func TestAnthropicThreadPostRetriesTransientTransportResponse(t *testing.T) {

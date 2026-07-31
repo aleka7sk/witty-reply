@@ -77,6 +77,28 @@ type ProviderError struct {
 func invalidOutputCode(err error) string {
 	message := strings.ToLower(fmt.Sprint(err))
 	switch {
+	case strings.Contains(message, "threads text contains forbidden current-anecdote narrative"):
+		return "invalid_output_thread_current_anecdote"
+	case strings.Contains(message, "threads text contains forbidden organization-experience narrative"):
+		return "invalid_output_thread_organization_experience"
+	case strings.Contains(message, "threads text contains forbidden first-person-experience narrative"):
+		return "invalid_output_thread_first_person_experience"
+	case strings.Contains(message, "threads text contains forbidden unverified-fact claim"):
+		return "invalid_output_thread_unverified_fact"
+	case strings.Contains(message, "threads text contains forbidden sales-pressure claim"):
+		return "invalid_output_thread_sales_pressure"
+	case strings.Contains(message, "threads text contains forbidden commercial claim"):
+		return "invalid_output_thread_commercial_claim"
+	case strings.Contains(message, "threads text contains digits"):
+		return "invalid_output_thread_digits"
+	case strings.Contains(message, "threads text does not match requested language"):
+		return "invalid_output_thread_language"
+	case strings.Contains(message, "repeated previous threads post"):
+		return "invalid_output_thread_repeated_post"
+	case strings.Contains(message, "unsupported threads goal"):
+		return "invalid_output_thread_goal"
+	case strings.Contains(message, "threads text"):
+		return "invalid_output_thread_text"
 	case strings.Contains(message, "expected exactly 3 replies"):
 		return "invalid_output_reply_count"
 	case strings.Contains(message, "duplicate reply"), strings.Contains(message, "repeated previous reply"):
