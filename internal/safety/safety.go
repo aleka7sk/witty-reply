@@ -26,21 +26,22 @@ const (
 type Reason string
 
 const (
-	ReasonEmpty        Reason = "empty"
-	ReasonControlChars Reason = "control_chars"
-	ReasonTooLong      Reason = "too_long"
-	ReasonPII          Reason = "pii"
-	ReasonProfanity    Reason = "profanity"
-	ReasonThreat       Reason = "threat"
-	ReasonDoxxing      Reason = "doxxing"
-	ReasonBlackmail    Reason = "blackmail"
-	ReasonFraud        Reason = "fraud"
-	ReasonHate         Reason = "hate_or_degradation"
-	ReasonSelfHarm     Reason = "self_harm"
-	ReasonPromptLeak   Reason = "prompt_leak"
-	ReasonDuplicate    Reason = "duplicate"
-	ReasonUnsafeMeme   Reason = "unsafe_meme"
-	ReasonFallback     Reason = "fallback"
+	ReasonEmpty         Reason = "empty"
+	ReasonControlChars  Reason = "control_chars"
+	ReasonTooLong       Reason = "too_long"
+	ReasonPII           Reason = "pii"
+	ReasonProfanity     Reason = "profanity"
+	ReasonThreat        Reason = "threat"
+	ReasonDoxxing       Reason = "doxxing"
+	ReasonBlackmail     Reason = "blackmail"
+	ReasonFraud         Reason = "fraud"
+	ReasonHate          Reason = "hate_or_degradation"
+	ReasonVulnerability Reason = "vulnerability_attack"
+	ReasonSelfHarm      Reason = "self_harm"
+	ReasonPromptLeak    Reason = "prompt_leak"
+	ReasonDuplicate     Reason = "duplicate"
+	ReasonUnsafeMeme    Reason = "unsafe_meme"
+	ReasonFallback      Reason = "fallback"
 )
 
 type Config struct {
@@ -183,6 +184,13 @@ var blockedPhraseRules = []phraseRule{
 		"лас нәсіл", "сендердің нәсілдерің жойылсын",
 		"subhuman", "dirty race", "your race should disappear",
 	}},
+	{reason: ReasonVulnerability, phrases: []string{
+		// High-confidence body-shaming and pregnancy-directed degradation.
+		"жируха", "жиробас", "толстуха", "жирная беременная", "толстая беременная",
+		"беременная корова", "смешной выкидыш",
+		"семіз жүкті әйел", "жүкті сиыр", "семіз сиыр",
+		"fat pregnant woman", "pregnant cow", "fat cow", "land whale", "funny miscarriage",
+	}},
 	{reason: ReasonPromptLeak, phrases: []string{
 		"system prompt", "developer message", "anthropic_api_key",
 		"telegram_bot_token", "вот мои системные инструкции",
@@ -290,6 +298,13 @@ func (f *Filter) Moderate(text string) ModerationDecision {
 // distinct replies. Unsafe or missing candidates are replaced by deterministic
 // language- and tone-aware fallbacks.
 func (f *Filter) FilterResult(result domain.GenerationResult, tone domain.Tone, language string) (domain.GenerationResult, Report) {
+	return f.FilterResultForMode(result, domain.ScenarioReply, tone, language)
+}
+
+// FilterResultForMode keeps last-mile fallbacks in the same social voice as
+// the provider result. A rejected public comment must never turn into a
+// defensive private-chat reply.
+func (f *Filter) FilterResultForMode(result domain.GenerationResult, mode domain.ScenarioMode, tone domain.Tone, language string) (domain.GenerationResult, Report) {
 	report := Report{}
 	filtered := make([]domain.Reply, 0, f.candidateCount)
 	seen := make(map[string]struct{}, f.candidateCount)
@@ -367,7 +382,7 @@ func (f *Filter) FilterResult(result domain.GenerationResult, tone domain.Tone, 
 	}
 
 	if len(filtered) < f.candidateCount {
-		for _, fallback := range Fallbacks(tone, language) {
+		for _, fallback := range FallbacksForMode(mode, tone, language) {
 			decision := f.FilterText(fallback.Text)
 			if !decision.Allowed {
 				continue
@@ -386,6 +401,9 @@ func (f *Filter) FilterResult(result domain.GenerationResult, tone domain.Tone, 
 		report.UsedFallback = true
 		report.Reasons = append(report.Reasons, ReasonFallback)
 	}
+	if mode == domain.ScenarioComment && tone != domain.ToneMeme {
+		filtered = orderCommentReplies(filtered)
+	}
 
 	result.Replies = filtered
 	report.Reasons = uniqueReasons(report.Reasons)
@@ -393,12 +411,43 @@ func (f *Filter) FilterResult(result domain.GenerationResult, tone domain.Tone, 
 }
 
 func Fallbacks(tone domain.Tone, language string) []domain.Reply {
+	return FallbacksForMode(domain.ScenarioReply, tone, language)
+}
+
+func FallbacksForMode(mode domain.ScenarioMode, tone domain.Tone, language string) []domain.Reply {
 	language = strings.ToLower(strings.TrimSpace(language))
 	toneAt := func(index int) domain.Tone {
 		if tone != domain.ToneMix {
 			return tone
 		}
 		return [...]domain.Tone{domain.ToneSmart, domain.TonePlayful, domain.ToneBoundary}[index]
+	}
+	if mode == domain.ScenarioComment {
+		commentToneAt := func(index int) domain.Tone {
+			if tone == domain.ToneMeme {
+				return domain.ToneMeme
+			}
+			return [...]domain.Tone{domain.ToneSmart, domain.TonePlayful, domain.ToneBoundary}[index]
+		}
+		if strings.HasPrefix(language, "kk") || strings.HasPrefix(language, "kz") {
+			return []domain.Reply{
+				{Tone: commentToneAt(0), Text: "Бір сөйлем — ал жалғасына пікірлердің өзі дайын тұр."},
+				{Tone: commentToneAt(1), Text: "Оқиға аяқталды, бірақ сұрақтар енді басталды."},
+				{Tone: commentToneAt(2), Text: "Бұл ой бұрылысты ескертусіз жасаған екен."},
+			}
+		}
+		if strings.HasPrefix(language, "en") {
+			return []domain.Reply{
+				{Tone: commentToneAt(0), Text: "One sentence, and the comments already have a sequel ready."},
+				{Tone: commentToneAt(1), Text: "The post ended, but the questions just clocked in."},
+				{Tone: commentToneAt(2), Text: "That thought took the scenic route without warning anyone."},
+			}
+		}
+		return []domain.Reply{
+			{Tone: commentToneAt(0), Text: "Одна фраза — а у комментариев уже готово продолжение."},
+			{Tone: commentToneAt(1), Text: "Пост закончился, но вопросы только вышли на смену."},
+			{Tone: commentToneAt(2), Text: "Эта мысль свернула в сюжет без предупреждения."},
+		}
 	}
 	if strings.HasPrefix(language, "kk") || strings.HasPrefix(language, "kz") {
 		return []domain.Reply{
@@ -441,6 +490,26 @@ func Fallbacks(tone domain.Tone, language string) []domain.Reply {
 			{Tone: toneAt(2), Text: "Звучит громко. А мысль где-то рядом?"},
 		}
 	}
+}
+
+func orderCommentReplies(replies []domain.Reply) []domain.Reply {
+	ordered := make([]domain.Reply, 0, len(replies))
+	used := make([]bool, len(replies))
+	for _, expected := range []domain.Tone{domain.ToneSmart, domain.TonePlayful, domain.ToneBoundary} {
+		for index, reply := range replies {
+			if !used[index] && reply.Tone == expected {
+				ordered = append(ordered, reply)
+				used[index] = true
+				break
+			}
+		}
+	}
+	for index, reply := range replies {
+		if !used[index] {
+			ordered = append(ordered, reply)
+		}
+	}
+	return ordered
 }
 
 // EscapeTelegramHTML must be applied only at the transport boundary. Keeping

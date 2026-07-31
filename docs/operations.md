@@ -15,8 +15,13 @@ Never place the bot token in a webhook URL, log, issue, screenshot, or committed
 1. Copy `.env.example` to `.env` and set `TELEGRAM_BOT_TOKEN` plus a random callback secret.
 2. Keep `AI_PROVIDER=fake` to validate the whole Telegram flow without API spend.
 3. Run `docker compose up --build`.
-4. Send `/start`, accept processing, and send a text message.
-5. Switch to `AI_PROVIDER=anthropic`, add an Anthropic API key, and restart for a real-provider test.
+4. Wait until both services are healthy with `docker compose ps`, then check `curl http://localhost:8080/readyz`.
+5. Send `/start`, accept processing, and exercise both scenarios:
+   - send a direct message to see `↩️ Ответить человеку`;
+   - send `коммент: <публичный пост>` to see `🔥 Залететь в комменты`;
+   - use the scenario-switch button and confirm that the original source is reused.
+6. In fake mode the scenarios, refinements, and revisions intentionally produce different deterministic demo text.
+7. Switch to `AI_PROVIDER=anthropic`, add an Anthropic API key, and restart for a real-provider test.
 
 ## Production checklist
 
@@ -30,16 +35,19 @@ Never place the bot token in a webhook URL, log, issue, screenshot, or committed
 - Unique 32+ byte callback and webhook secrets.
 - Voice provider either fully configured or deliberately disabled.
 - `/healthz`, `/readyz`, and `/metrics` monitored.
+- `/metrics` is restricted to the monitoring network or protected at the ingress.
 - Logs have a 30-day-or-shorter retention and contain no user content.
 - PostgreSQL disk encryption and least-privilege network access enabled.
 - Daily database backups tested for restore.
 - Backup retention and expiry are documented so a profile deleted from the live database is not retained indefinitely in backups.
+- Exactly one application replica is used for the process-local scenario session. Sticky HTTP routing is not sufficient because workers claim jobs from the shared durable inbox. The original source expires after `SESSION_TTL` of inactivity and is lost on restart; durable shared source storage and consistent per-user worker ownership are not part of v2.
 
 ## Health and alerts
 
 - `/healthz` proves that the HTTP process can respond; it does not probe workers or external dependencies.
 - `/readyz` checks store connectivity and the required PostgreSQL schema, and returns non-200 when the bot should not receive webhook traffic. It does not probe Telegram or AI-provider availability.
 - `/metrics` exposes Prometheus-format, content-free counters, gauges, and latency histograms.
+- Scenario metrics use only fixed `reply`/`comment` names. They never include submitted text, captions, usernames, or free-form source hints.
 
 Alert when the five-minute error rate exceeds 5%, provider p95 latency exceeds 30 seconds, provider rate limits spike, readiness fails, retry/dead-letter counters rise, the oldest pending inbox job exceeds five minutes, or the cleanup worker has not completed for two hours.
 
@@ -55,4 +63,4 @@ The queue is deliberately at least once. During incident review, treat a duplica
 
 ## Rollback
 
-Application migrations are additive and idempotent in v1. Roll back to the previous container image without reversing the schema. Validate readiness, `/start`, and one fake-provider generation before restoring normal traffic.
+Application migrations are additive and idempotent in v2. Roll back to the previous container image without reversing the schema. Validate readiness, `/start`, and one fake-provider generation before restoring normal traffic.

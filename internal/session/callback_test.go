@@ -69,12 +69,16 @@ func TestCallbackRejectsTamperingAndExpiry(t *testing.T) {
 	}
 }
 
-func TestCallbackSupportsConsentAndStyleActions(t *testing.T) {
+func TestCallbackSupportsConsentStyleAndScenarioActions(t *testing.T) {
 	codec, err := NewCallbackCodec([]byte("0123456789abcdef0123456789abcdef"), time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, action := range []Action{ActionConsent, ActionSaveStyle, ActionResetStyle} {
+	for _, action := range []Action{
+		ActionConsent, ActionSaveStyle, ActionResetStyle,
+		ActionModeReply, ActionModeComment, ActionCommentSubtler,
+		ActionCommentBolder, ActionCommentAbsurd, ActionCommentDifferentAngle,
+	} {
 		encoded, err := codec.Encode(CallbackPayload{
 			Action: action, UserID: 101, InteractionID: 101, Candidate: -1,
 		})
@@ -97,7 +101,9 @@ func TestActionNumericStability(t *testing.T) {
 		ActionToneSharp, ActionToneBoundary, ActionMeme, ActionFunnier,
 		ActionSharper, ActionSofter, ActionShorter, ActionMore, ActionRetry,
 		ActionCancel, ActionConfirmDelete, ActionCancelDelete, ActionConsent,
-		ActionSaveStyle, ActionResetStyle,
+		ActionSaveStyle, ActionResetStyle, ActionModeReply, ActionModeComment,
+		ActionCommentSubtler, ActionCommentBolder, ActionCommentAbsurd,
+		ActionCommentDifferentAngle,
 	}
 	for index, action := range actions {
 		if want := Action(index + 1); action != want {

@@ -42,22 +42,22 @@ func startText(lang language, privacyURL string, voiceExternal bool) string {
 	policyEN := policyLink("Privacy policy", privacyURL)
 	switch lang {
 	case langKK:
-		return "Мен — Witty Reply. Маған хабарламаны, скриншотты немесе дауыстық жазбаны жібер: мен ақылды, әзіл және нық үш жауап ұсынамын.\n\nБот жеке чаттарыңды өзі оқымайды және сенің орныңнан ешкімге жазбайды. Өңдеу үшін жіберген контент AI-провайдерге беріледі." + voiceKK + "\n\n" + policyKK + "\n\nЖалғастыруға келісесің бе?"
+		return "Мен — Witty Reply. Хабарламаны, постты, скриншотты немесе дауыстық жазбаны жібер: адамға жауап керек пе, әлде постқа тапқыр пікір керек пе — өзім анықтап, үш нұсқа ұсынамын.\n\nБот жеке чаттарыңды өзі оқымайды және сенің орныңнан ешкімге жазбайды. Өңдеу үшін жіберген контент AI-провайдерге беріледі." + voiceKK + "\n\n" + policyKK + "\n\nЖалғастыруға келісесің бе?"
 	case langEN:
-		return "I'm Witty Reply. Send me a message, screenshot, or voice note and I'll suggest three smart, playful, or firm replies.\n\nI cannot read your private chats and never send anything on your behalf. Submitted content is processed by the configured AI provider." + voiceEN + "\n\n" + policyEN + "\n\nDo you agree to continue?"
+		return "I'm Witty Reply. Send a message, post, screenshot, or voice note. I'll detect whether you need a direct reply or a witty public comment and suggest three options.\n\nI cannot read your private chats and never send anything on your behalf. Submitted content is processed by the configured AI provider." + voiceEN + "\n\n" + policyEN + "\n\nDo you agree to continue?"
 	default:
-		return "Я — Witty Reply. Пришли сообщение, скриншот или голосовое — предложу три ответа: умный, с подколом и уверенный.\n\nБот не читает личные чаты сам и никому не пишет от твоего имени. Отправленный контент обрабатывается внешним AI-провайдером." + voiceRU + "\n\n" + policyRU + "\n\nСогласен продолжить?"
+		return "Я — Ответочка. Пришли сообщение, пост, скриншот или голосовое. Я пойму, нужно ответить человеку или залететь с остроумным комментарием, и предложу три готовых варианта.\n\nБот не читает личные чаты сам и никому не пишет от твоего имени. Отправленный контент обрабатывается внешним AI-провайдером." + voiceRU + "\n\n" + policyRU + "\n\nСогласен продолжить?"
 	}
 }
 
 func consentAcceptedText(lang language) string {
 	switch lang {
 	case langKK:
-		return "Дайын. Енді жауап бергің келетін хабарламаны жібер. Скриншотқа қосымша контекстті сипаттама ретінде қоса аласың."
+		return "Дайын. Хабарламаны, постты немесе скриншотты жібер — режимді өзім анықтаймын. Қажет болса, оны бір батырмамен ауыстыра аласың."
 	case langEN:
-		return "Ready. Send the message you want to answer. For a screenshot, add any extra context in its caption."
+		return "Ready. Send a message, post, or screenshot and I'll detect the scenario. You can correct it with one tap."
 	default:
-		return "Готово. Теперь пришли сообщение, на которое хочешь ответить. Для скриншота дополнительный контекст можно добавить в подписи."
+		return "Готово. Пришли сообщение, пост или скриншот — я сам определю, нужен ответ человеку или комментарий под публикацией. Если захочешь, режим можно переключить одним нажатием."
 	}
 }
 
@@ -75,11 +75,11 @@ func consentRequiredText(lang language) string {
 func helpText(lang language) string {
 	switch lang {
 	case langKK:
-		return "Жіберуге болады:\n• мәтін немесе қайта жіберілген хабарлама;\n• чат скриншоты (10 МБ дейін);\n• дауыстық жазба (20 МБ дейін).\n\nКомандалар: /new, /cancel, /style, /plan, /privacy, /delete_me."
+		return "Жіберуге болады:\n• жеке хабарлама, пост немесе қайта жіберілген мәтін;\n• чат не жарияланым скриншоты (10 МБ дейін);\n• дауыстық жазба (20 МБ дейін).\n\nРежим автоматты анықталады. Нақты таңдау үшін мәтінді «ответь:» немесе «коммент:» деп баста.\n\nКомандалар: /new, /cancel, /style, /plan, /privacy, /delete_me."
 	case langEN:
-		return "Send:\n• text or a forwarded message;\n• a chat screenshot (up to 10 MB);\n• a voice note (up to 20 MB).\n\nCommands: /new, /cancel, /style, /plan, /privacy, /delete_me."
+		return "Send:\n• a private message, post, or forwarded text;\n• a chat or publication screenshot (up to 10 MB);\n• a voice note (up to 20 MB).\n\nThe mode is automatic. Start with “reply:” or “comment:” to force it.\n\nCommands: /new, /cancel, /style, /plan, /privacy, /delete_me."
 	default:
-		return "Можно прислать:\n• текст или пересланное сообщение;\n• скриншот переписки до 10 МБ;\n• голосовое до 20 МБ.\n\nКоманды: /new, /cancel, /style, /plan, /privacy, /delete_me."
+		return "Можно прислать:\n• личное сообщение, пост или пересланный текст;\n• скриншот переписки или публикации до 10 МБ;\n• голосовое до 20 МБ.\n\nРежим определяется автоматически. Для точного выбора начни текст с «ответь:» или «коммент:». После результата режим можно переключить без повторной отправки исходника.\n\nКоманды: /new, /cancel, /style, /plan, /privacy, /delete_me."
 	}
 }
 
@@ -297,6 +297,17 @@ func expiredText(lang language) string {
 	}
 }
 
+func modeChoiceText(lang language) string {
+	switch lang {
+	case langKK:
+		return "Мұнда екі түрлі мақсат болуы мүмкін. Не жазғымыз келеді?"
+	case langEN:
+		return "I can read this in two different ways. What do you want to write?"
+	default:
+		return "Здесь возможны два разных сценария. Что хотим написать?"
+	}
+}
+
 func quotaText(lang language, decision domain.QuotaDecision) string {
 	reset := decision.ResetsAt.Format("15:04")
 	switch lang {
@@ -326,13 +337,30 @@ func planText(lang language, stats domain.UserStats, resetsAt time.Time) string 
 
 func resultsText(lang language, result domain.GenerationResult) string {
 	var builder strings.Builder
+	if result.Mode == domain.ScenarioComment {
+		switch lang {
+		case langKK:
+			builder.WriteString("🔥 Режим: пікірлерге кіру\n\nҮш түрлі әзіл:\n\n")
+		case langEN:
+			builder.WriteString("🔥 Mode: Comment under the post\n\nThree different angles:\n\n")
+		default:
+			builder.WriteString("🔥 Режим: Залететь в комменты\n\nТри шутки с разными заходами:\n\n")
+		}
+		for index, reply := range result.Replies {
+			fmt.Fprintf(&builder, "%d. %s\n%s", index+1, commentCandidateLabel(lang, index), reply.Text)
+			if index < len(result.Replies)-1 {
+				builder.WriteString("\n\n")
+			}
+		}
+		return builder.String()
+	}
 	switch lang {
 	case langKK:
-		builder.WriteString("Мына үшеудің қайсысы саған жақын?\n\n")
+		builder.WriteString("↩️ Режим: адамға жауап беру\n\nМына үшеудің қайсысы саған жақын?\n\n")
 	case langEN:
-		builder.WriteString("Which one sounds most like you?\n\n")
+		builder.WriteString("↩️ Mode: Reply to the person\n\nWhich one sounds most like you?\n\n")
 	default:
-		builder.WriteString("Какой вариант больше похож на тебя?\n\n")
+		builder.WriteString("↩️ Режим: Ответить человеку\n\nКакой вариант больше похож на тебя?\n\n")
 	}
 	for index, reply := range result.Replies {
 		fmt.Fprintf(&builder, "%d. %s\n%s", index+1, toneLabel(lang, reply.Tone), reply.Text)
@@ -341,6 +369,19 @@ func resultsText(lang language, result domain.GenerationResult) string {
 		}
 	}
 	return builder.String()
+}
+
+func commentCandidateLabel(lang language, index int) string {
+	labels := map[language][]string{
+		langRU: {"🏆 Самый сильный", "🧠 Тонкий", "🤪 Дикий"},
+		langKK: {"🏆 Ең мықты", "🧠 Нәзік", "🤪 Еркін"},
+		langEN: {"🏆 Strongest", "🧠 Subtle", "🤪 Wild"},
+	}
+	values := labels[lang]
+	if index >= 0 && index < len(values) {
+		return values[index]
+	}
+	return toneLabel(lang, domain.ToneMix)
 }
 
 func toneLabel(lang language, tone domain.Tone) string {

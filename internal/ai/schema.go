@@ -10,6 +10,16 @@ const generationSchema = `{
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["reply", "comment"],
+      "description": "Whether the text answers a person directly or is a standalone public comment under a post."
+    },
+    "mode_confidence": {
+      "type": "string",
+      "enum": ["high", "low"],
+      "description": "High when one scenario clearly dominates; low only when the user must choose before publication."
+    },
     "situation": {
       "type": "string",
       "description": "A non-empty neutral summary of the social situation, no longer than 500 characters."
@@ -49,7 +59,7 @@ const generationSchema = `{
       "required": ["headline", "caption"]
     }
   },
-  "required": ["situation", "replies"]
+  "required": ["mode", "mode_confidence", "situation", "replies"]
 }`
 
 // GenerationJSONSchema returns an owned copy of the schema. Returning a copy

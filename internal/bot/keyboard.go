@@ -23,7 +23,7 @@ func consentKeyboard(codec *session.CallbackCodec, userID int64, lang language) 
 	return &telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{{telegram.CallbackButton(label, data)}}}, nil
 }
 
-func resultKeyboard(codec *session.CallbackCodec, userID, generationID int64, revision uint32, replies []domain.Reply, lang language) (*telegram.InlineKeyboardMarkup, error) {
+func resultKeyboard(codec *session.CallbackCodec, userID, generationID int64, revision uint32, replies []domain.Reply, mode domain.ScenarioMode, lang language) (*telegram.InlineKeyboardMarkup, error) {
 	if len(replies) != 3 {
 		return nil, fmt.Errorf("result keyboard requires exactly three replies")
 	}
@@ -60,6 +60,17 @@ func resultKeyboard(codec *session.CallbackCodec, userID, generationID int64, re
 		{{"😂 Смешнее", session.ActionFunnier}, {"🔥 Жёстче", session.ActionSharper}, {"🌿 Мягче", session.ActionSofter}},
 		{{"✂️ Короче", session.ActionShorter}, {"🔄 Ещё", session.ActionMore}, {"🖼 Мем", session.ActionMeme}},
 	}
+	if mode == domain.ScenarioComment {
+		refinementRows = [][]struct {
+			label  string
+			action session.Action
+		}{
+			{{"😂 Ещё смешнее", session.ActionFunnier}, {"🧠 Тоньше", session.ActionCommentSubtler}},
+			{{"😈 Наглее", session.ActionCommentBolder}, {"🤪 Абсурднее", session.ActionCommentAbsurd}},
+			{{"✂️ Короче", session.ActionShorter}, {"🎭 Другой заход", session.ActionCommentDifferentAngle}},
+			{{"🔄 Ещё три", session.ActionMore}},
+		}
+	}
 	if lang == langKK {
 		refinementRows = [][]struct {
 			label  string
@@ -68,6 +79,17 @@ func resultKeyboard(codec *session.CallbackCodec, userID, generationID int64, re
 			{{"😂 Күлкілі", session.ActionFunnier}, {"🔥 Өткір", session.ActionSharper}, {"🌿 Жұмсақ", session.ActionSofter}},
 			{{"✂️ Қысқа", session.ActionShorter}, {"🔄 Тағы", session.ActionMore}, {"🖼 Мем", session.ActionMeme}},
 		}
+		if mode == domain.ScenarioComment {
+			refinementRows = [][]struct {
+				label  string
+				action session.Action
+			}{
+				{{"😂 Күлкілі", session.ActionFunnier}, {"🧠 Нәзік", session.ActionCommentSubtler}},
+				{{"😈 Батыл", session.ActionCommentBolder}, {"🤪 Абсурд", session.ActionCommentAbsurd}},
+				{{"✂️ Қысқа", session.ActionShorter}, {"🎭 Басқа тәсіл", session.ActionCommentDifferentAngle}},
+				{{"🔄 Тағы үшеу", session.ActionMore}},
+			}
+		}
 	} else if lang == langEN {
 		refinementRows = [][]struct {
 			label  string
@@ -75,6 +97,17 @@ func resultKeyboard(codec *session.CallbackCodec, userID, generationID int64, re
 		}{
 			{{"😂 Funnier", session.ActionFunnier}, {"🔥 Sharper", session.ActionSharper}, {"🌿 Softer", session.ActionSofter}},
 			{{"✂️ Shorter", session.ActionShorter}, {"🔄 More", session.ActionMore}, {"🖼 Meme", session.ActionMeme}},
+		}
+		if mode == domain.ScenarioComment {
+			refinementRows = [][]struct {
+				label  string
+				action session.Action
+			}{
+				{{"😂 Funnier", session.ActionFunnier}, {"🧠 Subtler", session.ActionCommentSubtler}},
+				{{"😈 Bolder", session.ActionCommentBolder}, {"🤪 More absurd", session.ActionCommentAbsurd}},
+				{{"✂️ Shorter", session.ActionShorter}, {"🎭 New angle", session.ActionCommentDifferentAngle}},
+				{{"🔄 Three more", session.ActionMore}},
+			}
 		}
 	}
 	for _, row := range refinementRows {
@@ -88,8 +121,55 @@ func resultKeyboard(codec *session.CallbackCodec, userID, generationID int64, re
 		}
 		keyboard = append(keyboard, buttons)
 	}
-	keyboard = append(keyboard, styleRow)
+	if mode != domain.ScenarioComment {
+		keyboard = append(keyboard, styleRow)
+	}
+	switchAction := session.ActionModeComment
+	switchLabel := "🔥 Нет, нужен коммент под постом"
+	if mode == domain.ScenarioComment {
+		switchAction = session.ActionModeReply
+		switchLabel = "↩️ Нет, это ответ человеку"
+	}
+	if lang == langKK {
+		if mode == domain.ScenarioComment {
+			switchLabel = "↩️ Жоқ, бұл адамға жауап"
+		} else {
+			switchLabel = "🔥 Жоқ, постқа пікір керек"
+		}
+	} else if lang == langEN {
+		if mode == domain.ScenarioComment {
+			switchLabel = "↩️ No, reply to the person"
+		} else {
+			switchLabel = "🔥 No, comment under the post"
+		}
+	}
+	switchData, err := encodeCallback(codec, switchAction, userID, generationID, revision, -1)
+	if err != nil {
+		return nil, err
+	}
+	keyboard = append(keyboard, []telegram.InlineKeyboardButton{telegram.CallbackButton(switchLabel, switchData)})
 	return &telegram.InlineKeyboardMarkup{InlineKeyboard: keyboard}, nil
+}
+
+func modeChoiceKeyboard(codec *session.CallbackCodec, userID, sourceID int64, revision uint32, lang language) (*telegram.InlineKeyboardMarkup, error) {
+	replyLabel, commentLabel := "↩️ Ответить человеку", "🔥 Залететь в комментарии"
+	if lang == langKK {
+		replyLabel, commentLabel = "↩️ Адамға жауап беру", "🔥 Пікір жазу"
+	} else if lang == langEN {
+		replyLabel, commentLabel = "↩️ Reply to the person", "🔥 Comment under the post"
+	}
+	replyData, err := encodeCallback(codec, session.ActionModeReply, userID, sourceID, revision, -1)
+	if err != nil {
+		return nil, err
+	}
+	commentData, err := encodeCallback(codec, session.ActionModeComment, userID, sourceID, revision, -1)
+	if err != nil {
+		return nil, err
+	}
+	return &telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
+		{telegram.CallbackButton(replyLabel, replyData)},
+		{telegram.CallbackButton(commentLabel, commentData)},
+	}}, nil
 }
 
 func styleKeyboard(codec *session.CallbackCodec, userID int64, lang language) (*telegram.InlineKeyboardMarkup, error) {

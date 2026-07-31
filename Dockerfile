@@ -9,7 +9,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/witty-r
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates fonts-dejavu-core tzdata \
+    && apt-get install -y --no-install-recommends ca-certificates curl fonts-dejavu-core tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --no-create-home witty
 

@@ -132,8 +132,12 @@ func TestPostgresIntegration(t *testing.T) {
 	}
 
 	t.Run("generation ownership is enforced", func(t *testing.T) {
-		if _, err := postgres.GetGeneration(ctx, generationID, ownerID); err != nil {
+		stored, err := postgres.GetGeneration(ctx, generationID, ownerID)
+		if err != nil {
 			t.Fatalf("owner GetGeneration(): %v", err)
+		}
+		if stored.Result.Mode != domain.ScenarioComment || stored.Result.ModeConfidence != domain.ModeConfidenceHigh {
+			t.Fatalf("scenario result did not round-trip: %+v", stored.Result)
 		}
 		if _, err := postgres.GetGeneration(ctx, generationID, otherID); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("foreign GetGeneration() error = %v", err)
@@ -478,6 +482,7 @@ func integrationGeneration(telegramID int64, digest string) domain.GenerationRec
 		Provider:    "integration-test",
 		Model:       "deterministic",
 		Result: domain.GenerationResult{
+			Mode: domain.ScenarioComment, ModeConfidence: domain.ModeConfidenceHigh,
 			Situation: "Тест",
 			Replies: []domain.Reply{
 				{Tone: domain.ToneSmart, Text: "Первый"},

@@ -70,6 +70,9 @@ func TestModerateRejectsMultilingualAndObfuscatedUnsafeOutput(t *testing.T) {
 		{name: "en fraud", input: "Send me the verification code", reason: ReasonFraud},
 		{name: "en self harm spaced", input: "go k i l l y o u r s e l f", reason: ReasonSelfHarm},
 		{name: "en hate", input: "All Muslims should die", reason: ReasonHate},
+		{name: "ru vulnerability", input: "Эта жируха даже ребёнка не чувствует", reason: ReasonVulnerability},
+		{name: "kk vulnerability", input: "Семіз жүкті әйел деп мазақтады", reason: ReasonVulnerability},
+		{name: "en vulnerability", input: "What a pregnant cow", reason: ReasonVulnerability},
 		{name: "prompt leak obfuscated", input: "s y s t e m p r o m p t", reason: ReasonPromptLeak},
 	}
 	for _, tt := range tests {
@@ -122,6 +125,44 @@ func TestFilterResultDeduplicatesAndFillsSafeFallbacks(t *testing.T) {
 			t.Fatalf("duplicate reply %q", reply.Text)
 		}
 		seen[key] = true
+	}
+}
+
+func TestCommentFallbacksStayInPublicCommentVoice(t *testing.T) {
+	filter := New(Config{MaxRunes: 240, CandidateCount: 3})
+	result, report := filter.FilterResultForMode(domain.GenerationResult{}, domain.ScenarioComment, domain.ToneMix, "ru")
+	if !report.UsedFallback || len(result.Replies) != 3 {
+		t.Fatalf("comment fallback result = %+v report = %+v", result, report)
+	}
+	for _, reply := range result.Replies {
+		lower := strings.ToLower(reply.Text)
+		if strings.Contains(lower, "со мной") || strings.Contains(lower, "разговаривать") || strings.Contains(lower, "продолжу разговор") {
+			t.Fatalf("reply-oriented fallback leaked into comment mode: %q", reply.Text)
+		}
+	}
+}
+
+func TestCommentVulnerabilityAttackIsReplacedSafely(t *testing.T) {
+	filter := New(Config{MaxRunes: 240, CandidateCount: 3})
+	unsafe := domain.GenerationResult{Mode: domain.ScenarioComment, Replies: []domain.Reply{
+		{Tone: domain.ToneSmart, Text: "Эта жируха даже ребёнка не чувствует"},
+		{Tone: domain.TonePlayful, Text: "Потом по тишине в детской понимаешь всё"},
+		{Tone: domain.ToneBoundary, Text: "Формулировка сама открыла второй сезон"},
+	}}
+	result, report := filter.FilterResultForMode(unsafe, domain.ScenarioComment, domain.ToneMix, "ru")
+	if !report.UsedFallback || !hasReason(report.Reasons, ReasonVulnerability) {
+		t.Fatalf("unsafe public joke was not replaced: result=%+v report=%+v", result, report)
+	}
+	wantTones := []domain.Tone{domain.ToneSmart, domain.TonePlayful, domain.ToneBoundary}
+	for index, reply := range result.Replies {
+		if reply.Tone != wantTones[index] {
+			t.Fatalf("comment role order changed after fallback: %+v", result.Replies)
+		}
+	}
+	for _, reply := range result.Replies {
+		if strings.Contains(strings.ToLower(reply.Text), "жирух") {
+			t.Fatalf("vulnerability attack survived: %q", reply.Text)
+		}
 	}
 }
 

@@ -31,6 +31,7 @@ type fakeTelegram struct {
 	photos    []telegram.SendPhotoParams
 	callbacks []telegram.AnswerCallbackQueryParams
 	files     map[string][]byte
+	downloads atomic.Int64
 }
 
 func (f *fakeTelegram) SendMessage(_ context.Context, params telegram.SendMessageParams) (telegram.Message, error) {
@@ -59,6 +60,7 @@ func (f *fakeTelegram) AnswerCallbackQuery(_ context.Context, params telegram.An
 }
 
 func (f *fakeTelegram) DownloadFileLimit(_ context.Context, fileID string, limit int64) (telegram.DownloadedFile, error) {
+	f.downloads.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	data, ok := f.files[fileID]
@@ -498,5 +500,238 @@ func TestRetryAfterSuccessfulDeliveryDoesNotDoubleChargeQuota(t *testing.T) {
 	}
 	if provider.calls.Load() != 2 || len(telegramClient.snapshotMessages()) != 2 {
 		t.Fatalf("retry was not exercised: provider=%d messages=%d", provider.calls.Load(), len(telegramClient.snapshotMessages()))
+	}
+}
+
+func TestExplicitCommentDirectiveUsesPublicCommentScenario(t *testing.T) {
+	var received domain.GenerationRequest
+	provider := &countingProvider{fn: func(ctx context.Context, request domain.GenerationRequest) (domain.GenerationResult, error) {
+		received = request
+		return ai.NewFake().Generate(ctx, request)
+	}}
+	service, telegramClient, memory, _, _ := newTestService(t, provider)
+	ctx := context.Background()
+	_, _ = memory.UpsertUser(ctx, domain.User{TelegramID: 42, Language: "ru"})
+	_ = memory.SetConsent(ctx, 42, true)
+
+	if err := service.HandleUpdate(ctx, textUpdate(1, "коммент: Многие пациентки не чувствуют шевелений ребёнка")); err != nil {
+		t.Fatal(err)
+	}
+	if received.Mode != domain.ScenarioComment || received.Input.Text != "Многие пациентки не чувствуют шевелений ребёнка" {
+		t.Fatalf("generation request = %+v", received)
+	}
+	messages := telegramClient.snapshotMessages()
+	result := messages[len(messages)-1]
+	if !strings.Contains(result.Text, "Залететь в комменты") || result.ReplyMarkup == nil {
+		t.Fatalf("comment result = %+v", result)
+	}
+	for _, row := range result.ReplyMarkup.InlineKeyboard {
+		for _, button := range row {
+			if strings.HasPrefix(button.Text, "⭐") {
+				t.Fatalf("global reply-style save leaked into comment keyboard: %+v", result.ReplyMarkup)
+			}
+		}
+	}
+}
+
+func TestExplicitCommentIgnoresReplyToneAndStyleExamples(t *testing.T) {
+	var received domain.GenerationRequest
+	provider := &countingProvider{fn: func(ctx context.Context, request domain.GenerationRequest) (domain.GenerationResult, error) {
+		received = request
+		return ai.NewFake().Generate(ctx, request)
+	}}
+	service, _, memory, _, _ := newTestService(t, provider)
+	ctx := context.Background()
+	_, _ = memory.UpsertUser(ctx, domain.User{TelegramID: 42, Language: "ru"})
+	_ = memory.SetConsent(ctx, 42, true)
+	_ = memory.SetDefaultTone(ctx, 42, domain.ToneBoundary)
+	styleGeneration, err := memory.SaveGeneration(ctx, domain.GenerationRecord{
+		TelegramID: 42, InputKind: domain.InputText,
+		Result: domain.GenerationResult{Replies: []domain.Reply{{Tone: domain.ToneBoundary, Text: "Со мной так нельзя"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved, err := memory.SaveStyleExample(ctx, 42, styleGeneration, "Со мной так нельзя", 5); err != nil || !saved {
+		t.Fatalf("save reply style = %v, %v", saved, err)
+	}
+
+	if err := service.HandleUpdate(ctx, textUpdate(2, "коммент: Публичный пост для обсуждения")); err != nil {
+		t.Fatal(err)
+	}
+	if received.Mode != domain.ScenarioComment || received.Tone != domain.ToneMix || len(received.StyleExamples) != 0 {
+		t.Fatalf("reply personalization leaked into comment request: %+v", received)
+	}
+}
+
+func TestAmbiguousAutoModePromptsThenReusesSourceForFreeChoice(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests []domain.GenerationRequest
+	)
+	provider := &countingProvider{fn: func(ctx context.Context, request domain.GenerationRequest) (domain.GenerationResult, error) {
+		mu.Lock()
+		requests = append(requests, request)
+		call := len(requests)
+		mu.Unlock()
+		if call == 1 {
+			forced := request
+			forced.Mode = domain.ScenarioReply
+			result, err := ai.NewFake().Generate(ctx, forced)
+			result.ModeConfidence = domain.ModeConfidenceLow
+			return result, err
+		}
+		return ai.NewFake().Generate(ctx, request)
+	}}
+	service, telegramClient, memory, _, _ := newTestService(t, provider)
+	ctx := context.Background()
+	_, _ = memory.UpsertUser(ctx, domain.User{TelegramID: 42, Language: "ru"})
+	_ = memory.SetConsent(ctx, 42, true)
+	source := "Фраза без однозначного адресата"
+
+	if err := service.HandleUpdate(ctx, textUpdate(1, source)); err != nil {
+		t.Fatal(err)
+	}
+	messages := telegramClient.snapshotMessages()
+	choice := messages[len(messages)-1]
+	if !strings.Contains(choice.Text, "два разных сценария") || choice.ReplyMarkup == nil || len(choice.ReplyMarkup.InlineKeyboard) != 2 {
+		t.Fatalf("mode choice = %+v", choice)
+	}
+	commentData := choice.ReplyMarkup.InlineKeyboard[1][0].CallbackData
+	user := testUser()
+	callbackMessage := telegram.Message{MessageID: 10, Chat: telegram.Chat{ID: 42, Type: "private"}}
+	if err := service.HandleUpdate(ctx, telegram.Update{UpdateID: 2, CallbackQuery: &telegram.CallbackQuery{
+		ID: "choose-comment", From: user, Message: &callbackMessage, Data: commentData,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	got := append([]domain.GenerationRequest(nil), requests...)
+	mu.Unlock()
+	if len(got) != 2 || got[0].Mode != domain.ScenarioAuto || got[1].Mode != domain.ScenarioComment || got[1].Input.Text != source || len(got[1].PreviousReplies) != 0 {
+		t.Fatalf("requests = %+v", got)
+	}
+	messages = telegramClient.snapshotMessages()
+	if !strings.Contains(messages[len(messages)-1].Text, "Залететь в комменты") {
+		t.Fatalf("selected comment result = %+v", messages[len(messages)-1])
+	}
+	stats, err := memory.Stats(ctx, 42, service.now(), service.config.Limits.TextDaily)
+	if err != nil || stats.UsedToday != 1 {
+		t.Fatalf("input quota after choice = %+v, %v", stats, err)
+	}
+}
+
+func TestAmbiguousScreenshotChoiceDoesNotDownloadAgain(t *testing.T) {
+	provider := &countingProvider{next: ai.NewFake()}
+	service, telegramClient, memory, _, _ := newTestService(t, provider)
+	ctx := context.Background()
+	_, _ = memory.UpsertUser(ctx, domain.User{TelegramID: 42, Language: "ru"})
+	_ = memory.SetConsent(ctx, 42, true)
+
+	canvas := image.NewRGBA(image.Rect(0, 0, 20, 10))
+	canvas.Set(1, 1, color.RGBA{R: 255, A: 255})
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, canvas); err != nil {
+		t.Fatal(err)
+	}
+	telegramClient.files["ambiguous-screenshot"] = encoded.Bytes()
+	user := testUser()
+	update := telegram.Update{UpdateID: 10, Message: &telegram.Message{
+		MessageID: 10, From: &user, Chat: telegram.Chat{ID: 42, Type: "private"},
+		Photo: []telegram.PhotoSize{{FileID: "ambiguous-screenshot", Width: 20, Height: 10, FileSize: int64(encoded.Len())}},
+	}}
+	if err := service.HandleUpdate(ctx, update); err != nil {
+		t.Fatal(err)
+	}
+	messages := telegramClient.snapshotMessages()
+	choice := messages[len(messages)-1]
+	if choice.ReplyMarkup == nil || len(choice.ReplyMarkup.InlineKeyboard) != 2 {
+		t.Fatalf("screenshot did not request scenario choice: %+v", choice)
+	}
+	commentData := choice.ReplyMarkup.InlineKeyboard[1][0].CallbackData
+	callbackMessage := telegram.Message{MessageID: 11, Chat: telegram.Chat{ID: 42, Type: "private"}}
+	if err := service.HandleUpdate(ctx, telegram.Update{UpdateID: 11, CallbackQuery: &telegram.CallbackQuery{
+		ID: "choose-screenshot-comment", From: user, Message: &callbackMessage, Data: commentData,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if downloads := telegramClient.downloads.Load(); downloads != 1 {
+		t.Fatalf("source image was downloaded %d times, want once", downloads)
+	}
+}
+
+func TestAutoModeSwitchIsFreeAndCarriesPreviousCandidates(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests []domain.GenerationRequest
+	)
+	provider := &countingProvider{fn: func(ctx context.Context, request domain.GenerationRequest) (domain.GenerationResult, error) {
+		mu.Lock()
+		requests = append(requests, request)
+		mu.Unlock()
+		return ai.NewFake().Generate(ctx, request)
+	}}
+	service, telegramClient, memory, sessions, _ := newTestService(t, provider)
+	ctx := context.Background()
+	_, _ = memory.UpsertUser(ctx, domain.User{TelegramID: 42, Language: "ru"})
+	_ = memory.SetConsent(ctx, 42, true)
+
+	if err := service.HandleUpdate(ctx, textUpdate(1, "Ты опять всё придумал")); err != nil {
+		t.Fatal(err)
+	}
+	before, ok := sessions.Get(42)
+	if !ok || before.Value.Mode != domain.ScenarioReply || !before.Value.FreeModeSwitch {
+		t.Fatalf("initial interaction = %+v, %v", before, ok)
+	}
+	firstRecord, err := memory.GetGeneration(ctx, before.Value.GenerationID, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := telegramClient.snapshotMessages()
+	markup := messages[len(messages)-1].ReplyMarkup
+	switchData := markup.InlineKeyboard[len(markup.InlineKeyboard)-1][0].CallbackData
+	user := testUser()
+	callbackMessage := telegram.Message{MessageID: 11, Chat: telegram.Chat{ID: 42, Type: "private"}}
+	if err := service.HandleUpdate(ctx, telegram.Update{UpdateID: 2, CallbackQuery: &telegram.CallbackQuery{
+		ID: "switch-comment", From: user, Message: &callbackMessage, Data: switchData,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	after, ok := sessions.Get(42)
+	if !ok || after.Value.Mode != domain.ScenarioComment || after.Value.FreeModeSwitch {
+		t.Fatalf("switched interaction = %+v, %v", after, ok)
+	}
+	secondRecord, err := memory.GetGeneration(ctx, after.Value.GenerationID, 42)
+	if err != nil || secondRecord.InputDigest != firstRecord.InputDigest {
+		t.Fatalf("generation digests = %q / %q, err=%v", firstRecord.InputDigest, secondRecord.InputDigest, err)
+	}
+	mu.Lock()
+	got := append([]domain.GenerationRequest(nil), requests...)
+	mu.Unlock()
+	if len(got) != 2 || got[1].Mode != domain.ScenarioComment || got[1].Transform != "mode_switch" || len(got[1].PreviousReplies) != 3 {
+		t.Fatalf("switch requests = %+v", got)
+	}
+	decision, err := memory.ConsumeQuota(ctx, 42, 99, domain.QuotaRefinement, 1, service.now())
+	if err != nil || !decision.Allowed || decision.Used != 1 {
+		t.Fatalf("free switch consumed refinement quota: %+v, %v", decision, err)
+	}
+	if err := memory.RefundQuota(ctx, 42, 99, domain.QuotaRefinement); err != nil {
+		t.Fatal(err)
+	}
+	messages = telegramClient.snapshotMessages()
+	commentMarkup := messages[len(messages)-1].ReplyMarkup
+	switchBackData := commentMarkup.InlineKeyboard[len(commentMarkup.InlineKeyboard)-1][0].CallbackData
+	if err := service.HandleUpdate(ctx, telegram.Update{UpdateID: 3, CallbackQuery: &telegram.CallbackQuery{
+		ID: "switch-reply", From: user, Message: &callbackMessage, Data: switchBackData,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	afterBack, ok := sessions.Peek(42)
+	if !ok || afterBack.Value.Mode != domain.ScenarioReply || afterBack.Value.Tone != domain.ToneMix {
+		t.Fatalf("second switch did not restore reply defaults: %+v, %v", afterBack, ok)
+	}
+	decision, err = memory.ConsumeQuota(ctx, 42, 100, domain.QuotaRefinement, 1, service.now())
+	if err != nil || decision.Allowed || decision.Used != 1 {
+		t.Fatalf("second switch did not consume refinement quota: %+v, %v", decision, err)
 	}
 }

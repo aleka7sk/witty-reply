@@ -110,7 +110,7 @@ func validModelName(value string) bool {
 // decodeGenerationResult rejects extra fields and trailing JSON before the
 // semantic validator is run. Structured model output is not trusted merely
 // because the upstream API claims it matches a schema.
-func decodeGenerationResult(raw []byte, requestedTone domain.Tone) (domain.GenerationResult, error) {
+func decodeGenerationResult(raw []byte, requestedTone domain.Tone, requestedModes ...domain.ScenarioMode) (domain.GenerationResult, error) {
 	if len(raw) == 0 {
 		return domain.GenerationResult{}, fmt.Errorf("%w: empty structured output", ErrInvalidResponse)
 	}
@@ -129,8 +129,15 @@ func decodeGenerationResult(raw []byte, requestedTone domain.Tone) (domain.Gener
 	} else if !errors.Is(err, io.EOF) {
 		return domain.GenerationResult{}, fmt.Errorf("%w: malformed trailing data: %v", ErrInvalidResponse, err)
 	}
+	if strings.TrimSpace(string(result.Mode)) == "" || strings.TrimSpace(string(result.ModeConfidence)) == "" {
+		return domain.GenerationResult{}, fmt.Errorf("%w: structured output omitted mode classification", ErrInvalidResponse)
+	}
 
-	if err := ValidateResult(&result, requestedTone); err != nil {
+	requestedMode := domain.ScenarioAuto
+	if len(requestedModes) > 0 {
+		requestedMode = requestedModes[0]
+	}
+	if err := ValidateResultForMode(&result, requestedTone, requestedMode); err != nil {
 		return domain.GenerationResult{}, err
 	}
 	return result, nil

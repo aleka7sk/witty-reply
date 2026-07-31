@@ -15,6 +15,41 @@ const (
 	InputVoice InputKind = "voice"
 )
 
+// ScenarioMode describes whose voice the generated text must use. Auto is a
+// request-only value: provider results must always resolve it to Reply or
+// Comment so the Telegram UI can make the model's interpretation visible.
+type ScenarioMode string
+
+const (
+	ScenarioAuto    ScenarioMode = "auto"
+	ScenarioReply   ScenarioMode = "reply"
+	ScenarioComment ScenarioMode = "comment"
+)
+
+var ValidScenarioModes = map[ScenarioMode]struct{}{
+	ScenarioAuto: {}, ScenarioReply: {}, ScenarioComment: {},
+}
+
+func ParseScenarioMode(value string) (ScenarioMode, bool) {
+	mode := ScenarioMode(strings.ToLower(strings.TrimSpace(value)))
+	_, ok := ValidScenarioModes[mode]
+	return mode, ok
+}
+
+func (m ScenarioMode) Concrete() bool {
+	return m == ScenarioReply || m == ScenarioComment
+}
+
+// ModeConfidence deliberately uses a two-value contract. The model should ask
+// for clarification only when choosing the wrong scenario would materially
+// change the voice and the source does not contain a dominant signal.
+type ModeConfidence string
+
+const (
+	ModeConfidenceHigh ModeConfidence = "high"
+	ModeConfidenceLow  ModeConfidence = "low"
+)
+
 type Tone string
 
 const (
@@ -95,21 +130,27 @@ type Usage struct {
 }
 
 type GenerationRequest struct {
-	Input         Input
-	Tone          Tone
-	Transform     string
-	Language      string
-	Relationship  string
-	StyleExamples []string
+	Input           Input
+	Tone            Tone
+	Mode            ScenarioMode
+	Transform       string
+	Language        string
+	Relationship    string
+	SourceHint      string
+	StyleExamples   []string
+	PreviousReplies []string
+	VariantSeed     uint32
 }
 
 type GenerationResult struct {
-	Situation string  `json:"situation"`
-	Replies   []Reply `json:"replies"`
-	Meme      *Meme   `json:"meme,omitempty"`
-	Provider  string  `json:"-"`
-	Model     string  `json:"-"`
-	Usage     Usage   `json:"-"`
+	Mode           ScenarioMode   `json:"mode"`
+	ModeConfidence ModeConfidence `json:"mode_confidence"`
+	Situation      string         `json:"situation"`
+	Replies        []Reply        `json:"replies"`
+	Meme           *Meme          `json:"meme,omitempty"`
+	Provider       string         `json:"-"`
+	Model          string         `json:"-"`
+	Usage          Usage          `json:"-"`
 }
 
 type GenerationRecord struct {

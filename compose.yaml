@@ -20,10 +20,16 @@ services:
       STORE_DRIVER: postgres
       DATABASE_URL: postgres://witty:witty@postgres:5432/witty?sslmode=disable
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
     restart: unless-stopped
     mem_limit: 768m
     cpus: 2.0

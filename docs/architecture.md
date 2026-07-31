@@ -8,7 +8,8 @@ flowchart TD
     T --> QI["Encrypted inbox"]
     QI --> B["Bot application"]
     B --> Q["Quota and privacy"]
-    B --> AI["AI provider"]
+    B --> MODE["Scenario state"]
+    MODE --> AI["Classify + generate"]
     B --> STT["Speech adapter"]
     B --> MEME["Meme renderer"]
     Q --> PG["PostgreSQL"]
@@ -19,9 +20,9 @@ flowchart TD
 ## Boundaries
 
 - `cmd/witty-reply` composes dependencies and handles process lifecycle.
-- `internal/bot` owns commands, consent, state transitions, quota selection, generation, and callbacks.
+- `internal/bot` owns commands, consent, auto/explicit scenario transitions, quota selection, generation, and callbacks.
 - `internal/telegram` owns Bot API transport and Telegram-specific JSON types.
-- `internal/ai` exposes one provider interface with Anthropic API, Claude CLI, and deterministic fake implementations.
+- `internal/ai` exposes one provider interface with Anthropic API, Claude CLI, and deterministic fake implementations. One structured call resolves `reply`/`comment`, reports high/low confidence, drafts three candidates, and—in comment mode—performs an internal multi-angle ranking pass.
 - `internal/store` owns durable metadata and opaque encrypted inbox payloads. It never receives plaintext source text, screenshots, voice bytes, or transcripts.
 - `internal/session` keeps private source context in memory with a short TTL and last-write-wins cancellation.
 - `internal/safety` provides an explicit deterministic moderation/filter stage before delivery. It normalizes common Unicode evasions and blocks high-confidence RU/KK/EN threats, doxxing, blackmail, self-harm encouragement, and hate/degradation.
@@ -36,12 +37,13 @@ flowchart TD
 3. The user record is upserted. AI processing stops unless consent exists.
 4. Input is size/type validated. Media is downloaded only into memory.
 5. The appropriate entitlement is reserved atomically.
-6. A short-lived session records the source input and marks any older job for that user obsolete.
+6. A short-lived session records the source input, anonymized source hint, scenario state, revision, and previous candidates, and marks any older job for that user obsolete.
 7. Style examples are loaded from PostgreSQL.
-8. The AI provider returns structured JSON under its own safety policy. The application then performs independent schema, length, diversity, and deterministic multilingual last-mile moderation checks. This layered guard is deliberately conservative and is not presented as perfect semantic moderation.
-9. After payload scrubbing, the inbox retains only content-free delivery metadata until retention cleanup. Generation storage separately holds a secret-keyed, non-reversible source digest, generated candidates, and provider/model identifiers. Token totals are exposed only as content-free aggregate metrics.
-10. Telegram receives a response with native copy buttons and signed refinement/feedback callbacks. If Telegram accepts the response but job completion is not recorded, a retry can produce a duplicate response; the system does not claim exactly-once outbound delivery.
-11. Session source data expires automatically. Durable generated data is removed by the hourly retention cleanup job.
+8. Explicit `ответь:`/`коммент:` prefixes or signed mode buttons force a scenario. Otherwise the AI provider returns a concrete scenario and confidence together with structured candidates. High confidence is delivered with a visible mode label and correction button. Low confidence commits an `awaiting_mode` session and displays two choices; generated candidates from that uncertain pass are not exposed.
+9. The application performs independent schema, mode/tone consistency, length, diversity, and deterministic multilingual last-mile moderation checks. Scenario-aware fallbacks preserve the public-comment or private-reply voice. This layered guard is deliberately conservative and is not presented as perfect semantic moderation.
+10. After payload scrubbing, the inbox retains only content-free delivery metadata until retention cleanup. Generation storage separately holds a secret-keyed, non-reversible source digest, resolved scenario inside result JSON, generated candidates, and provider/model identifiers. Token totals are exposed only as content-free aggregate metrics.
+11. Telegram receives scenario-specific native copy/refinement buttons and signed mode/feedback callbacks. A refinement includes the original source and previous three candidates. If Telegram accepts the response but job completion is not recorded, a retry can produce a duplicate response; the system does not claim exactly-once outbound delivery.
+12. Session source data expires automatically. Durable generated data is removed by the hourly retention cleanup job.
 
 ## Delivery modes
 
@@ -55,10 +57,12 @@ Polling is the default local mode and permits one bot instance. Webhook is the p
 - Outbound acknowledgement ambiguity: a reply accepted by Telegram immediately before a worker crash may be sent again when the job is retried.
 - New input during generation: previous job is cancelled/obsolete and may not send a late result.
 - Provider timeout or malformed output: controlled user-facing retry message; raw provider output is never exposed.
+- Low-confidence scenario: no uncertain candidate is exposed; the signed choice callback reuses the same source and original input quota.
+- Wrong automatic scenario: the first signed correction is free, reuses the same source digest, and disables further free switches for that interaction.
 - Database unavailable: readiness fails and generation does not start.
 - Meme font/render failure: text candidates remain available.
-- Restart: durable queue and user settings survive; raw refinement sessions intentionally do not.
+- Restart/session expiry: durable queue, generations, and user settings survive; raw refinement/mode-switch sessions intentionally do not, so the user is asked to resend the source.
 
 ## Scaling path
 
-The durable inbox supports multiple workers and crash recovery. The refinement session is still process-local, so multiple application replicas require sticky per-user routing or a shared encrypted session cache. The v1 deployment remains intentionally single-region; Kafka, Kubernetes, and microservices add no value at the current validation stage.
+The durable inbox supports multiple workers and crash recovery inside one application process. The refinement session is process-local, while any replica can claim a job from the shared inbox, so HTTP sticky routing alone cannot preserve callbacks across replicas. Run exactly one application replica until shared encrypted sessions or consistent per-user worker ownership exists. The v2 deployment remains intentionally single-region; Kafka, Kubernetes, and microservices add no value at the current validation stage.

@@ -35,3 +35,16 @@ func TestParseTone(t *testing.T) {
 		t.Fatal("unknown tone was accepted")
 	}
 }
+
+func TestParseScenarioMode(t *testing.T) {
+	mode, ok := ParseScenarioMode(" COMMENT ")
+	if !ok || mode != ScenarioComment || !mode.Concrete() {
+		t.Fatalf("ParseScenarioMode() = %q, %v", mode, ok)
+	}
+	if ScenarioAuto.Concrete() {
+		t.Fatal("auto mode must not be concrete")
+	}
+	if _, ok := ParseScenarioMode("ambiguous"); ok {
+		t.Fatal("unknown scenario mode was accepted")
+	}
+}

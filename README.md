@@ -1,6 +1,6 @@
 # Witty Reply
 
-Telegram-first AI co-author for messages you want to answer without losing face. Send text, a forwarded message, a screenshot, or a voice note; Witty Reply returns three short candidates that can be copied, refined, turned into a meme card, and gradually adapted to the user's explicitly saved style.
+Telegram-first AI co-author with two distinct scenarios. Send a private message you need to answer, or a post/screenshot you want to comment on. Witty Reply detects the scenario, shows its interpretation, and returns three short candidates that can be copied and refined without resending the source.
 
 The product supports witty teasing and firm boundaries. It is not an automated harassment bot: threats, doxxing, hate, blackmail, and targeted humiliation are filtered and replaced with safe, confident alternatives.
 
@@ -11,8 +11,10 @@ The product supports witty teasing and firm boundaries. It is not an automated h
 - Anthropic Messages API with native structured output, images, retries, deadlines, token usage, and Claude Sonnet 5 low-effort defaults.
 - Isolated Claude CLI adapter for local/internal API-key-backed evaluation.
 - Deterministic fake provider for a zero-cost end-to-end smoke test.
-- Exactly three native Telegram-copyable replies per generation.
-- Funnier, sharper, softer, shorter, more, and meme refinements.
+- Auto-first scenario routing with an explicit `↩️ Reply` or `🔥 Comment` label, a one-tap correction, and a two-button clarification only when the source is genuinely ambiguous.
+- Exactly three native Telegram-copyable candidates per generation.
+- Reply refinements: funnier, sharper, softer, shorter, more, and meme.
+- Public-comment refinements: funnier, subtler, bolder, more absurd, shorter, a genuinely different angle, and three more.
 - Original 1080×1080 Cyrillic PNG meme cards rendered locally with DejaVu — no scraping or unlicensed template catalog.
 - Consent gate, user-owned signed callbacks, atomic daily quotas, feedback, saved style examples, reset, and complete profile deletion.
 - AES-256-GCM encrypted durable Telegram inbox with per-user ordering, at-least-once processing, retries, lease recovery, dead-lettering, and payload scrubbing at a terminal state.
@@ -26,7 +28,7 @@ Prerequisites: Go 1.25+ for a native run, or Docker Compose.
 
 ### 1. Create the Telegram bot
 
-Create a bot through `@BotFather`, copy its token, and disable group joining with `/setjoingroups`. Witty Reply v1 intentionally works only in private chats.
+Create a bot through `@BotFather`, copy its token, and disable group joining with `/setjoingroups`. Witty Reply v2 intentionally works only in private chats.
 
 ### 2. Configure
 
@@ -42,7 +44,7 @@ TELEGRAM_CALLBACK_SECRET=a-random-secret-at-least-32-characters
 AI_PROVIDER=fake
 ```
 
-`AI_PROVIDER=fake` exercises the entire Telegram experience without making paid AI calls.
+`AI_PROVIDER=fake` exercises the entire Telegram experience without making paid AI calls. Unlike a static stub, it has separate reply/comment banks and changes output after refinement buttons.
 
 Docker Compose reads `.env` automatically. The Go binary deliberately does not, so a native run must export it first.
 
@@ -68,6 +70,34 @@ Open the bot, send `/start`, accept AI processing, then send a message such as:
 ```text
 Тебя вообще никто не спрашивал
 ```
+
+To exercise the public-comment scenario without a screenshot:
+
+```text
+коммент: Многие пациентки не чувствуют шевелений ребёнка
+```
+
+The fake provider includes a safe, contextual demo for this example. A real Anthropic provider classifies and writes from the submitted context rather than using the demo bank.
+
+## Two scenarios
+
+| Scenario | Voice | Initial candidates |
+|---|---|---|
+| `↩️ Reply to the person` | The user answers a specific participant from their own perspective | Smart, playful, firm |
+| `🔥 Comment under the post` | An outside reader leaves a standalone public comment | Strongest, subtle, wild |
+
+The default is automatic. Direct address, private-chat structure, forwarded-user metadata, public-post UI, channel/forum metadata, and screenshot layout are used as evidence. Only a non-identifying enum such as `forwarded_channel` reaches the prompt; forwarded names, usernames, and IDs are not used as routing hints.
+
+Explicit leading prefixes override automatic routing:
+
+```text
+ответь: <сообщение собеседника>
+коммент: <текст публикации>
+```
+
+If the model reports low confidence, the bot asks whether to reply or comment. That choice is free and reuses the normalized source already in memory. After an automatically selected result, the first correction to the opposite mode is also free; later switches use the refinement quota.
+
+The source context, including normalized screenshot bytes, is process-local and expires after `SESSION_TTL` of inactivity (30 minutes by default) or a restart. A valid refinement renews that window; stale buttons do not. Mode switches and refinements work without resending while the session exists. An expired button asks the user to submit the source again. Run exactly one application replica until a shared encrypted session store or consistent per-user worker ownership is implemented; sticky HTTP routing alone is insufficient because workers claim jobs from the shared durable inbox.
 
 ### 4. Enable Claude in production
 
@@ -181,7 +211,7 @@ go test -race ./...
 go build ./cmd/witty-reply
 ```
 
-CI also runs `govulncheck`.
+CI also runs `staticcheck` and `govulncheck` on the current Go runner.
 
 PostgreSQL integration tests use an isolated temporary schema and run whenever `TEST_DATABASE_URL` is set; otherwise they skip locally. CI supplies a PostgreSQL 17 service automatically.
 
@@ -193,7 +223,7 @@ PostgreSQL integration tests use an isolated temporary schema and run whenever `
 - [Operations runbook](docs/operations.md)
 - [Human-readable code map](docs/CODEMAP.md)
 
-## Intentional v1 boundaries
+## Intentional v2 boundaries
 
 No automatic access to private chats, no automatic sending on the user's behalf, no group operation, no scraped memes, no Telegram Stars billing, no mobile app, and no fine-tuning on Claude outputs. Personalization uses only explicit profile settings and style examples at prompt time.
 

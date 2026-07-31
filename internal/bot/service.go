@@ -57,12 +57,21 @@ type Config struct {
 }
 
 type Interaction struct {
-	Input        domain.Input
-	Tone         domain.Tone
-	Language     string
-	GenerationID int64
-	Revision     uint32
-	ChatID       int64
+	SourceID           int64
+	Input              domain.Input
+	Tone               domain.Tone
+	Mode               domain.ScenarioMode
+	SourceHint         string
+	Language           string
+	PreviousReplies    []string
+	GenerationID       int64
+	Revision           uint32
+	ChatID             int64
+	AwaitingMode       bool
+	AutoDetected       bool
+	FreeModeSwitch     bool
+	QuotaReservationID int64
+	QuotaCategory      domain.QuotaCategory
 }
 
 // interaction keeps existing package-local tests concise while exposing the
@@ -212,11 +221,17 @@ func (b *Service) QueuePolicy(update telegram.Update) UpdateQueuePolicy {
 	case session.ActionConfirmDelete, session.ActionCancel:
 		return UpdateQueuePolicy{Superseding: true}
 	case session.ActionMeme, session.ActionFunnier, session.ActionSharper, session.ActionSofter,
-		session.ActionShorter, session.ActionMore, session.ActionRetry:
-		return UpdateQueuePolicy{Supersedable: true, Superseding: true}
+		session.ActionShorter, session.ActionMore, session.ActionRetry,
+		session.ActionModeReply, session.ActionModeComment,
+		session.ActionCommentSubtler, session.ActionCommentBolder,
+		session.ActionCommentAbsurd, session.ActionCommentDifferentAngle:
+		// Generative callbacks remain replaceable by a newer source message, but
+		// do not preempt one another. A delayed double-tap carries the previous
+		// revision and must not cancel the valid generation already in flight.
+		return UpdateQueuePolicy{Supersedable: true}
 	case session.ActionToneSmart, session.ActionTonePlayful, session.ActionToneSharp, session.ActionToneBoundary:
 		if payload.InteractionID != callback.From.ID {
-			return UpdateQueuePolicy{Supersedable: true, Superseding: true}
+			return UpdateQueuePolicy{Supersedable: true}
 		}
 	}
 	return UpdateQueuePolicy{}
@@ -286,7 +301,18 @@ func (b *Service) handleMessage(ctx context.Context, updateID int64, message tel
 		return b.sendText(ctx, message.Chat.ID, quotaText(lang, decision), nil)
 	}
 
-	value := interaction{Tone: user.DefaultTone, Language: user.Language, Revision: 1, ChatID: message.Chat.ID}
+	tone := user.DefaultTone
+	if raw.mode == domain.ScenarioComment {
+		tone = domain.ToneMix
+	}
+	value := interaction{
+		SourceID: updateID, Tone: tone, Mode: raw.mode, SourceHint: raw.sourceHint,
+		Language: user.Language, Revision: 1, ChatID: message.Chat.ID,
+		QuotaReservationID: reservation.id, QuotaCategory: reservation.category,
+	}
+	if value.Mode == "" {
+		value.Mode = domain.ScenarioAuto
+	}
 	lease, err := b.sessions.Begin(ctx, user.TelegramID, value)
 	if err != nil {
 		b.refundQuota(user.TelegramID, reservation)
@@ -295,10 +321,12 @@ func (b *Service) handleMessage(ctx context.Context, updateID int64, message tel
 	input, sourceLanguage, err := b.materializeInput(lease.Context, raw, user.Language)
 	if err != nil {
 		if ctx.Err() != nil {
+			b.refundQuota(user.TelegramID, reservation)
 			return ctx.Err()
 		}
 		if !b.sessions.IsCurrent(lease) {
 			b.metrics.Inc("obsolete_jobs")
+			b.refundQuota(user.TelegramID, reservation)
 			return nil
 		}
 		b.sessions.Cancel(user.TelegramID)
@@ -322,9 +350,11 @@ func (b *Service) handleMessage(ctx context.Context, updateID int64, message tel
 	value.Language = sourceLanguage
 	if err := b.sessions.Commit(lease, value); err != nil {
 		if ctx.Err() != nil {
+			b.refundQuota(user.TelegramID, reservation)
 			return ctx.Err()
 		}
 		b.metrics.Inc("obsolete_jobs")
+		b.refundQuota(user.TelegramID, reservation)
 		return nil
 	}
 	return b.generateWithLease(ctx, lease, message.Chat.ID, user, value, "", reservation)
@@ -461,6 +491,18 @@ func (b *Service) handleCallback(ctx context.Context, updateID int64, callback t
 		return b.refine(ctx, updateID, chatID, user, lang, payload, "", "shorter")
 	case session.ActionMore, session.ActionRetry:
 		return b.refine(ctx, updateID, chatID, user, lang, payload, "", "more")
+	case session.ActionCommentSubtler:
+		return b.refine(ctx, updateID, chatID, user, lang, payload, "", "subtler")
+	case session.ActionCommentBolder:
+		return b.refine(ctx, updateID, chatID, user, lang, payload, "", "bolder")
+	case session.ActionCommentAbsurd:
+		return b.refine(ctx, updateID, chatID, user, lang, payload, "", "absurder")
+	case session.ActionCommentDifferentAngle:
+		return b.refine(ctx, updateID, chatID, user, lang, payload, "", "new_angle")
+	case session.ActionModeReply:
+		return b.changeMode(ctx, updateID, chatID, user, lang, payload, domain.ScenarioReply)
+	case session.ActionModeComment:
+		return b.changeMode(ctx, updateID, chatID, user, lang, payload, domain.ScenarioComment)
 	case session.ActionCancel:
 		b.sessions.Cancel(user.TelegramID)
 		return b.sendText(ctx, chatID, cancelledText(lang), nil)
@@ -470,9 +512,14 @@ func (b *Service) handleCallback(ctx context.Context, updateID int64, callback t
 }
 
 func (b *Service) refine(ctx context.Context, updateID, chatID int64, user domain.User, lang language, payload session.CallbackPayload, tone domain.Tone, transform string) error {
-	snapshot, ok := b.sessions.Get(user.TelegramID)
-	if !ok || snapshot.Value.GenerationID != payload.InteractionID || snapshot.Value.Revision != payload.Revision {
+	snapshot, ok := b.sessions.Peek(user.TelegramID)
+	if !ok || snapshot.Value.AwaitingMode || snapshot.Value.GenerationID != payload.InteractionID || snapshot.Value.Revision != payload.Revision {
 		return b.sendText(ctx, chatID, expiredText(lang), nil)
+	}
+	if strings.HasPrefix(transform, "subtl") || transform == "bolder" || transform == "absurder" || transform == "new_angle" {
+		if snapshot.Value.Mode != domain.ScenarioComment {
+			return b.sendText(ctx, chatID, expiredText(lang), nil)
+		}
 	}
 	category, limit := domain.QuotaRefinement, b.config.Limits.RefinementDaily
 	if tone == domain.ToneMeme {
@@ -490,7 +537,56 @@ func (b *Service) refine(ctx context.Context, updateID, chatID int64, user domai
 	if tone == "" {
 		tone = snapshot.Value.Tone
 	}
-	return b.generate(ctx, chatID, user, snapshot.Value.Input, snapshot.Value.Language, tone, transform, reservation, snapshot.Value.Revision+1)
+	value := snapshot.Value
+	value.FreeModeSwitch = false
+	return b.generate(ctx, chatID, user, value, tone, value.Mode, transform, reservation, value.Revision+1)
+}
+
+func (b *Service) changeMode(ctx context.Context, updateID, chatID int64, user domain.User, lang language, payload session.CallbackPayload, mode domain.ScenarioMode) error {
+	snapshot, ok := b.sessions.Peek(user.TelegramID)
+	if !ok || snapshot.Value.Revision != payload.Revision {
+		return b.sendText(ctx, chatID, expiredText(lang), nil)
+	}
+	value := snapshot.Value
+	tone := user.DefaultTone
+	if mode == domain.ScenarioComment {
+		tone = domain.ToneMix
+	}
+	if value.AwaitingMode {
+		if payload.InteractionID != value.SourceID || value.SourceID <= 0 {
+			return b.sendText(ctx, chatID, expiredText(lang), nil)
+		}
+		reservation := quotaReservation{id: value.QuotaReservationID, category: value.QuotaCategory}
+		value.AwaitingMode = false
+		value.AutoDetected = false
+		value.FreeModeSwitch = false
+		b.metrics.Inc("mode_choices")
+		return b.generate(ctx, chatID, user, value, tone, mode, "mode_selected", reservation, value.Revision+1)
+	}
+	if value.GenerationID != payload.InteractionID || value.GenerationID <= 0 {
+		return b.sendText(ctx, chatID, expiredText(lang), nil)
+	}
+	if value.Mode == mode {
+		return nil
+	}
+	reservation := quotaReservation{}
+	if value.FreeModeSwitch {
+		b.metrics.Inc("mode_corrections_free")
+	} else {
+		reservation = quotaReservation{id: updateID, category: domain.QuotaRefinement}
+		decision, err := b.store.ConsumeQuota(ctx, user.TelegramID, reservation.id, reservation.category, b.config.Limits.RefinementDaily, b.now())
+		if err != nil {
+			return err
+		}
+		if !decision.Allowed {
+			b.metrics.Inc("quota_denials")
+			return b.sendText(ctx, chatID, quotaText(lang, decision), nil)
+		}
+	}
+	value.FreeModeSwitch = false
+	value.AutoDetected = false
+	b.metrics.Inc("mode_switches")
+	return b.generate(ctx, chatID, user, value, tone, mode, "mode_switch", reservation, value.Revision+1)
 }
 
 func (b *Service) saveStyle(ctx context.Context, chatID int64, user domain.User, lang language, payload session.CallbackPayload) error {
@@ -518,8 +614,13 @@ func (b *Service) saveStyle(ctx context.Context, chatID int64, user domain.User,
 	return b.sendText(ctx, chatID, styleSavedText(lang), nil)
 }
 
-func (b *Service) generate(ctx context.Context, chatID int64, user domain.User, input domain.Input, sourceLanguage string, tone domain.Tone, transform string, reservation quotaReservation, revision uint32) error {
-	value := interaction{Input: input, Tone: tone, Language: sourceLanguage, Revision: revision, ChatID: chatID}
+func (b *Service) generate(ctx context.Context, chatID int64, user domain.User, value interaction, tone domain.Tone, mode domain.ScenarioMode, transform string, reservation quotaReservation, revision uint32) error {
+	value.Tone = tone
+	value.Mode = mode
+	value.Revision = revision
+	value.ChatID = chatID
+	value.GenerationID = 0
+	value.AwaitingMode = false
 	lease, err := b.sessions.Begin(ctx, user.TelegramID, value)
 	if err != nil {
 		b.refundQuota(user.TelegramID, reservation)
@@ -532,9 +633,14 @@ func (b *Service) generateWithLease(ctx context.Context, lease session.Lease, ch
 	stopAction := b.startChatAction(lease.Context, chatID, telegram.ChatActionTyping)
 	defer stopAction()
 
-	examples, err := b.store.ListStyleExamples(lease.Context, user.TelegramID, b.config.Limits.StyleExamples)
+	var examples []string
+	var err error
+	if value.Mode != domain.ScenarioComment {
+		examples, err = b.store.ListStyleExamples(lease.Context, user.TelegramID, b.config.Limits.StyleExamples)
+	}
 	if err != nil {
 		if ctx.Err() != nil {
+			b.refundQuota(user.TelegramID, reservation)
 			return ctx.Err()
 		}
 		if !b.sessions.IsCurrent(lease) {
@@ -547,9 +653,12 @@ func (b *Service) generateWithLease(ctx context.Context, lease session.Lease, ch
 		return err
 	}
 	request := domain.GenerationRequest{
-		Input: value.Input, Tone: value.Tone, Transform: transform, Language: value.Language, StyleExamples: examples,
+		Input: value.Input, Tone: value.Tone, Mode: value.Mode, Transform: transform,
+		Language: value.Language, SourceHint: value.SourceHint, StyleExamples: examples,
+		PreviousReplies: append([]string(nil), value.PreviousReplies...), VariantSeed: value.Revision,
 	}
 	if err := validateUpdateLease(lease.Context); err != nil {
+		b.refundQuota(user.TelegramID, reservation)
 		return err
 	}
 	started := time.Now()
@@ -559,10 +668,12 @@ func (b *Service) generateWithLease(ctx context.Context, lease session.Lease, ch
 	b.metrics.Observe("provider_latency", time.Since(started))
 	if err != nil {
 		if ctx.Err() != nil {
+			b.refundQuota(user.TelegramID, reservation)
 			return ctx.Err()
 		}
 		if !b.sessions.IsCurrent(lease) {
 			b.metrics.Inc("obsolete_jobs")
+			b.refundQuota(user.TelegramID, reservation)
 			return nil
 		}
 		b.sessions.Cancel(user.TelegramID)
@@ -572,14 +683,62 @@ func (b *Service) generateWithLease(ctx context.Context, lease session.Lease, ch
 		return b.sendText(ctx, chatID, processingErrorText(userLanguage(user.Language)), nil)
 	}
 	if ctx.Err() != nil {
+		b.refundQuota(user.TelegramID, reservation)
 		return ctx.Err()
 	}
 	if !b.sessions.IsCurrent(lease) {
 		b.metrics.Inc("obsolete_jobs")
+		b.refundQuota(user.TelegramID, reservation)
+		return nil
+	}
+	b.metrics.Add("input_tokens", int64(result.Usage.InputTokens))
+	b.metrics.Add("output_tokens", int64(result.Usage.OutputTokens))
+
+	if request.Mode == domain.ScenarioAuto && result.ModeConfidence == domain.ModeConfidenceLow {
+		value.Mode = result.Mode
+		value.AwaitingMode = true
+		value.AutoDetected = true
+		value.FreeModeSwitch = false
+		value.GenerationID = 0
+		value.PreviousReplies = nil
+		if err := b.sessions.Commit(lease, value); err != nil {
+			if ctx.Err() != nil {
+				b.refundQuota(user.TelegramID, reservation)
+				return ctx.Err()
+			}
+			b.metrics.Inc("obsolete_jobs")
+			b.refundQuota(user.TelegramID, reservation)
+			return nil
+		}
+		keyboard, keyboardErr := modeChoiceKeyboard(b.callbacks, user.TelegramID, value.SourceID, value.Revision, userLanguage(user.Language))
+		if keyboardErr != nil {
+			b.sessions.Cancel(user.TelegramID)
+			b.refundQuota(user.TelegramID, reservation)
+			return keyboardErr
+		}
+		if err := b.sendText(lease.Context, chatID, modeChoiceText(userLanguage(user.Language)), keyboard); err != nil {
+			if errors.Is(err, store.ErrSuperseded) {
+				b.refundQuota(user.TelegramID, reservation)
+				return err
+			}
+			b.sessions.Cancel(user.TelegramID)
+			b.refundQuota(user.TelegramID, reservation)
+			return err
+		}
+		if persistent, ok := sessionPersistenceContext(lease.Context); ok {
+			if _, err := b.sessions.Reparent(lease, persistent); err != nil {
+				b.refundQuota(user.TelegramID, reservation)
+				return err
+			}
+		}
+		b.metrics.Inc("mode_ambiguous")
 		return nil
 	}
 
-	result, report := b.safety.FilterResult(result, value.Tone, value.Language)
+	if result.Mode == domain.ScenarioComment && value.Tone != domain.ToneMeme {
+		value.Tone = domain.ToneMix
+	}
+	result, report := b.safety.FilterResultForMode(result, result.Mode, value.Tone, value.Language)
 	if report.Dropped > 0 || report.Modified > 0 || report.UsedFallback {
 		b.metrics.Inc("safety_interventions")
 	}
@@ -588,6 +747,17 @@ func (b *Service) generateWithLease(ctx context.Context, lease session.Lease, ch
 		b.refundQuota(user.TelegramID, reservation)
 		return b.sendText(ctx, chatID, processingErrorText(userLanguage(user.Language)), nil)
 	}
+	wasAuto := request.Mode == domain.ScenarioAuto
+	value.Mode = result.Mode
+	value.AwaitingMode = false
+	value.AutoDetected = wasAuto
+	value.FreeModeSwitch = wasAuto
+	value.PreviousReplies = make([]string, 0, len(result.Replies))
+	for _, reply := range result.Replies {
+		value.PreviousReplies = append(value.PreviousReplies, reply.Text)
+	}
+	value.QuotaReservationID = 0
+	value.QuotaCategory = ""
 	record := domain.GenerationRecord{
 		TelegramID: user.TelegramID, InputKind: value.Input.Kind, InputDigest: b.inputDigest(value.Input), Tone: value.Tone,
 		Provider: result.Provider, Model: result.Model, Result: result,
@@ -595,10 +765,12 @@ func (b *Service) generateWithLease(ctx context.Context, lease session.Lease, ch
 	generationID, err := b.store.SaveGeneration(lease.Context, record)
 	if err != nil {
 		if ctx.Err() != nil {
+			b.refundQuota(user.TelegramID, reservation)
 			return ctx.Err()
 		}
 		if !b.sessions.IsCurrent(lease) {
 			b.metrics.Inc("obsolete_jobs")
+			b.refundQuota(user.TelegramID, reservation)
 			return nil
 		}
 		b.sessions.Cancel(user.TelegramID)
@@ -608,36 +780,41 @@ func (b *Service) generateWithLease(ctx context.Context, lease session.Lease, ch
 	value.GenerationID = generationID
 	if err := b.sessions.Commit(lease, value); err != nil {
 		if ctx.Err() != nil {
+			b.refundQuota(user.TelegramID, reservation)
 			return ctx.Err()
 		}
 		b.metrics.Inc("obsolete_jobs")
+		b.refundQuota(user.TelegramID, reservation)
 		return nil
 	}
-	keyboard, err := resultKeyboard(b.callbacks, user.TelegramID, generationID, value.Revision, result.Replies, userLanguage(user.Language))
+	keyboard, err := resultKeyboard(b.callbacks, user.TelegramID, generationID, value.Revision, result.Replies, result.Mode, userLanguage(user.Language))
 	if err != nil {
 		b.sessions.Cancel(user.TelegramID)
 		b.refundQuota(user.TelegramID, reservation)
 		return err
 	}
-	b.metrics.Add("input_tokens", int64(result.Usage.InputTokens))
-	b.metrics.Add("output_tokens", int64(result.Usage.OutputTokens))
 	if ctx.Err() != nil {
+		b.refundQuota(user.TelegramID, reservation)
 		return ctx.Err()
 	}
 	if !b.sessions.IsCurrent(lease) {
 		b.metrics.Inc("obsolete_jobs")
+		b.refundQuota(user.TelegramID, reservation)
 		return nil
 	}
 	err = b.deliverResult(lease.Context, chatID, userLanguage(user.Language), result, keyboard, value.Tone)
 	if err != nil {
 		if errors.Is(err, store.ErrSuperseded) {
+			b.refundQuota(user.TelegramID, reservation)
 			return err
 		}
 		if ctx.Err() != nil {
+			b.refundQuota(user.TelegramID, reservation)
 			return ctx.Err()
 		}
 		if !b.sessions.IsCurrent(lease) {
 			b.metrics.Inc("obsolete_jobs")
+			b.refundQuota(user.TelegramID, reservation)
 			return nil
 		}
 		b.sessions.Cancel(user.TelegramID)
@@ -650,6 +827,11 @@ func (b *Service) generateWithLease(ctx context.Context, lease session.Lease, ch
 		}
 	}
 	b.metrics.Inc("generations_succeeded")
+	if result.Mode == domain.ScenarioComment {
+		b.metrics.Inc("generations_comment")
+	} else {
+		b.metrics.Inc("generations_reply")
+	}
 	return nil
 }
 
@@ -678,13 +860,15 @@ func (b *Service) deliverResult(ctx context.Context, chatID int64, lang language
 }
 
 type rawInput struct {
-	kind      domain.InputKind
-	text      string
-	fileID    string
-	mediaType string
-	filename  string
-	fileSize  int64
-	duration  int
+	kind       domain.InputKind
+	text       string
+	mode       domain.ScenarioMode
+	sourceHint string
+	fileID     string
+	mediaType  string
+	filename   string
+	fileSize   int64
+	duration   int
 }
 
 type quotaReservation struct {
@@ -694,24 +878,36 @@ type quotaReservation struct {
 
 func (b *Service) classifyInput(message telegram.Message) (rawInput, error) {
 	if text := strings.TrimSpace(message.Text); text != "" {
-		if utf8.RuneCountInString(text) > b.config.Limits.MaxTextRunes {
+		mode, source := domain.ScenarioAuto, text
+		if message.ForwardOrigin == nil {
+			mode, source = extractScenarioDirective(text, false)
+		}
+		if utf8.RuneCountInString(source) > b.config.Limits.MaxTextRunes {
 			return rawInput{}, errors.New("text too long")
 		}
-		return rawInput{kind: domain.InputText, text: text}, nil
+		return rawInput{kind: domain.InputText, text: source, mode: mode, sourceHint: sourceHint(message, domain.InputText)}, nil
 	}
 	if photo, ok := message.LargestPhoto(); ok {
-		return rawInput{kind: domain.InputImage, text: strings.TrimSpace(message.Caption), fileID: photo.FileID, mediaType: "image/jpeg", fileSize: photo.FileSize}, nil
+		mode, caption := domain.ScenarioAuto, strings.TrimSpace(message.Caption)
+		if message.ForwardOrigin == nil {
+			mode, caption = extractScenarioDirective(message.Caption, true)
+		}
+		return rawInput{kind: domain.InputImage, text: caption, mode: mode, sourceHint: sourceHint(message, domain.InputImage), fileID: photo.FileID, mediaType: "image/jpeg", fileSize: photo.FileSize}, nil
 	}
 	if message.Document != nil && isImageDocument(*message.Document) {
 		document := message.Document
-		return rawInput{kind: domain.InputImage, text: strings.TrimSpace(message.Caption), fileID: document.FileID, mediaType: document.MIMEType, filename: document.FileName, fileSize: document.FileSize}, nil
+		mode, caption := domain.ScenarioAuto, strings.TrimSpace(message.Caption)
+		if message.ForwardOrigin == nil {
+			mode, caption = extractScenarioDirective(message.Caption, true)
+		}
+		return rawInput{kind: domain.InputImage, text: caption, mode: mode, sourceHint: sourceHint(message, domain.InputImage), fileID: document.FileID, mediaType: document.MIMEType, filename: document.FileName, fileSize: document.FileSize}, nil
 	}
 	if message.Voice != nil {
 		voice := message.Voice
 		if voice.Duration > 5*60 {
 			return rawInput{}, errors.New("voice too long")
 		}
-		return rawInput{kind: domain.InputVoice, fileID: voice.FileID, mediaType: voice.MIMEType, filename: "voice.ogg", fileSize: voice.FileSize, duration: voice.Duration}, nil
+		return rawInput{kind: domain.InputVoice, mode: domain.ScenarioAuto, sourceHint: sourceHint(message, domain.InputVoice), fileID: voice.FileID, mediaType: voice.MIMEType, filename: "voice.ogg", fileSize: voice.FileSize, duration: voice.Duration}, nil
 	}
 	return rawInput{}, errors.New("unsupported input")
 }
@@ -818,6 +1014,9 @@ func (b *Service) startChatAction(ctx context.Context, chatID int64, action tele
 func (b *Service) now() time.Time { return time.Now().In(b.config.UsageLocation) }
 
 func (b *Service) refundQuota(telegramID int64, reservation quotaReservation) {
+	if reservation.id <= 0 || reservation.category == "" {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := b.store.RefundQuota(ctx, telegramID, reservation.id, reservation.category); err != nil {

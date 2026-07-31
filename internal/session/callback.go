@@ -49,10 +49,16 @@ const (
 	ActionConsent
 	ActionSaveStyle
 	ActionResetStyle
+	ActionModeReply
+	ActionModeComment
+	ActionCommentSubtler
+	ActionCommentBolder
+	ActionCommentAbsurd
+	ActionCommentDifferentAngle
 )
 
 func (a Action) Valid() bool {
-	return a >= ActionFeedbackUp && a <= ActionResetStyle
+	return a >= ActionFeedbackUp && a <= ActionCommentDifferentAngle
 }
 
 type CallbackPayload struct {

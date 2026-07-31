@@ -175,8 +175,11 @@ func (provider *ClaudeCLIProvider) Generate(ctx context.Context, request domain.
 		return domain.GenerationResult{}, &ProviderError{Provider: providerClaudeCLI, Code: "output_limit", Err: ErrOutputTooLarge}
 	}
 
-	result, err := parseCLIResult(stdout.Bytes(), normalized.Tone, provider.model)
+	result, err := parseCLIResult(stdout.Bytes(), normalized.Tone, provider.model, normalized.Mode)
 	if err != nil {
+		return domain.GenerationResult{}, &ProviderError{Provider: providerClaudeCLI, Code: "invalid_output", Err: err}
+	}
+	if err := validateFreshReplies(result.Replies, normalized.PreviousReplies); err != nil {
 		return domain.GenerationResult{}, &ProviderError{Provider: providerClaudeCLI, Code: "invalid_output", Err: err}
 	}
 	return result, nil
@@ -235,7 +238,7 @@ func (provider *ClaudeCLIProvider) environment(temporaryDirectory string) []stri
 	return environment
 }
 
-func parseCLIResult(raw []byte, requestedTone domain.Tone, fallbackModel string) (domain.GenerationResult, error) {
+func parseCLIResult(raw []byte, requestedTone domain.Tone, fallbackModel string, requestedModes ...domain.ScenarioMode) (domain.GenerationResult, error) {
 	if len(raw) == 0 {
 		return domain.GenerationResult{}, fmt.Errorf("%w: empty CLI output", ErrInvalidResponse)
 	}
@@ -264,7 +267,11 @@ func parseCLIResult(raw []byte, requestedTone domain.Tone, fallbackModel string)
 	if len(envelope.StructuredOutput) == 0 || bytes.Equal(bytes.TrimSpace(envelope.StructuredOutput), []byte("null")) {
 		return domain.GenerationResult{}, fmt.Errorf("%w: CLI omitted structured_output", ErrInvalidResponse)
 	}
-	result, err := decodeGenerationResult(envelope.StructuredOutput, requestedTone)
+	requestedMode := domain.ScenarioAuto
+	if len(requestedModes) > 0 {
+		requestedMode = requestedModes[0]
+	}
+	result, err := decodeGenerationResult(envelope.StructuredOutput, requestedTone, requestedMode)
 	if err != nil {
 		return domain.GenerationResult{}, err
 	}

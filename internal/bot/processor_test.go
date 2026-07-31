@@ -362,7 +362,7 @@ func TestActiveRegistryClosesClaimRegistrationRace(t *testing.T) {
 	}
 }
 
-func TestQueuePolicySupersedesOnlyGenerativeAndCancellationUpdates(t *testing.T) {
+func TestQueuePolicyKeepsCallbacksReplaceableWithoutCrossPreemption(t *testing.T) {
 	service, _, _, _, codec := newTestService(t, ai.NewFake())
 	if policy := service.QueuePolicy(textUpdate(1, "content")); !policy.Supersedable || !policy.Superseding {
 		t.Fatalf("content policy = %+v", policy)
@@ -373,16 +373,46 @@ func TestQueuePolicySupersedesOnlyGenerativeAndCancellationUpdates(t *testing.T)
 	if policy := service.QueuePolicy(textUpdate(3, "/help")); policy != (UpdateQueuePolicy{}) {
 		t.Fatalf("help policy = %+v", policy)
 	}
+	user := testUser()
+	for index, action := range []session.Action{
+		session.ActionMore, session.ActionModeReply, session.ActionModeComment,
+		session.ActionCommentSubtler, session.ActionCommentBolder,
+		session.ActionCommentAbsurd, session.ActionCommentDifferentAngle,
+	} {
+		data, err := codec.Encode(session.CallbackPayload{
+			Action: action, UserID: 42, InteractionID: 9, Revision: 1, Candidate: -1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		policy := service.QueuePolicy(telegram.Update{UpdateID: int64(4 + index), CallbackQuery: &telegram.CallbackQuery{ID: "generation-action", From: user, Data: data}})
+		if !policy.Supersedable || policy.Superseding {
+			t.Fatalf("action %d policy = %+v", action, policy)
+		}
+	}
+}
+
+func TestStaleGenerativeCallbackCannotPreemptActiveSession(t *testing.T) {
+	service, _, _, sessions, codec := newTestService(t, ai.NewFake())
+	value := interaction{SourceID: 1, GenerationID: 20, Revision: 2, Mode: domain.ScenarioReply}
+	lease, err := sessions.Begin(context.Background(), 42, value)
+	if err != nil {
+		t.Fatal(err)
+	}
 	data, err := codec.Encode(session.CallbackPayload{
-		Action: session.ActionMore, UserID: 42, InteractionID: 9, Revision: 1, Candidate: -1,
+		Action: session.ActionMore, UserID: 42, InteractionID: 19, Revision: 1, Candidate: -1,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	user := testUser()
-	policy := service.QueuePolicy(telegram.Update{UpdateID: 4, CallbackQuery: &telegram.CallbackQuery{ID: "more", From: user, Data: data}})
-	if !policy.Supersedable || !policy.Superseding {
-		t.Fatalf("refinement policy = %+v", policy)
+	update := telegram.Update{UpdateID: 99, CallbackQuery: &telegram.CallbackQuery{ID: "stale", From: user, Data: data}}
+	if policy := service.QueuePolicy(update); !policy.Supersedable || policy.Superseding {
+		t.Fatalf("stale callback policy = %+v", policy)
+	}
+	service.PreemptUpdate(update)
+	if !sessions.IsCurrent(lease) {
+		t.Fatal("stale callback cancelled the active generation")
 	}
 }
 

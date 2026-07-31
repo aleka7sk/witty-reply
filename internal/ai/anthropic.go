@@ -153,8 +153,11 @@ func (provider *AnthropicProvider) Generate(ctx context.Context, request domain.
 			}
 		}
 
-		result, retryAfter, retryable, callErr := provider.doRequest(ctx, body, normalized.Tone)
+		result, retryAfter, retryable, callErr := provider.doRequest(ctx, body, normalized.Tone, normalized.Mode)
 		if callErr == nil {
+			if freshErr := validateFreshReplies(result.Replies, normalized.PreviousReplies); freshErr != nil {
+				return domain.GenerationResult{}, &ProviderError{Provider: providerAnthropic, Code: "invalid_output", Err: freshErr}
+			}
 			return result, nil
 		}
 		lastErr = callErr
@@ -202,7 +205,7 @@ func (provider *AnthropicProvider) requestBody(request domain.GenerationRequest,
 	return json.Marshal(payload)
 }
 
-func (provider *AnthropicProvider) doRequest(ctx context.Context, body []byte, requestedTone domain.Tone) (domain.GenerationResult, time.Duration, bool, error) {
+func (provider *AnthropicProvider) doRequest(ctx context.Context, body []byte, requestedTone domain.Tone, requestedMode domain.ScenarioMode) (domain.GenerationResult, time.Duration, bool, error) {
 	attemptCtx, cancel := context.WithTimeout(ctx, provider.timeout)
 	defer cancel()
 
@@ -273,7 +276,7 @@ func (provider *AnthropicProvider) doRequest(ctx context.Context, body []byte, r
 			structured.WriteString(block.Text)
 		}
 	}
-	result, err := decodeGenerationResult(structured.Bytes(), requestedTone)
+	result, err := decodeGenerationResult(structured.Bytes(), requestedTone, requestedMode)
 	if err != nil {
 		return domain.GenerationResult{}, 0, false, &ProviderError{Provider: providerAnthropic, Code: "invalid_output", RequestID: response.Header.Get("request-id"), Err: err}
 	}
