@@ -190,6 +190,38 @@ func TestPostgresIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("thread claim binds lease expiry as timestamptz", func(t *testing.T) {
+		const claimOwnerID = int64(71006)
+		if _, err := postgres.UpsertUser(ctx, domain.User{TelegramID: claimOwnerID}); err != nil {
+			t.Fatal(err)
+		}
+		draftID, err := postgres.CreateThreadDraft(ctx, testThreadDraft(claimOwnerID, 1, "Timestamp claim regression"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var claimAt time.Time
+		if err := postgres.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&claimAt); err != nil {
+			t.Fatal(err)
+		}
+		const lease = 37 * time.Second
+		claimedDraft, claimed, err := postgres.ClaimThreadDraft(
+			ctx, draftID, claimOwnerID, 1, "timestamp-claim", claimAt, lease,
+		)
+		if err != nil {
+			t.Fatalf("ClaimThreadDraft() must bind claim_expires_at as timestamptz: %v", err)
+		}
+		if !claimed || claimedDraft.ClaimExpiresAt == nil {
+			t.Fatalf("claim = %+v, claimed=%v", claimedDraft, claimed)
+		}
+		wantExpiry := claimAt.UTC().Add(lease)
+		if !claimedDraft.ClaimExpiresAt.Equal(wantExpiry) {
+			t.Fatalf("claim expiry = %s, want %s", claimedDraft.ClaimExpiresAt, wantExpiry)
+		}
+		if err := postgres.FailThreadDraft(ctx, draftID, claimOwnerID, "timestamp-claim", "test_complete", false); err != nil {
+			t.Fatal(err)
+		}
+	})
+
 	t.Run("thread drafts are durable owned current and publish idempotent", func(t *testing.T) {
 		firstID, err := postgres.CreateThreadDraft(ctx, testThreadDraft(ownerID, 1, "Первый Threads-пост"))
 		if err != nil {

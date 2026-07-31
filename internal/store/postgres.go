@@ -590,7 +590,7 @@ func (p *Postgres) ClaimThreadDraft(
 			END,
 			claim_expires_at = CASE
 				WHEN state = 'publishing' AND publish_started_at IS NOT NULL THEN NULL
-				ELSE $6
+				ELSE $6::timestamptz
 			END,
 			publish_started_at = CASE
 				WHEN state = 'publishing' AND publish_started_at IS NOT NULL THEN publish_started_at
