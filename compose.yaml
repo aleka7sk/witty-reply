@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: witty
+      POSTGRES_USER: witty
+      POSTGRES_PASSWORD: witty
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U witty -d witty"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    env_file: .env
+    environment:
+      STORE_DRIVER: postgres
+      DATABASE_URL: postgres://witty:witty@postgres:5432/witty?sslmode=disable
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 768m
+    cpus: 2.0
+
+volumes:
+  postgres-data:
