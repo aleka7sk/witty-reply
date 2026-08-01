@@ -86,6 +86,11 @@ func threadFinalistSetText(set domain.ThreadFinalistSet) string {
 			message.WriteString("⭐ выбор редактора · ")
 		}
 		message.WriteString(threadScenarioLabel(candidate.ScenarioID))
+		if candidate.MaterialBasis == "material" {
+			message.WriteString(" · по материалу дня")
+		} else {
+			message.WriteString(" · evergreen, материал не используется")
+		}
 		if !candidate.Selectable {
 			hasUnselectable = true
 			message.WriteString(" · ⚠️ только для сравнения")
@@ -108,25 +113,31 @@ func threadFinalistSetCancelledText(restored bool) string {
 }
 
 func threadDraftText(draft domain.ThreadDraft) string {
-	return threadDraftTextWithContext(draft, nil, "")
+	return threadDraftTextWithContext(draft, nil, "", "")
 }
 
-func threadDraftTextWithBrief(draft domain.ThreadDraft, materialKind domain.ThreadMaterialKind) string {
-	return threadDraftTextWithContext(draft, nil, materialKind)
+func threadDraftTextWithBrief(
+	draft domain.ThreadDraft,
+	materialKind domain.ThreadMaterialKind,
+	materialBasis string,
+) string {
+	return threadDraftTextWithContext(draft, nil, materialKind, materialBasis)
 }
 
 func threadDraftTextWithMediaAndBrief(
 	draft domain.ThreadDraft,
 	mediaValue domain.ThreadMedia,
 	materialKind domain.ThreadMaterialKind,
+	materialBasis string,
 ) string {
-	return threadDraftTextWithContext(draft, &mediaValue, materialKind)
+	return threadDraftTextWithContext(draft, &mediaValue, materialKind, materialBasis)
 }
 
 func threadDraftTextWithContext(
 	draft domain.ThreadDraft,
 	mediaValue *domain.ThreadMedia,
 	materialKind domain.ThreadMaterialKind,
+	materialBasis string,
 ) string {
 	voice := "Belcanto"
 	if draft.Voice == domain.ThreadVoiceAlisher {
@@ -136,7 +147,7 @@ func threadDraftTextWithContext(
 	scenario := threadScenarioLabel(draft.ScenarioID)
 	material := "без материала — только evergreen"
 	contentRights := ""
-	if materialKind == domain.ThreadMaterialText {
+	if materialBasis == "material" || (materialBasis == "" && materialKind == domain.ThreadMaterialText) {
 		material = "использован подтверждённый материал дня"
 		contentRights = "\n\nПеред публикацией проверь факты и разрешения на имена/цитаты; детей обезличь."
 	} else if draft.Objective == domain.ThreadObjectiveLegacy {

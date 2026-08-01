@@ -406,7 +406,7 @@ func TestThreadDraftPexelsCaptionStaysWithinTelegramLimit(t *testing.T) {
 		SourcePageURL:   "https://www.pexels.com/" + strings.Repeat("p", 2_000),
 		SourceAuthorURL: "https://www.pexels.com/@" + strings.Repeat("a", 2_000),
 	}
-	caption := threadDraftTextWithMediaAndBrief(draft, mediaValue, domain.ThreadMaterialText)
+	caption := threadDraftTextWithMediaAndBrief(draft, mediaValue, domain.ThreadMaterialText, "material")
 	if runes := utf8.RuneCountInString(caption); runes > 1_024 {
 		t.Fatalf("caption runes = %d", runes)
 	}

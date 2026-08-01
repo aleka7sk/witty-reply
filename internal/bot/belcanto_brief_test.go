@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aleka7sk/witty-reply/internal/ai"
 	"github.com/aleka7sk/witty-reply/internal/domain"
@@ -18,9 +19,10 @@ import (
 )
 
 type briefCaptureProvider struct {
-	mu             sync.Mutex
-	threadRequests []ai.ThreadPostRequest
-	ordinaryCalls  int
+	mu                 sync.Mutex
+	threadRequests     []ai.ThreadPostRequest
+	ordinaryCalls      int
+	mixedMaterialBasis bool
 }
 
 type refinementFailureProvider struct {
@@ -57,19 +59,31 @@ func (p *briefCaptureProvider) Generate(ctx context.Context, request domain.Gene
 func (p *briefCaptureProvider) GenerateThreadPost(_ context.Context, request ai.ThreadPostRequest) (ai.ThreadPostResult, error) {
 	p.mu.Lock()
 	p.threadRequests = append(p.threadRequests, request)
+	mixedMaterialBasis := p.mixedMaterialBasis
 	p.mu.Unlock()
-	return validTestThreadResultForRequest(
+	result := validTestThreadResultForRequest(
 		request,
 		"У каждого стола в караоке есть человек, который дольше всех говорит «я не буду», а потом не отдаёт микрофон. Кто это у вас?",
 		"brief-test",
 		"brief-test",
-	), nil
+	)
+	if mixedMaterialBasis && strings.TrimSpace(request.Material) != "" {
+		result.Audit.Candidates[1].MaterialBasis = "none"
+		result.Audit.Candidates[1].Evidence = ""
+	}
+	return result, nil
 }
 
 func (p *briefCaptureProvider) snapshot() ([]ai.ThreadPostRequest, int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]ai.ThreadPostRequest(nil), p.threadRequests...), p.ordinaryCalls
+}
+
+func (p *briefCaptureProvider) useMixedMaterialBasis() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.mixedMaterialBasis = true
 }
 
 func newBriefFlowService(t *testing.T) (*Service, *fakeTelegram, *store.Memory, *briefCaptureProvider) {
@@ -229,6 +243,121 @@ func TestThreadsTrialRequiresVerifiedMaterialAndHidesEvergreenShortcut(t *testin
 	brief, err = memory.GetCurrentThreadBrief(ctx, 42)
 	if err != nil || brief.State != domain.ThreadBriefAwaitingMaterial {
 		t.Fatalf("trial brief = %+v, %v", brief, err)
+	}
+}
+
+func TestThreadsMaterialPortfolioMakesEvergreenOverrideExplicit(t *testing.T) {
+	service, telegramClient, memory, provider := newBriefFlowService(t)
+	provider.useMixedMaterialBasis()
+	ctx := context.Background()
+
+	if err := service.HandleUpdate(ctx, textUpdate(700, "/threads")); err != nil {
+		t.Fatal(err)
+	}
+	replies := threadButtonCallback(t, telegramClient.snapshotMessages()[0].ReplyMarkup, "💬 Ответы")
+	if err := service.HandleUpdate(ctx, callbackUpdate(701, replies)); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.HandleUpdate(ctx, textUpdate(702, "Педагог заметил: взрослый ученик впервые спокойно дослушал запись своего голоса до конца.")); err != nil {
+		t.Fatal(err)
+	}
+
+	set, err := memory.GetThreadFinalistSetByGenerationUpdate(ctx, 42, 702)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.Candidates[0].MaterialBasis != "material" || set.Candidates[1].MaterialBasis != "none" {
+		t.Fatalf("mixed finalist provenance = %+v", set.Candidates)
+	}
+	portfolio := telegramClient.snapshotMessages()[len(telegramClient.snapshotMessages())-1]
+	if !strings.Contains(portfolio.Text, "по материалу дня") ||
+		!strings.Contains(portfolio.Text, "evergreen, материал не используется") {
+		t.Fatalf("portfolio hid material provenance: %q", portfolio.Text)
+	}
+
+	chooseEvergreen := threadButtonCallback(t, portfolio.ReplyMarkup, "Выбрать 2")
+	if err := service.HandleUpdate(ctx, callbackUpdate(703, chooseEvergreen)); err != nil {
+		t.Fatal(err)
+	}
+	draft, err := memory.GetCurrentThreadDraft(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview := telegramClient.snapshotMessages()[len(telegramClient.snapshotMessages())-1].Text
+	if draft.Text != set.Candidates[1].Text || !strings.Contains(preview, "без материала — только evergreen") ||
+		strings.Contains(preview, "использован подтверждённый материал дня") {
+		t.Fatalf("evergreen preview = %q, draft=%+v", preview, draft)
+	}
+	if requests, ordinary := provider.snapshot(); len(requests) != 1 || ordinary != 0 {
+		t.Fatalf("evergreen selection repeated AI: threads=%d ordinary=%d", len(requests), ordinary)
+	}
+}
+
+func TestThreadFinalistSelectionReplayNeverRestoresStaleControls(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		makeStale func(*testing.T, context.Context, *Service, *store.Memory, domain.User, domain.ThreadDraft)
+		startID   int64
+	}{
+		{
+			name:    "after refinement",
+			startID: 800,
+			makeStale: func(t *testing.T, ctx context.Context, service *Service, _ *store.Memory, user domain.User, draft domain.ThreadDraft) {
+				t.Helper()
+				if err := service.prepareThreadDraft(ctx, 900, 42, user, draft.Voice, "shorter", &draft, nil); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:    "after publication",
+			startID: 1_000,
+			makeStale: func(t *testing.T, ctx context.Context, _ *Service, memory *store.Memory, _ domain.User, draft domain.ThreadDraft) {
+				t.Helper()
+				now := time.Now().UTC()
+				const claimToken = "stale-selection-replay"
+				if _, claimed, err := memory.ClaimThreadDraft(ctx, draft.ID, 42, draft.Revision, claimToken, now, time.Minute); err != nil || !claimed {
+					t.Fatalf("claim draft: claimed=%v err=%v", claimed, err)
+				}
+				if err := memory.SetThreadContainer(ctx, draft.ID, 42, claimToken, "container-stale-replay"); err != nil {
+					t.Fatal(err)
+				}
+				if err := memory.BeginThreadPublish(ctx, draft.ID, 42, claimToken, now, time.Minute); err != nil {
+					t.Fatal(err)
+				}
+				if err := memory.CompleteThreadDraft(ctx, draft.ID, 42, claimToken, "post-stale-replay", ""); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			service, telegramClient, memory, _ := newBriefFlowService(t)
+			ctx := context.Background()
+			draft := generateThreadDraftForTest(t, service, memory, testCase.startID)
+			set, err := memory.GetThreadFinalistSet(ctx, draft.FinalistSetID, 42)
+			if err != nil {
+				t.Fatal(err)
+			}
+			user, err := memory.GetUser(ctx, 42)
+			if err != nil {
+				t.Fatal(err)
+			}
+			testCase.makeStale(t, ctx, service, memory, user, draft)
+
+			before := len(telegramClient.snapshotMessages())
+			if err := service.selectThreadFinalist(ctx, set.SelectionUpdateID, 42, user, session.CallbackPayload{
+				Action: session.ActionThreadSelectFinalist, UserID: 42,
+				InteractionID: set.ID, Revision: set.Revision - 1, Candidate: int8(set.SelectedPosition),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			messages := telegramClient.snapshotMessages()
+			if len(messages) != before+1 || messages[len(messages)-1].Text != threadDraftStaleText() ||
+				messages[len(messages)-1].ReplyMarkup != nil {
+				t.Fatalf("stale selection replay exposed controls: %+v", messages[len(messages)-1])
+			}
+		})
 	}
 }
 

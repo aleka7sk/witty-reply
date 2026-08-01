@@ -748,6 +748,9 @@ func (b *Service) selectThreadFinalist(
 		}
 		return err
 	}
+	if !draft.Current || (draft.State != domain.ThreadDraftReady && draft.State != domain.ThreadDraftFailed) {
+		return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+	}
 	if created {
 		b.recordBelcantoDraftReady(draft)
 		b.logBelcantoFinalistSelected(user.TelegramID, set, draft, candidate)
@@ -1168,16 +1171,12 @@ func (b *Service) sendThreadDraftPreview(
 	draft domain.ThreadDraft,
 	keyboard *telegram.InlineKeyboardMarkup,
 ) error {
-	materialKind := domain.ThreadMaterialNone
-	if draft.BriefID > 0 {
-		brief, err := b.store.GetThreadBrief(ctx, draft.BriefID, draft.TelegramID)
-		if err != nil {
-			return fmt.Errorf("load Threads brief for preview: %w", err)
-		}
-		materialKind = brief.MaterialKind
+	materialKind, materialBasis, err := b.threadDraftMaterialContext(ctx, draft)
+	if err != nil {
+		return err
 	}
 	if draft.MediaMode != domain.ThreadMediaImage {
-		return b.sendText(ctx, chatID, threadDraftTextWithBrief(draft, materialKind), keyboard)
+		return b.sendText(ctx, chatID, threadDraftTextWithBrief(draft, materialKind, materialBasis), keyboard)
 	}
 	mediaValue, err := b.store.GetThreadMedia(ctx, draft.MediaID, draft.TelegramID)
 	if err != nil {
@@ -1186,9 +1185,39 @@ func (b *Service) sendThreadDraftPreview(
 	keyboard = threadDraftKeyboardWithMediaSource(keyboard, mediaValue)
 	_, err = b.telegram.SendPhoto(ctx, telegram.SendPhotoParams{
 		ChatID: chatID, Photo: telegram.FileUpload("belcanto-threads.jpg", mediaValue.Data),
-		Caption: threadDraftTextWithMediaAndBrief(draft, mediaValue, materialKind), ReplyMarkup: keyboard, ProtectContent: true,
+		Caption: threadDraftTextWithMediaAndBrief(draft, mediaValue, materialKind, materialBasis), ReplyMarkup: keyboard, ProtectContent: true,
 	})
 	return err
+}
+
+func (b *Service) threadDraftMaterialContext(
+	ctx context.Context,
+	draft domain.ThreadDraft,
+) (domain.ThreadMaterialKind, string, error) {
+	materialKind := domain.ThreadMaterialNone
+	if draft.BriefID > 0 {
+		brief, err := b.store.GetThreadBrief(ctx, draft.BriefID, draft.TelegramID)
+		if err != nil {
+			return "", "", fmt.Errorf("load Threads brief for preview: %w", err)
+		}
+		materialKind = brief.MaterialKind
+	}
+	if draft.FinalistSetID == 0 {
+		return materialKind, "", nil
+	}
+	set, err := b.store.GetThreadFinalistSet(ctx, draft.FinalistSetID, draft.TelegramID)
+	if err != nil {
+		return "", "", fmt.Errorf("load Threads finalist provenance for preview: %w", err)
+	}
+	if set.State != domain.ThreadFinalistSetSelected || set.SelectedDraftID != draft.ID ||
+		set.SelectedPosition < 0 || set.SelectedPosition >= len(set.Candidates) {
+		return "", "", errors.New("threads finalist provenance is inconsistent")
+	}
+	candidate := set.Candidates[set.SelectedPosition]
+	if candidate.Position != set.SelectedPosition || candidate.Text != draft.Text || candidate.ScenarioID != draft.ScenarioID {
+		return "", "", errors.New("threads selected finalist does not match its draft")
+	}
+	return materialKind, candidate.MaterialBasis, nil
 }
 
 func (b *Service) threadDraftKeyboard(
