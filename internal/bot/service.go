@@ -233,16 +233,16 @@ func (b *Service) QueuePolicy(update telegram.Update) UpdateQueuePolicy {
 	if update.Message != nil && update.Message.From != nil && !update.Message.From.IsBot && update.Message.Chat.Type == "private" {
 		command := parseCommand(update.Message.Text)
 		switch command {
-		case "new", "cancel", "delete_me", "delete_data":
+		case "new", "cancel", "delete_me", "delete_data", "threads", "belcanto":
 			return UpdateQueuePolicy{Superseding: true}
 		case "":
-			if raw, err := b.classifyInput(*update.Message); err == nil {
-				if raw.kind == domain.InputImage && b.isBelcantoOperator(update.Message.From.ID) {
-					// An operator image may be the durable second step of a
-					// Threads draft. Keep it ordered and retryable until storage
-					// can decide whether it belongs to that workflow.
-					return UpdateQueuePolicy{}
-				}
+			// Belcanto operator input may be the material for a durable ThreadBrief.
+			// Keep all of it strictly ordered until storage, not an in-memory guess,
+			// decides which workflow owns the update.
+			if b.isBelcantoOperator(update.Message.From.ID) {
+				return UpdateQueuePolicy{}
+			}
+			if _, err := b.classifyInput(*update.Message); err == nil {
 				return UpdateQueuePolicy{Supersedable: true, Superseding: true}
 			}
 		}
@@ -314,7 +314,7 @@ func (b *Service) handleMessage(ctx context.Context, updateID int64, message tel
 	}
 	lang := userLanguage(user.Language)
 	if command := parseCommand(message.Text); command != "" {
-		return b.handleCommand(ctx, message.Chat.ID, user, lang, command)
+		return b.handleCommand(ctx, updateID, message.Chat.ID, user, lang, command)
 	}
 	if !user.HasConsent() {
 		keyboard, keyboardErr := consentKeyboard(b.callbacks, user.TelegramID, lang)
@@ -322,6 +322,9 @@ func (b *Service) handleMessage(ctx context.Context, updateID int64, message tel
 			return keyboardErr
 		}
 		return b.sendText(ctx, message.Chat.ID, consentRequiredText(lang), keyboard)
+	}
+	if handled, briefErr := b.tryHandleThreadBriefMaterial(ctx, updateID, message, user); handled {
+		return briefErr
 	}
 	if handled, mediaErr := b.tryHandleThreadMediaUpload(ctx, updateID, message, user); handled {
 		return mediaErr
@@ -402,7 +405,7 @@ func (b *Service) handleMessage(ctx context.Context, updateID int64, message tel
 	return b.generateWithLease(ctx, lease, message.Chat.ID, user, value, "", reservation)
 }
 
-func (b *Service) handleCommand(ctx context.Context, chatID int64, user domain.User, lang language, command string) error {
+func (b *Service) handleCommand(ctx context.Context, updateID, chatID int64, user domain.User, lang language, command string) error {
 	switch command {
 	case "start":
 		if user.HasConsent() {
@@ -419,9 +422,15 @@ func (b *Service) handleCommand(ctx context.Context, chatID int64, user domain.U
 		return b.sendText(ctx, chatID, privacyText(lang, b.config.PrivacyURL, b.config.SpeechProvider != "disabled"), nil)
 	case "new":
 		b.sessions.Cancel(user.TelegramID)
+		if cancelled, err := b.cancelCurrentThreadBriefIfPending(ctx, chatID, user); cancelled || err != nil {
+			return err
+		}
 		return b.sendText(ctx, chatID, contextClearedText(lang), nil)
 	case "cancel":
 		b.sessions.Cancel(user.TelegramID)
+		if cancelled, err := b.cancelCurrentThreadBriefIfPending(ctx, chatID, user); cancelled || err != nil {
+			return err
+		}
 		return b.sendText(ctx, chatID, cancelledText(lang), nil)
 	case "style":
 		keyboard, err := styleKeyboard(b.callbacks, user.TelegramID, lang)
@@ -440,7 +449,7 @@ func (b *Service) handleCommand(ctx context.Context, chatID int64, user domain.U
 		}
 		return b.sendText(ctx, chatID, planText(lang, stats, nextDay(b.now())), nil)
 	case "belcanto", "threads":
-		return b.handleBelcantoCommand(ctx, chatID, user, lang)
+		return b.handleBelcantoCommand(ctx, updateID, chatID, user, lang)
 	case "delete_me", "delete_data":
 		keyboard, err := deleteKeyboard(b.callbacks, user.TelegramID, lang)
 		if err != nil {
@@ -555,20 +564,38 @@ func (b *Service) handleCallback(ctx context.Context, updateID int64, callback t
 		return b.changeMode(ctx, updateID, chatID, user, lang, payload, domain.ScenarioReply)
 	case session.ActionModeComment:
 		return b.changeMode(ctx, updateID, chatID, user, lang, payload, domain.ScenarioComment)
+	case session.ActionThreadObjectiveReach,
+		session.ActionThreadObjectiveReplies,
+		session.ActionThreadObjectiveTrust,
+		session.ActionThreadObjectiveTrial,
+		session.ActionThreadObjectiveCommunity:
+		objective, ok := threadObjectiveForAction(payload.Action)
+		if !ok {
+			return nil
+		}
+		return b.selectThreadBriefObjective(ctx, chatID, user, payload, objective)
+	case session.ActionThreadMaterialNone:
+		return b.completeThreadBriefWithoutMaterial(ctx, updateID, chatID, user, payload)
+	case session.ActionThreadBriefChangeObjective:
+		return b.showThreadBriefObjectives(ctx, chatID, user, payload)
+	case session.ActionThreadBriefCancel:
+		return b.cancelThreadBrief(ctx, chatID, user, payload)
+	case session.ActionThreadBriefRetry:
+		return b.retryThreadBrief(ctx, updateID, chatID, user, payload)
 	case session.ActionThreadNewBelcanto:
-		return b.refineThreadDraft(ctx, chatID, user, payload, domain.ThreadVoiceBelcanto, "different_angle")
+		return b.refineThreadDraft(ctx, updateID, chatID, user, payload, domain.ThreadVoiceBelcanto, "different_angle")
 	case session.ActionThreadNewAlisher:
-		return b.refineThreadDraft(ctx, chatID, user, payload, domain.ThreadVoiceAlisher, "different_angle")
+		return b.refineThreadDraft(ctx, updateID, chatID, user, payload, domain.ThreadVoiceAlisher, "different_angle")
 	case session.ActionThreadWittier:
-		return b.refineThreadDraft(ctx, chatID, user, payload, "", "wittier")
+		return b.refineThreadDraft(ctx, updateID, chatID, user, payload, "", "wittier")
 	case session.ActionThreadWarmer:
-		return b.refineThreadDraft(ctx, chatID, user, payload, "", "warmer")
+		return b.refineThreadDraft(ctx, updateID, chatID, user, payload, "", "warmer")
 	case session.ActionThreadShorter:
-		return b.refineThreadDraft(ctx, chatID, user, payload, "", "shorter")
+		return b.refineThreadDraft(ctx, updateID, chatID, user, payload, "", "shorter")
 	case session.ActionThreadDifferentAngle:
-		return b.refineThreadDraft(ctx, chatID, user, payload, "", "different_angle")
+		return b.refineThreadDraft(ctx, updateID, chatID, user, payload, "", "different_angle")
 	case session.ActionThreadNoSell:
-		return b.refineThreadDraft(ctx, chatID, user, payload, "", "no_sell")
+		return b.refineThreadDraft(ctx, updateID, chatID, user, payload, "", "no_sell")
 	case session.ActionThreadUseImage:
 		return b.setThreadDraftMediaMode(ctx, chatID, user, payload, domain.ThreadMediaImagePending)
 	case session.ActionThreadUseText:
@@ -603,7 +630,16 @@ func threadActionRequiresConsent(action session.Action) bool {
 		session.ActionThreadUseImage,
 		session.ActionThreadUseText,
 		session.ActionThreadKeepImage,
-		session.ActionThreadUsePexels:
+		session.ActionThreadUsePexels,
+		session.ActionThreadObjectiveReach,
+		session.ActionThreadObjectiveReplies,
+		session.ActionThreadObjectiveTrust,
+		session.ActionThreadObjectiveTrial,
+		session.ActionThreadObjectiveCommunity,
+		session.ActionThreadMaterialNone,
+		session.ActionThreadBriefChangeObjective,
+		session.ActionThreadBriefCancel,
+		session.ActionThreadBriefRetry:
 		return true
 	default:
 		return false

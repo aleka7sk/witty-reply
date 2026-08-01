@@ -50,32 +50,64 @@ func (provider *FakeProvider) GenerateThreadPost(ctx context.Context, request Th
 	if err != nil {
 		return ThreadPostResult{}, err
 	}
+	plan, err := selectThreadPostScenarioPlan(normalized)
+	if err != nil {
+		return ThreadPostResult{}, err
+	}
 	results := curatedThreadPosts(normalized, threadPostFinalistCount, nil)
 	if len(results) != threadPostFinalistCount {
 		return ThreadPostResult{}, fmt.Errorf("fake Threads finalist invariant: %w", ErrInvalidResponse)
 	}
 	audit := ThreadPostAudit{
-		GenerationID: normalized.GenerationID, RecipeID: selectThreadPostRecipe(normalized).ID,
-		ExplorationGoal: threadPostFinalistCount, GenerationCalls: 1, GeneratorProvider: providerFake,
-		GeneratorModel: "deterministic-threads-v2", SelectionMode: "deterministic_fake",
-		DecisionReason: "Deterministic local preview provider selected the strongest of five validated editorial examples.",
+		GenerationID: normalized.GenerationID, Objective: normalized.Objective, RecipeID: "scenario-engine-v3",
+		ExplorationGoal: threadPostConceptCount, ConceptCalls: 1, WriterCalls: 1, GenerationCalls: 2, GeneratorProvider: providerFake,
+		GeneratorModel: "deterministic-threads-v3", SelectionMode: "deterministic_fake",
+		DecisionReason: "Deterministic local preview selected one of five scenario-diverse editorial examples.",
+		Concepts:       make([]ThreadPostConceptAudit, 0, len(plan)),
 		Candidates:     make([]ThreadPostCandidateAudit, 0, threadPostFinalistCount),
+	}
+	for index, scenario := range plan {
+		materialBasis, evidence := "none", ""
+		if scenario.RequiresMaterial {
+			materialBasis, evidence = "material", fakeThreadPostEvidence(normalized.Material)
+		}
+		audit.Concepts = append(audit.Concepts, ThreadPostConceptAudit{
+			ID: fmt.Sprintf("C%02d", index+1), ScenarioID: scenario.ID, Mechanism: scenario.Mechanism,
+			Angle: scenario.Instruction, Hook: "deterministic preview concept", Ending: "scenario-specific ending",
+			MaterialBasis: materialBasis, Evidence: evidence, Eligible: true,
+		})
 	}
 	candidates := make([]threadPostCandidate, 0, threadPostFinalistCount)
 	for index, finalist := range results {
 		audit.Candidates = append(audit.Candidates, ThreadPostCandidateAudit{
 			Attempt: 1, SourceSlot: fmt.Sprintf("fake_%d", index+1), Goal: finalist.Goal,
+			Objective: finalist.Objective, ScenarioID: finalist.ScenarioID, Mechanism: finalist.Mechanism,
+			MaterialBasis: finalist.MaterialBasis, Evidence: finalist.Evidence,
 			Text: finalist.Text, Eligible: true, Considered: true, Local: scoreThreadPostQuality(finalist.Text),
 		})
 		candidates = append(candidates, threadPostCandidate{Result: finalist, AuditIndex: index})
 	}
 	assignBlindReviewerIDs(candidates, audit.Candidates, normalized.Seed, 1)
-	winner := bestLocalThreadPostCandidate(candidates, audit.Candidates)
+	winnerPool := candidates
+	if normalized.Material != "" {
+		winnerPool = make([]threadPostCandidate, 0, len(candidates))
+		for _, candidate := range candidates {
+			if candidate.Result.MaterialBasis == "material" {
+				winnerPool = append(winnerPool, candidate)
+			}
+		}
+	}
+	if len(winnerPool) == 0 {
+		return ThreadPostResult{}, fmt.Errorf("fake Threads material winner invariant: %w", ErrInvalidResponse)
+	}
+	winner := bestLocalThreadPostCandidate(winnerPool, audit.Candidates)
 	markThreadPostAuditWinner(&audit, winner)
+	audit.ScenarioID = winner.Result.ScenarioID
+	audit.Mechanism = winner.Result.Mechanism
 	result := winner.Result
 	result.Provider = providerFake
 	result.Model = audit.GeneratorModel
-	result.Visual = ThreadPostVisualRecommendation{Mode: "text_only", Query: defaultThreadPhotoQuery}
+	result.Visual = ThreadPostVisualRecommendation{Mode: "text_only", Query: SafeThreadPhotoQuery(result.ScenarioID)}
 	result.Audit = audit
 	return result, nil
 }
@@ -84,26 +116,68 @@ func curatedThreadPosts(normalized normalizedThreadPostRequest, limit int, exclu
 	if limit <= 0 {
 		return nil
 	}
+	plan, err := selectThreadPostScenarioPlan(normalized)
+	if err != nil {
+		return nil
+	}
 	bank := fakeThreadPostBank(normalized.Voice)
+	if normalized.Material != "" {
+		bank = groundedFakeThreadPostBank(normalized, plan)
+	} else {
+		allowed := make(map[string]struct{}, len(plan))
+		for _, scenario := range plan {
+			allowed[scenario.ID] = struct{}{}
+		}
+		filtered := make([]fakeThreadPost, 0, len(bank))
+		for _, candidate := range bank {
+			if _, ok := allowed[candidate.scenarioID]; ok {
+				filtered = append(filtered, candidate)
+			}
+		}
+		bank = filtered
+	}
+	if len(bank) == 0 {
+		return nil
+	}
 	offset := int(normalized.Seed % uint32(len(bank)))
-	switch normalized.Transform {
-	case "wittier":
+	if normalized.Material == "" && normalized.Voice == "alisher" {
+		offset = (offset + 7) % len(bank)
+	}
+	switch {
+	case normalized.Material != "":
+		offset = 0
+	case normalized.Transform == "wittier":
 		offset = (offset + 2) % len(bank)
-	case "warmer":
+	case normalized.Transform == "warmer":
 		offset = (offset + 4) % len(bank)
-	case "shorter":
+	case normalized.Transform == "shorter":
 		offset = (offset + 6) % len(bank)
-	case "different_angle":
+	case normalized.Transform == "different_angle":
 		offset = (offset + 8) % len(bank)
 	}
-	results := make([]ThreadPostResult, 0, limit)
+	poolLimit := len(bank)
+	results := make([]ThreadPostResult, 0, poolLimit)
 	seen := make(map[string]struct{}, len(excluded)+limit)
+	seenScenarios := make(map[string]struct{}, limit)
 	for key := range excluded {
 		seen[key] = struct{}{}
 	}
-	for attempt := 0; attempt < len(bank) && len(results) < limit; attempt++ {
+	for attempt := 0; attempt < len(bank) && len(results) < poolLimit; attempt++ {
 		candidate := bank[(offset+attempt)%len(bank)]
-		result := ThreadPostResult{Goal: candidate.goal, Text: candidate.text}
+		if _, duplicate := seenScenarios[candidate.scenarioID]; duplicate {
+			continue
+		}
+		result := ThreadPostResult{
+			Goal: string(normalized.Objective), Objective: normalized.Objective,
+			ScenarioID: candidate.scenarioID, Mechanism: candidate.mechanism,
+			MaterialBasis: candidate.materialBasis, Evidence: candidate.evidence, Text: candidate.text,
+		}
+		if result.MaterialBasis == "" {
+			result.MaterialBasis = "none"
+		}
+		if err := validateThreadPostEvidence(result.MaterialBasis, result.Evidence, normalized, threadPostScenarioByID[result.ScenarioID].RequiresMaterial); err != nil {
+			continue
+		}
 		if err := validateThreadPostResult(&result, normalized); err != nil {
 			continue
 		}
@@ -118,111 +192,247 @@ func curatedThreadPosts(normalized normalizedThreadPostRequest, limit int, exclu
 			continue
 		}
 		seen[key] = struct{}{}
+		seenScenarios[result.ScenarioID] = struct{}{}
 		results = append(results, result)
+	}
+	if limit == threadPostFinalistCount {
+		return selectFakeThreadPosts(results, normalized, limit)
+	}
+	if len(results) > limit {
+		results = results[:limit]
 	}
 	return results
 }
 
+func selectFakeThreadPosts(pool []ThreadPostResult, request normalizedThreadPostRequest, limit int) []ThreadPostResult {
+	anchors := threadPostObjectiveAnchorIDs(request)
+	minimumMaterial := 0
+	if request.Material != "" {
+		minimumMaterial = minimumMaterialBackedFinalistCount
+	}
+	selected := make([]ThreadPostResult, 0, limit)
+	var winner []ThreadPostResult
+	var search func(int, int)
+	search = func(start, questionEndings int) {
+		if winner != nil {
+			return
+		}
+		if len(selected) == limit {
+			scenarios := make(map[string]struct{}, limit)
+			mechanisms := make(map[string]struct{}, limit)
+			materialCount := 0
+			for _, candidate := range selected {
+				scenarios[candidate.ScenarioID] = struct{}{}
+				mechanisms[candidate.Mechanism] = struct{}{}
+				if candidate.MaterialBasis == "material" {
+					materialCount++
+				}
+			}
+			if len(mechanisms) < 4 || materialCount < minimumMaterial ||
+				!threadPostPortfolioHasObjectiveAnchor(anchors, scenarios) {
+				return
+			}
+			if request.PreviousScenarioID != "" && request.Transform != "different_angle" {
+				if _, preserved := scenarios[request.PreviousScenarioID]; !preserved {
+					return
+				}
+			}
+			winner = append([]ThreadPostResult(nil), selected...)
+			return
+		}
+		if len(pool)-start < limit-len(selected) {
+			return
+		}
+		for index := start; index < len(pool); index++ {
+			candidate := pool[index]
+			isQuestion := strings.HasSuffix(strings.TrimSpace(candidate.Text), "?")
+			if isQuestion && questionEndings >= 3 {
+				continue
+			}
+			nearDuplicate := false
+			for _, existing := range selected {
+				if existing.ScenarioID == candidate.ScenarioID || threadPostsNearDuplicate(candidate.Text, existing.Text) {
+					nearDuplicate = true
+					break
+				}
+			}
+			if nearDuplicate {
+				continue
+			}
+			selected = append(selected, candidate)
+			nextQuestions := questionEndings
+			if isQuestion {
+				nextQuestions++
+			}
+			search(index+1, nextQuestions)
+			selected = selected[:len(selected)-1]
+			if winner != nil {
+				return
+			}
+		}
+	}
+	search(0, 0)
+	return winner
+}
+
 type fakeThreadPost struct {
-	goal string
-	text string
+	goal          string // retained only for the unused legacy fixture bank below
+	scenarioID    string
+	mechanism     string
+	materialBasis string
+	evidence      string
+	text          string
 }
 
 func fakeThreadPostBank(voice string) []fakeThreadPost {
+	posts := []fakeThreadPost{
+		{scenarioID: "karaoke_archetype", mechanism: "conversation_humor", text: "У каждого стола в караоке есть человек, который весь вечер говорит «я не буду», а потом не отдаёт микрофон. Кто вы за своим столом?"},
+		{scenarioID: "song_memory", mechanism: "music_memory", text: "Какую песню вы помните не по словам, а по голосу мамы, папы или бабушки? Иногда семейный плейлист хранится именно так."},
+		{scenarioID: "astana_soundtrack", mechanism: "local_identity", text: "Какая песня звучит для вас как ночная дорога по Астане? Нужен не официальный гимн, а ваш личный саундтрек."},
+		{scenarioID: "audience_choice", mechanism: "participation", text: "Что разобрать следующим: почему свой голос на записи кажется чужим, как выбрать удобную тональность или куда исчезает дыхание в длинной строке?"},
+		{scenarioID: "adult_beginner", mechanism: "recognition", text: "Что неловче на первом занятии: спеть перед педагогом или потом услышать запись собственного голоса? У взрослых обычно есть очень конкретный ответ."},
+		{scenarioID: "everyday_voice_humor", mechanism: "conversation_humor", text: "Домашний вокал особенно уверен, пока душ, чайник и пылесос официально входят в состав группы. Кто у вас отвечает за ритм?"},
+		{scenarioID: "recording_reaction", mechanism: "recognition", text: "Первое прослушивание своего голосового сообщения: отрицание, торг, попытка удалить и только потом смысл сказанного. Какая стадия ваша?"},
+		{scenarioID: "after_work_creativity", mechanism: "lifestyle", text: "Какое занятие после работы возвращает вам ощущение, что день состоял не только из задач? Для кого-то это песня, для кого-то — танец или кисти."},
+		{scenarioID: "music_hot_take", mechanism: "conversation", text: "Музыкальная позиция, за которую можно спокойно спорить: песня для караоке должна подходить голосу, а не доказывать уважение к оригинальной тональности."},
+		{scenarioID: "mini_voice_experiment", mechanism: "practical", text: "Негромко скажите строчку любимой песни, затем спойте её в том же разговорном настроении. Что сохранилось, а что голос зачем-то решил украсить?"},
+		{scenarioID: "finish_the_line", mechanism: "participation", text: "Закончите фразу названием песни: «Если бы эта неделя была припевом, она звучала бы как…»"},
+		{scenarioID: "format_choice", mechanism: "qualification", text: "Кому спокойнее впервые запеть один на один, а кому легче, когда рядом ещё пара таких же новичков? Интересно, от чего зависит ваш выбор."},
+		{scenarioID: "seven_day_challenge", mechanism: "participation", text: "Музыкальный эксперимент на неделю: каждый день выбирать один припев и замечать только одну новую деталь — дыхание, слово, паузу или настроение."},
+		{scenarioID: "question_to_teacher", mechanism: "participation", text: "Какой вопрос о голосе вы давно хотели задать педагогу, но он кажется слишком простым? Именно простые вопросы часто дают самые полезные разборы."},
+		{scenarioID: "music_hot_take", mechanism: "conversation", text: "Не всякая любимая песня обязана становиться вашей песней для караоке. Какой трек вы обожаете слушать, но никогда не возьмёте в микрофон?"},
+		{scenarioID: "karaoke_archetype", mechanism: "conversation_humor", text: "Караоке-компания делится на тех, кто выбирает песню сердцем, и тех, кто слишком поздно вспоминает о тональности. В какой команде вы?"},
+		{scenarioID: "song_memory", mechanism: "music_memory", text: "Какая строчка из песни выросла вместе с вами и теперь означает совсем не то, что раньше?"},
+		{scenarioID: "astana_soundtrack", mechanism: "local_identity", text: "Если собрать плейлист «Астана после работы», какая песня обязана открывать его, а какая — звучать последней?"},
+		{scenarioID: "audience_choice", mechanism: "participation", text: "Выберите тему для короткого разбора: удобная тональность, дыхание перед припевом или страх высокой ноты. Что пригодится раньше?"},
+		{scenarioID: "adult_beginner", mechanism: "recognition", text: "Взрослый новичок чаще боится не ошибиться, а выглядеть человеком, который ещё не умеет. В какой сфере вам удалось пережить этот первый шаг?"},
+		{scenarioID: "everyday_voice_humor", mechanism: "conversation_humor", text: "В машине концерт начинается уверенно, пока музыка не становится тише на светофоре. У кого ещё внезапно меняется громкость солиста?"},
+		{scenarioID: "recording_reaction", mechanism: "recognition", text: "Что удивляет в записи своего голоса сильнее: тембр, интонация или то, насколько иначе звучит знакомая фраза?"},
+		{scenarioID: "after_work_creativity", mechanism: "lifestyle", text: "Когда вы в последний раз учились чему-то не для работы, диплома или пользы? Что выбрали просто потому, что хотелось?"},
+		{scenarioID: "mini_voice_experiment", mechanism: "practical", text: "Попробуйте пропеть один припев сначала очень серьёзно, потом как обычный рассказ другу. В какой версии слова слышны лучше?"},
+		{scenarioID: "finish_the_line", mechanism: "participation", text: "Продолжите без долгих раздумий: «Песня, которую нельзя включать фоном, — это…»"},
+		{scenarioID: "format_choice", mechanism: "qualification", text: "Что помогает вам быстрее освоиться в новом деле: личное внимание или маленькая группа, где ошибаются вместе?"},
+		{scenarioID: "seven_day_challenge", mechanism: "participation", text: "Небольшой музыкальный челлендж: неделю начинать утро с одной песни и записывать одно слово о настроении после неё. Какой трек взяли бы первым?"},
+		{scenarioID: "question_to_teacher", mechanism: "participation", text: "Что в пении кажется вам «врождённым» и поэтому бессмысленным для изучения? Можно собрать эти убеждения для честного разбора."},
+		{scenarioID: "music_hot_take", mechanism: "conversation", text: "Хороший кавер не обязан быть похож на оригинал. Какой исполнитель заставил вас заново услышать знакомую песню?"},
+		{scenarioID: "karaoke_archetype", mechanism: "conversation_humor", text: "Самая честная должность в караоке — человек, который знает только припев, но отвечает за него как за весь концерт. Есть такой в вашей компании?"},
+	}
+	for index := range posts {
+		posts[index].goal = "replies"
+	}
 	if voice == "alisher" {
-		return []fakeThreadPost{
-			{goal: "recognition", text: "Взрослая жизнь устроена странно: на созвоны голос находится всегда, на любимую песню — после внутреннего согласования."},
-			{goal: "discussion", text: "Мы так долго учимся говорить уверенно, а потом стесняемся спеть одну ноту."},
-			{goal: "recognition", text: "У взрослого человека есть отдельный талант: хотеть петь и одновременно ждать письменного разрешения от вселенной."},
-			{goal: "discussion", text: "Караоке быстро показывает, кто выбрал песню сердцем, а кто переоценил переговорные навыки."},
-			{goal: "recognition", text: "Самая сложная нота — та, перед которой успел придумать мнение всех соседей."},
-			{goal: "warmth", text: "Иногда «я не умею петь» означает «я ещё не слышал себя без внутреннего отдела критики»."},
-			{goal: "discussion", text: "Микрофон ничего не добавляет к характеру. Он просто перестаёт его скрывать."},
-			{goal: "recognition", text: "Перед первой нотой внутренний критик обычно просит слово вне очереди."},
-			{goal: "discussion", text: "Есть песни, которые человек выбирает сам. И есть песни, которые внезапно знают о нём больше."},
-			{goal: "warmth", text: "Уверенность редко приходит до голоса. Обычно она догоняет его где-то между вдохом и первой фразой."},
-			{goal: "recognition", text: "Фраза «я пою только для себя» обычно произносится так, будто у себя очень строгий продюсер."},
-			{goal: "recognition", text: "Внутренний критик удивительно музыкален: вступает без приглашения и всегда уверен, что он солист."},
-			{goal: "discussion", text: "Люди боятся взять не ту ноту, будто правильные ноты потом подают на них в суд."},
-			{goal: "recognition", text: "У каждого есть песня, на которой уверенность внезапно заканчивает испытательный срок."},
-			{goal: "discussion", text: "Когда говорят «медведь на ухо наступил», медведя почему-то никто не просит подтвердить версию."},
-			{goal: "recognition", text: "Микрофон не пугает. Пугает внезапная перспектива услышать себя без внутреннего пресс-секретаря."},
-			{goal: "recognition", text: "Взрослый человек может провести сложные переговоры, но перед микрофоном всё равно ждёт согласования у подростка внутри."},
-			{goal: "recognition", text: "Песня занимает несколько минут. Подготовительный стыд иногда выходит режиссёрской версией."},
-			{goal: "recognition", text: "Нота может быть мимо. Лицо после неё обычно делает ошибку заметнее."},
-			{goal: "discussion", text: "Самый верный способ не сфальшивить — не петь. У него почему-то очень скучный репертуар."},
-			{goal: "recognition", text: "Высокую ноту проще взять, чем спокойно принять запись собственного голоса."},
-			{goal: "recognition", text: "Человек слышит запись своего голоса и сразу понимает: внутренний диктор всё это время работал удалённо."},
-			{goal: "warmth", text: "Если голос дрожит, возможно, он просто первым понял важность момента."},
-			{goal: "discussion", text: "Караоке — место, где друзья искренне поддерживают тебя и совершенно не поддерживают выбранную тональность."},
-			{goal: "discussion", text: "Какой знакомый припев превращает ваше «я только послушаю» в полноценное выступление?"},
-			{goal: "recognition", text: "Микрофон не делает человека громче. Он просто увольняет внутреннего пресс-секретаря."},
-			{goal: "discussion", text: "Какую песню вы знаете наизусть, хотя никогда не садились учить её слова?"},
-			{goal: "recognition", text: "Фальшивую ноту слышат не все. Попытку сделать вид, что так и задумано, замечают почему-то сразу."},
-			{goal: "discussion", text: "Какой исполнитель заставляет вас подпевать даже в магазине, где приходится делать вид, что это кашель?"},
-			{goal: "recognition", text: "Наушники создают редкое государство: один гражданин, полный суверенитет и очень спорный вокал."},
-			{goal: "discussion", text: "Какая строчка из песни выросла вместе с вами и теперь означает совсем не то, что раньше?"},
-			{goal: "recognition", text: "Запись собственного голоса — короткая встреча внутреннего диктора с человеком, на которого он всё это время работал."},
-			{goal: "discussion", text: "Какой припев вы бы доверили человеку вместо длинного объяснения своего настроения?"},
-			{goal: "recognition", text: "Ритм сбивается реже, чем уверенность. Просто у ритма нет привычки читать воображаемые комментарии."},
-			{goal: "discussion", text: "Какую песню нельзя ставить фоном, потому что она немедленно забирает всё внимание?"},
-			{goal: "warmth", text: "Любимый голос не обязательно самый ровный. Обычно это тот, в котором слышно живого человека между нотами."},
-			{goal: "recognition", text: "Слово «подпевать» звучит скромно. Соседи иногда располагают другой терминологией."},
-			{goal: "discussion", text: "Какую мелодию вы узнаете раньше, чем успеваете вспомнить, откуда она?"},
-			{goal: "recognition", text: "Человек может забыть слова куплета, но тело почему-то прекрасно помнит, где должен начаться припев."},
-			{goal: "warmth", text: "Некоторые песни возвращают не прошлое, а способность на минуту отнестись к нему мягче."},
-			{goal: "discussion", text: "Какой трек вы включаете ради одной-единственной секунды, где всё встаёт на место?"},
-			{goal: "recognition", text: "Домашний вокал особенно смел, пока чайник, душ и пылесос официально входят в состав группы."},
-			{goal: "warmth", text: "Тихий голос тоже умеет держать внимание. Ему просто приходится выбирать слова и ноты точнее."},
-			{goal: "discussion", text: "Если бы ваш характер был музыкальным инструментом, что звучало бы первым: барабаны, клавиши или что-то другое?"},
+		return append(posts[1:], posts[0])
+	}
+	return posts
+}
+
+func groundedFakeThreadPostBank(request normalizedThreadPostRequest, plan []threadPostScenario) []fakeThreadPost {
+	evidence := fakeThreadPostEvidence(request.Material)
+	prefixes := map[string]string{
+		"teacher_micro_tip":      "Практическая деталь о голосе из материала дня: ",
+		"myth_micro_test":        "Для короткой проверки берём только подтверждённую деталь: ",
+		"first_minute":           "Сцену первого знакомства задаёт конкретная деталь: ",
+		"what_wont_happen":       "Спокойнее, когда заранее известна эта точная деталь: ",
+		"normal_mistake":         "Вместо идеальной истории — одна нормальная деталь о голосе: ",
+		"student_week":           "Творческую неделю лучше всего показывает конкретная деталь: ",
+		"backstage_moment":       "Закулисье начинается не с триумфа, а с этой детали: ",
+		"community_event":        "Жизнь музыкального сообщества видна в одной детали: ",
+		"transparent_invitation": "В приглашении оставляем только проверенную конкретику: ",
+	}
+	allowed := make(map[string]threadPostScenario, len(plan))
+	bank := make([]fakeThreadPost, 0, len(plan)+len(fakeThreadPostBank(request.Voice)))
+	for _, scenario := range plan {
+		allowed[scenario.ID] = scenario
+		if !scenario.RequiresMaterial {
+			continue
+		}
+		prefix := prefixes[scenario.ID]
+		if prefix == "" {
+			prefix = "Подтверждённая музыкальная деталь из материала дня: "
+		}
+		bank = append(bank, fakeThreadPost{
+			scenarioID: scenario.ID, mechanism: scenario.Mechanism,
+			materialBasis: "material", evidence: evidence, text: prefix + evidence,
+		})
+	}
+	seenEvergreen := make(map[string]struct{}, len(plan))
+	for _, candidate := range fakeThreadPostBank(request.Voice) {
+		scenario, ok := allowed[candidate.scenarioID]
+		if !ok || scenario.RequiresMaterial {
+			continue
+		}
+		if _, duplicate := seenEvergreen[candidate.scenarioID]; duplicate {
+			continue
+		}
+		seenEvergreen[candidate.scenarioID] = struct{}{}
+		bank = append(bank, candidate)
+	}
+	return bank
+}
+
+func fakeThreadPostEvidence(material string) string {
+	material = strings.TrimSpace(material)
+	const budget = 120
+	for _, line := range strings.Split(material, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if len([]rune(line)) <= budget {
+			if _, valid := threadPostQuotedSpans(line); valid {
+				return line
+			}
+		}
+		runes := []rune(line)
+		if len(runes) > budget {
+			runes = runes[:budget]
+		}
+		for index := len(runes) - 1; index >= 0; index-- {
+			if !strings.ContainsRune(".!?;", runes[index]) {
+				continue
+			}
+			candidate := strings.TrimSpace(string(runes[:index+1]))
+			if _, valid := threadPostQuotedSpans(candidate); valid && candidate != "" {
+				return candidate
+			}
 		}
 	}
-	return []fakeThreadPost{
-		{goal: "warmth", text: "Иногда голосу нужен не новый диапазон, а разрешение звучать без извинений."},
-		{goal: "recognition", text: "Пение — редкий способ занять пространство и никого при этом не вытеснить."},
-		{goal: "warmth", text: "Есть дни, когда лучший разговор с собой начинается не со слов, а с ноты."},
-		{goal: "recognition", text: "Свой голос узнаётся не тогда, когда он идеален, а когда перестаёшь прятать его за чужими."},
-		{goal: "warmth", text: "Вокал начинается не с громкости. Он начинается с момента, когда перестаёшь уменьшать себя."},
-		{goal: "discussion", text: "Астана умеет быть громкой. Иногда особенно приятно ответить ей своей нотой."},
-		{goal: "warmth", text: "Музыка не требует быть готовым. Она просит быть настоящим."},
-		{goal: "recognition", text: "Голос — это единственный инструмент, который невозможно забыть дома."},
-		{goal: "discussion", text: "Какая песня первой вспоминается, когда никому ничего не нужно доказывать?"},
-		{goal: "warmth", text: "Иногда одна честная нота возвращает к себе быстрее, чем длинный внутренний разговор."},
-		{goal: "recognition", text: "Когда человек говорит «у меня нет голоса», голос уже произнёс эту фразу довольно убедительно."},
-		{goal: "warmth", text: "Тишина перед первой нотой — не пустота. Это смелость набирает воздух."},
-		{goal: "recognition", text: "Фальшивая нота заканчивается быстро. Страх перед ней иногда репетирует дольше самой песни."},
-		{goal: "warmth", text: "Есть песни, которые не хочется исполнять идеально. Их хочется прожить точно."},
-		{goal: "recognition", text: "Красивый голос впечатляет. Узнаваемый — остаётся."},
-		{goal: "warmth", text: "Пение — редкий разговор, где дыхание успевает сказать правду раньше слов."},
-		{goal: "recognition", text: "Не каждая нота обязана быть громкой. Некоторые попадают точно потому, что не спорят с тишиной."},
-		{goal: "recognition", text: "Самая узнаваемая часть песни начинается там, где человек перестаёт стараться звучать «правильно»."},
-		{goal: "warmth", text: "Песня меняется, когда перестаёшь изображать исполнителя и становишься рассказчиком."},
-		{goal: "recognition", text: "Диапазон измеряют нотами. Свободу голоса — тем, сколько себя в них осталось."},
-		{goal: "warmth", text: "Микрофон усиливает звук, но не подменяет присутствие. И это хорошая новость."},
-		{goal: "recognition", text: "Иногда дыхание сбивается не от сложной фразы, а от мысли, что тебя действительно услышат."},
-		{goal: "warmth", text: "Музыкальный слух замечает ноту. Человеческий — честность."},
-		{goal: "discussion", text: "Какую песню вы бы спели, если бы никто не оценивал исполнение?"},
-		{goal: "discussion", text: "Какую песню вы узнаете по одному вдоху ещё до первой ноты?"},
-		{goal: "recognition", text: "Голос — единственный инструмент, который невозможно забыть дома. Зато можно долго делать вид, что он там остался."},
-		{goal: "warmth", text: "Тишина перед первой нотой не пустая. В ней дыхание, внимание и маленькое решение всё-таки начать."},
-		{goal: "discussion", text: "Какая строчка из песни говорит о вашем настроении точнее любого статуса?"},
-		{goal: "discussion", text: "Какую мелодию вы узнаете раньше, чем успеваете вспомнить её название?"},
-		{goal: "recognition", text: "Красивый голос привлекает внимание. Узнаваемый остаётся в памяти после последней ноты."},
-		{goal: "discussion", text: "Какой музыкальный звук для вас уютнее: шорох пластинки, клавиши, гитара или чей-то тихий голос?"},
-		{goal: "warmth", text: "Микрофон усиливает звук, но не подменяет присутствие. Поэтому тихая фраза иногда держит внимание лучше громкой."},
-		{goal: "discussion", text: "Какую песню вы бы оставили себе, если бы из всего плейлиста можно было сохранить только одну?"},
-		{goal: "warmth", text: "Любимая песня не всегда утешает. Иногда она просто садится рядом и не торопит менять настроение."},
-		{goal: "discussion", text: "Какой припев объединяет людей, которые до него были уверены, что у них совершенно разные вкусы?"},
-		{goal: "recognition", text: "Первые слова песни иногда забываются. Тело всё равно точно знает, где начинается знакомый ритм."},
-		{goal: "discussion", text: "Какую песню невозможно включить фоном, потому что она сразу требует всего внимания?"},
-		{goal: "recognition", text: "Одна и та же мелодия в наушниках, машине и пустой комнате звучит как три разных разговора."},
-		{goal: "discussion", text: "Какой голос вы узнали бы даже через старый телефон и шум улицы?"},
-		{goal: "warmth", text: "Песня не меняет прошлое. Но иногда меняет интонацию, с которой человек его вспоминает."},
-		{goal: "discussion", text: "Какой трек вы включаете ради одной секунды, в которой всё неожиданно становится на место?"},
-		{goal: "recognition", text: "На записи собственный голос кажется чужим ровно до момента, когда в нём узнаётся знакомая улыбка."},
-		{goal: "discussion", text: "Какую песню вы любите не целиком, а за одну строчку, один аккорд или один вдох?"},
-		{goal: "discussion", text: "Если бы Астана звучала музыкальным инструментом, что это было бы и почему?"},
+
+	// If the first complete line/sentence is longer than the post budget, take
+	// an exact word-bounded span between quotation delimiters. Omitting the
+	// delimiters keeps the excerpt exact while preventing a blind rune cut from
+	// creating an unmatched quote in every deterministic finalist.
+	chunks := strings.FieldsFunc(material, func(character rune) bool {
+		return character == '\n' || character == '\r' || character == '«' || character == '»' ||
+			character == '“' || character == '”' || character == '"'
+	})
+	for _, chunk := range chunks {
+		candidate := boundedFakeThreadPostEvidence(chunk, budget)
+		if candidate == "" || !strings.Contains(material, candidate) {
+			continue
+		}
+		if _, valid := threadPostQuotedSpans(candidate); valid {
+			return candidate
+		}
 	}
+	return boundedFakeThreadPostEvidence(material, budget)
+}
+
+func boundedFakeThreadPostEvidence(value string, budget int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) <= budget {
+		return value
+	}
+	runes = runes[:budget]
+	cut := len(runes)
+	for index := len(runes) - 1; index >= 0; index-- {
+		if runes[index] == ' ' || runes[index] == '\t' {
+			cut = index
+			break
+		}
+	}
+	return strings.TrimSpace(string(runes[:cut]))
 }
 
 func fakeResult(request domain.GenerationRequest) domain.GenerationResult {

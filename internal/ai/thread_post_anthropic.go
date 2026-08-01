@@ -7,14 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/aleka7sk/witty-reply/internal/domain"
 )
-
-const minimumBlindReviewCandidates = 3
 
 type threadAnthropicCall struct {
 	Structured []byte
@@ -23,10 +20,10 @@ type threadAnthropicCall struct {
 	Usage      domain.Usage
 }
 
-// GenerateThreadPost deliberately uses two independent Anthropic calls on the
-// normal path: a high-effort private exploration that exposes five finalists,
-// followed by a blind editorial review. Only the locally validated winner is
-// returned to Telegram; all checkable finalist data remains in Audit.
+// GenerateThreadPost uses three explicit high-effort stages: twelve auditable
+// scenario concepts, five grounded and mechanically diverse finalists, and an
+// independent blind review. Hidden chain-of-thought is neither requested nor
+// stored; the concepts are concise editorial deliverables.
 func (provider *AnthropicProvider) GenerateThreadPost(ctx context.Context, request ThreadPostRequest) (ThreadPostResult, error) {
 	if provider == nil {
 		return ThreadPostResult{}, fmt.Errorf("%w: nil Anthropic provider", ErrConfiguration)
@@ -35,49 +32,30 @@ func (provider *AnthropicProvider) GenerateThreadPost(ctx context.Context, reque
 	if err != nil {
 		return ThreadPostResult{}, err
 	}
-	recipe := selectThreadPostRecipe(normalized)
+	plan, err := selectThreadPostScenarioPlan(normalized)
+	if err != nil {
+		return ThreadPostResult{}, err
+	}
 	audit := ThreadPostAudit{
-		GenerationID: normalized.GenerationID, RecipeID: recipe.ID,
+		GenerationID: normalized.GenerationID, Objective: normalized.Objective,
+		RecipeID:        "scenario-engine-v3",
 		ExplorationGoal: threadPostExplorationGoal, GeneratorProvider: providerAnthropic,
 		ReviewerProvider: providerAnthropic,
 	}
-	prompt := buildThreadPostPrompt(normalized)
 
-	generationCtx, cancelGeneration := threadPostStageContext(ctx, provider.timeout+5*time.Second)
-	candidates, generationErr := provider.generateThreadPostCandidates(generationCtx, normalized, prompt, 1, &audit)
-	cancelGeneration()
-	pool := append([]threadPostCandidate(nil), candidates...)
-	repairAttempted := shouldRepairThreadPostGeneration(generationErr, len(candidates))
-	if repairAttempted {
-		if err := ctx.Err(); err != nil {
-			return ThreadPostResult{}, err
+	concepts, conceptErr := provider.runThreadPostConceptStage(ctx, normalized, plan, &audit)
+	if conceptErr != nil {
+		if normalized.Material != "" || !mayUseCuratedThreadFallback(conceptErr) {
+			return ThreadPostResult{}, conceptErr
 		}
-		reasons := threadPostRepairReasons(audit.Candidates, generationErr)
-		repairPrompt := buildThreadPostRepairPrompt(prompt, reasons)
-		repairCtx, cancelRepair := threadPostStageContext(ctx, provider.timeout+5*time.Second)
-		repaired, repairErr := provider.generateThreadPostCandidates(repairCtx, normalized, repairPrompt, 2, &audit)
-		cancelRepair()
-		pool = append(pool, repaired...)
-		if repairErr != nil {
-			generationErr = repairErr
-		} else {
-			generationErr = nil
-		}
+		return curatedThreadPostFallback(normalized, safeThreadPostFallbackReason(conceptErr), audit)
 	}
-
-	candidates = selectThreadPostFinalists(pool, audit.Candidates, threadPostFinalistCount)
-	if repairAttempted && len(candidates) > 0 && len(candidates) < threadPostFinalistCount {
-		candidates = appendCuratedThreadPostFinalists(normalized, candidates, &audit, threadPostFinalistCount)
-	}
-	if len(candidates) < threadPostFinalistCount {
-		if err := ctx.Err(); err != nil {
-			return ThreadPostResult{}, err
+	candidates, writerErr := provider.runThreadPostWriterStage(ctx, normalized, concepts, &audit)
+	if writerErr != nil {
+		if normalized.Material != "" || !mayUseCuratedThreadFallback(writerErr) {
+			return ThreadPostResult{}, writerErr
 		}
-		if generationErr != nil && !mayUseCuratedThreadFallback(generationErr) {
-			return ThreadPostResult{}, generationErr
-		}
-		reason := safeThreadPostFallbackReason(generationErr)
-		return curatedThreadPostFallback(normalized, reason, audit)
+		return curatedThreadPostFallback(normalized, safeThreadPostFallbackReason(writerErr), audit)
 	}
 	assignBlindReviewerIDs(candidates, audit.Candidates, normalized.Seed, audit.GenerationCalls+1)
 	for _, candidate := range candidates {
@@ -89,44 +67,77 @@ func (provider *AnthropicProvider) GenerateThreadPost(ctx context.Context, reque
 	if err != nil {
 		return ThreadPostResult{}, err
 	}
-	reviewBody, err := provider.threadPostReviewRequestBody(reviewPrompt, reviewSchema)
-	if err != nil {
-		return ThreadPostResult{}, fmt.Errorf("%w: encode Anthropic Threads review request: %v", ErrInvalidRequest, err)
-	}
-	audit.ReviewCalls++
-	reviewCtx, cancelReview := threadPostStageContext(ctx, 5*time.Second)
-	reviewCall, reviewErr := provider.callThreadPostStage(reviewCtx, reviewBody)
-	cancelReview()
-	addUsage(&audit.ReviewUsage, reviewCall.Usage)
-	audit.ReviewerModel = reviewCall.Model
-	audit.ReviewerRequestID = reviewCall.RequestID
 
-	var winner threadPostCandidate
-	if reviewErr == nil {
-		decision, decodeErr := decodeThreadPostReview(reviewCall.Structured, candidates)
-		if decodeErr == nil {
-			winner, err = applyThreadPostReviewDecision(candidates, &audit, decision)
-			if err == nil {
-				audit.ReviewerWinnerID = decision.DeclaredWinner
-				if decision.ScoreOverride {
-					audit.SelectionMode = "review_score_override"
-					audit.DecisionReason = "The reviewer's declared winner did not match its scorecards; selected the highest weighted score."
-					winner.Result.Visual = ThreadPostVisualRecommendation{Mode: "text_only", Query: defaultThreadPhotoQuery}
-				} else {
-					audit.SelectionMode = "anthropic_blind_review"
-					audit.DecisionReason = decision.Reason
-					winner.Result.Visual = decision.Visual
-				}
-			} else {
-				reviewErr = newInvalidOutputError(providerAnthropic, reviewCall.RequestID, err)
-			}
-		} else {
-			reviewErr = newInvalidOutputError(providerAnthropic, reviewCall.RequestID, decodeErr)
+	var (
+		winner         threadPostCandidate
+		reviewErr      error
+		lastReviewCall threadAnthropicCall
+	)
+	for attempt := 1; attempt <= 2; attempt++ {
+		attemptPrompt := reviewPrompt
+		if attempt == 2 {
+			attemptPrompt = buildThreadPostReviewRepairPrompt(reviewPrompt)
 		}
+		reviewBody, bodyErr := provider.threadPostReviewRequestBody(attemptPrompt, reviewSchema)
+		if bodyErr != nil {
+			return ThreadPostResult{}, fmt.Errorf("%w: encode Anthropic Threads review request: %v", ErrInvalidRequest, bodyErr)
+		}
+		audit.ReviewCalls++
+		reviewCtx, cancelReview := threadPostStageContext(ctx, 5*time.Second)
+		reviewCall, callErr := provider.callThreadPostStage(reviewCtx, reviewBody)
+		cancelReview()
+		lastReviewCall = reviewCall
+		recordThreadPostReviewCall(&audit, reviewCall, callErr)
+		if callErr != nil {
+			// Transport retries are already exhausted inside callThreadPostStage.
+			// Authentication, refusal, truncation, and all other API failures must
+			// not be disguised as a semantic structured-output repair.
+			reviewErr = callErr
+			break
+		}
+
+		decision, decodeErr := decodeThreadPostReview(reviewCall.Structured, candidates)
+		if decodeErr != nil {
+			reviewErr = newInvalidOutputError(providerAnthropic, reviewCall.RequestID, decodeErr)
+			if attempt == 1 {
+				continue
+			}
+			break
+		}
+		winner, err = applyThreadPostReviewDecision(candidates, &audit, decision)
+		if err != nil {
+			reviewErr = newInvalidOutputError(providerAnthropic, reviewCall.RequestID, err)
+			if attempt == 1 {
+				continue
+			}
+			break
+		}
+
+		reviewErr = nil
+		audit.ReviewerWinnerID = decision.DeclaredWinner
+		if decision.ScoreOverride {
+			audit.SelectionMode = "review_score_override"
+			audit.DecisionReason = "The reviewer's declared winner did not match its scorecards; selected the highest weighted score."
+			winner.Result.Visual = ThreadPostVisualRecommendation{Mode: "text_only", Query: defaultThreadPhotoQuery}
+		} else {
+			audit.SelectionMode = "anthropic_blind_review"
+			audit.DecisionReason = decision.Reason
+			winner.Result.Visual = decision.Visual
+		}
+		break
 	}
 	if reviewErr != nil || winner.ReviewerID == "" {
 		if err := ctx.Err(); err != nil {
 			return ThreadPostResult{}, err
+		}
+		// A local score cannot semantically prove that a paraphrase is entailed
+		// by operator material. Never publish a material-backed candidate when
+		// the independent grounding review is unavailable or invalid.
+		if normalized.Material != "" {
+			if reviewErr != nil {
+				return ThreadPostResult{}, reviewErr
+			}
+			return ThreadPostResult{}, newInvalidOutputError(providerAnthropic, lastReviewCall.RequestID, fmt.Errorf("%w: grounded Threads review produced no winner", ErrInvalidResponse))
 		}
 		winner = bestLocalThreadPostCandidate(candidates, audit.Candidates)
 		audit.SelectionMode = "local_review_fallback"
@@ -134,16 +145,123 @@ func (provider *AnthropicProvider) GenerateThreadPost(ctx context.Context, reque
 		audit.ReviewerError = safeThreadPostFallbackReason(reviewErr)
 		winner.Result.Visual = ThreadPostVisualRecommendation{Mode: "text_only", Query: defaultThreadPhotoQuery}
 	}
+	// Reviewer free-form output has seen approved material and must never become
+	// an external Pexels query. Preserve the editorial mode/brief, but replace
+	// every model-supplied query with a deterministic scenario-only value.
+	winner.Result.Visual.Query = SafeThreadPhotoQuery(winner.Result.ScenarioID)
 
 	markThreadPostAuditWinner(&audit, winner)
+	audit.ScenarioID = winner.Result.ScenarioID
+	audit.Mechanism = winner.Result.Mechanism
 	winner.Result.Provider = providerAnthropic
 	winner.Result.Model = audit.GeneratorModel
 	if winner.Result.Model == "" {
 		winner.Result.Model = provider.model
 	}
-	winner.Result.Usage = sumUsage(audit.GenerationUsage, audit.ReviewUsage)
+	winner.Result.Usage = sumUsage(audit.ConceptUsage, audit.WriterUsage, audit.ReviewUsage)
 	winner.Result.Audit = audit
 	return winner.Result, nil
+}
+
+func (provider *AnthropicProvider) runThreadPostConceptStage(
+	ctx context.Context,
+	request normalizedThreadPostRequest,
+	plan []threadPostScenario,
+	audit *ThreadPostAudit,
+) ([]ThreadPostConcept, error) {
+	schema, err := threadPostConceptJSONSchema(plan)
+	if err != nil {
+		return nil, err
+	}
+	prompt := buildThreadPostConceptPrompt(request, plan)
+	for attempt := 1; attempt <= 2; attempt++ {
+		if attempt == 2 {
+			prompt += "\n\nThe previous concept envelope failed strict validation. Return a completely corrected envelope with exactly twelve slots C01 through C12, every assigned scenario exactly once, exact material evidence where required, and no extra fields."
+		}
+		body, bodyErr := provider.threadPostStageRequestBody(threadPostConceptSystemPrompt, prompt, schema)
+		if bodyErr != nil {
+			return nil, bodyErr
+		}
+		audit.ConceptCalls++
+		audit.GenerationCalls++
+		stageCtx, cancel := threadPostStageContext(ctx, provider.threadTimeout+5*time.Second)
+		call, callErr := provider.callThreadPostStage(stageCtx, body)
+		cancel()
+		addUsage(&audit.ConceptUsage, call.Usage)
+		addUsage(&audit.GenerationUsage, call.Usage)
+		if call.RequestID != "" {
+			audit.ConceptRequestIDs = append(audit.ConceptRequestIDs, call.RequestID)
+			audit.GenerationRequestIDs = append(audit.GenerationRequestIDs, call.RequestID)
+		}
+		if call.Model != "" {
+			audit.GeneratorModel = call.Model
+		}
+		if callErr != nil {
+			return nil, callErr
+		}
+		concepts, conceptsAudit, decodeErr := decodeThreadPostConcepts(call.Structured, request, plan)
+		if decodeErr == nil {
+			audit.Concepts = conceptsAudit
+			return concepts, nil
+		}
+		if attempt == 2 {
+			audit.Concepts = conceptsAudit
+			return nil, newInvalidOutputError(providerAnthropic, call.RequestID, decodeErr)
+		}
+	}
+	return nil, fmt.Errorf("%w: unreachable concept stage", ErrInvalidResponse)
+}
+
+func (provider *AnthropicProvider) runThreadPostWriterStage(
+	ctx context.Context,
+	request normalizedThreadPostRequest,
+	concepts []ThreadPostConcept,
+	audit *ThreadPostAudit,
+) ([]threadPostCandidate, error) {
+	schema, err := threadPostFinalistJSONSchema(request, concepts)
+	if err != nil {
+		return nil, err
+	}
+	prompt := buildThreadPostWriterPrompt(request, concepts)
+	for attempt := 1; attempt <= 2; attempt++ {
+		if attempt == 2 {
+			prompt += "\n\nThe previous finalist envelope failed strict validation. Rewrite all five posts: five different scenario_id values, at least four mechanisms, no more than three question endings, no unsupported fact, digit, or quotation, and exact evidence excerpts. Include an objective anchor from: " + strings.Join(threadPostObjectiveAnchorIDs(request), ", ") + ". When approved material exists, at least two finalists must be material-backed and keep their concepts' exact evidence."
+		}
+		body, bodyErr := provider.threadPostStageRequestBody(threadPostWriterSystemPrompt, prompt, schema)
+		if bodyErr != nil {
+			return nil, bodyErr
+		}
+		audit.WriterCalls++
+		audit.GenerationCalls++
+		stageCtx, cancel := threadPostStageContext(ctx, provider.threadTimeout+5*time.Second)
+		call, callErr := provider.callThreadPostStage(stageCtx, body)
+		cancel()
+		addUsage(&audit.WriterUsage, call.Usage)
+		addUsage(&audit.GenerationUsage, call.Usage)
+		if call.RequestID != "" {
+			audit.WriterRequestIDs = append(audit.WriterRequestIDs, call.RequestID)
+			audit.GenerationRequestIDs = append(audit.GenerationRequestIDs, call.RequestID)
+		}
+		if call.Model != "" {
+			audit.GeneratorModel = call.Model
+		}
+		if callErr != nil {
+			return nil, callErr
+		}
+		candidates, candidateAudit, decodeErr := decodeThreadPostFinalists(call.Structured, request, concepts, attempt)
+		offset := len(audit.Candidates)
+		for index := range candidates {
+			candidates[index].AuditIndex += offset
+		}
+		audit.Candidates = append(audit.Candidates, candidateAudit...)
+		if decodeErr == nil {
+			return candidates, nil
+		}
+		if attempt == 2 {
+			return nil, newInvalidOutputError(providerAnthropic, call.RequestID, decodeErr)
+		}
+	}
+	return nil, fmt.Errorf("%w: unreachable writer stage", ErrInvalidResponse)
 }
 
 func threadPostStageContext(parent context.Context, reserve time.Duration) (context.Context, context.CancelFunc) {
@@ -160,153 +278,6 @@ func threadPostStageContext(parent context.Context, reserve time.Duration) (cont
 		budget = time.Millisecond
 	}
 	return context.WithTimeout(parent, budget)
-}
-
-func shouldRepairThreadPostGeneration(err error, candidateCount int) bool {
-	if err == nil {
-		return candidateCount < threadPostFinalistCount
-	}
-	var providerErr *ProviderError
-	return errors.As(err, &providerErr) && strings.HasPrefix(providerErr.Code, "invalid_output_thread_")
-}
-
-func selectThreadPostFinalists(
-	pool []threadPostCandidate,
-	audits []ThreadPostCandidateAudit,
-	limit int,
-) []threadPostCandidate {
-	ordered := append([]threadPostCandidate(nil), pool...)
-	sort.SliceStable(ordered, func(left, right int) bool {
-		leftAudit := audits[ordered[left].AuditIndex]
-		rightAudit := audits[ordered[right].AuditIndex]
-		if leftAudit.Local.Score != rightAudit.Local.Score {
-			return leftAudit.Local.Score > rightAudit.Local.Score
-		}
-		if localLengthDistance(leftAudit.Local.RuneCount) != localLengthDistance(rightAudit.Local.RuneCount) {
-			return localLengthDistance(leftAudit.Local.RuneCount) < localLengthDistance(rightAudit.Local.RuneCount)
-		}
-		if leftAudit.Attempt != rightAudit.Attempt {
-			return leftAudit.Attempt < rightAudit.Attempt
-		}
-		return leftAudit.SourceSlot < rightAudit.SourceSlot
-	})
-	unique := make([]threadPostCandidate, 0, min(limit, len(pool)))
-	seen := make(map[string]struct{}, len(pool))
-	selectedTexts := make([]string, 0, min(limit, len(pool)))
-	for _, candidate := range ordered {
-		key := canonicalThreadPost(candidate.Result.Text)
-		if key == "" {
-			continue
-		}
-		if _, duplicate := seen[key]; duplicate {
-			continue
-		}
-		nearDuplicate := false
-		for _, selected := range selectedTexts {
-			if threadPostsNearDuplicate(candidate.Result.Text, selected) {
-				nearDuplicate = true
-				break
-			}
-		}
-		if nearDuplicate {
-			continue
-		}
-		seen[key] = struct{}{}
-		selectedTexts = append(selectedTexts, candidate.Result.Text)
-		unique = append(unique, candidate)
-	}
-	if len(unique) > limit {
-		unique = unique[:limit]
-	}
-	return unique
-}
-
-func appendCuratedThreadPostFinalists(
-	normalized normalizedThreadPostRequest,
-	candidates []threadPostCandidate,
-	audit *ThreadPostAudit,
-	limit int,
-) []threadPostCandidate {
-	excluded := make(map[string]struct{}, len(candidates))
-	for _, candidate := range candidates {
-		excluded[canonicalThreadPost(candidate.Result.Text)] = struct{}{}
-	}
-	fills := curatedThreadPosts(normalized, limit-len(candidates), excluded)
-	for index, result := range fills {
-		auditIndex := len(audit.Candidates)
-		audit.Candidates = append(audit.Candidates, ThreadPostCandidateAudit{
-			Attempt: audit.GenerationCalls + 1, SourceSlot: fmt.Sprintf("curated_fill_%d", index+1),
-			Goal: result.Goal, Text: result.Text, Eligible: true, Local: scoreThreadPostQuality(result.Text),
-		})
-		candidates = append(candidates, threadPostCandidate{Result: result, AuditIndex: auditIndex})
-	}
-	return selectThreadPostFinalists(candidates, audit.Candidates, limit)
-}
-
-func (provider *AnthropicProvider) generateThreadPostCandidates(
-	ctx context.Context,
-	normalized normalizedThreadPostRequest,
-	prompt string,
-	attempt int,
-	audit *ThreadPostAudit,
-) ([]threadPostCandidate, error) {
-	body, err := provider.threadPostGenerationRequestBody(prompt)
-	if err != nil {
-		return nil, fmt.Errorf("%w: encode Anthropic Threads request: %v", ErrInvalidRequest, err)
-	}
-	audit.GenerationCalls++
-	call, callErr := provider.callThreadPostStage(ctx, body)
-	addUsage(&audit.GenerationUsage, call.Usage)
-	if call.Model != "" {
-		audit.GeneratorModel = call.Model
-	}
-	if call.RequestID != "" {
-		audit.GenerationRequestIDs = append(audit.GenerationRequestIDs, call.RequestID)
-	}
-	if callErr != nil {
-		return nil, callErr
-	}
-	candidates, candidatesAudit, decodeErr := decodeThreadPostCandidates(call.Structured, normalized, attempt)
-	offset := len(audit.Candidates)
-	for index := range candidates {
-		candidates[index].AuditIndex += offset
-	}
-	audit.Candidates = append(audit.Candidates, candidatesAudit...)
-	if decodeErr != nil {
-		return nil, newInvalidOutputError(providerAnthropic, call.RequestID, decodeErr)
-	}
-	if len(candidates) < minimumBlindReviewCandidates {
-		return candidates, &ProviderError{
-			Provider: providerAnthropic, Code: "invalid_output_thread_insufficient_finalists", RequestID: call.RequestID,
-			Err: fmt.Errorf("%w: fewer than three safe Threads finalists", ErrInvalidResponse),
-		}
-	}
-	return candidates, nil
-}
-
-func buildThreadPostRepairPrompt(original string, reasons []string) string {
-	if len(reasons) == 0 {
-		reasons = []string{"invalid_output_thread_semantic"}
-	}
-	return original + "\n\nThe previous finalist set did not yield enough safe publication candidates. Safe validator categories: " + strings.Join(reasons, ", ") + ". Privately explore at least ten entirely fresh approaches from the original editorial controls, correct every listed condition in all five returned finalists, and do not reuse or reveal rejected text, scratch work, or private reasoning."
-}
-
-func threadPostRepairReasons(audits []ThreadPostCandidateAudit, generationErr error) []string {
-	seen := make(map[string]struct{})
-	for _, candidate := range audits {
-		if candidate.ValidationCode != "" {
-			seen[candidate.ValidationCode] = struct{}{}
-		}
-	}
-	if generationErr != nil {
-		seen[safeThreadPostFallbackReason(generationErr)] = struct{}{}
-	}
-	reasons := make([]string, 0, len(seen))
-	for reason := range seen {
-		reasons = append(reasons, reason)
-	}
-	sort.Strings(reasons)
-	return reasons
 }
 
 func applyThreadPostReviewDecision(
@@ -370,7 +341,9 @@ func curatedThreadPostFallback(normalized normalizedThreadPostRequest, reason st
 		auditIndex := len(audit.Candidates)
 		audit.Candidates = append(audit.Candidates, ThreadPostCandidateAudit{
 			Attempt: audit.GenerationCalls + 1, SourceSlot: fmt.Sprintf("curated_%d", index+1),
-			Goal: result.Goal, Text: result.Text, Eligible: true, Considered: true,
+			Goal: result.Goal, Objective: result.Objective, ScenarioID: result.ScenarioID, Mechanism: result.Mechanism,
+			MaterialBasis: result.MaterialBasis, Evidence: result.Evidence,
+			Text: result.Text, Eligible: true, Considered: true,
 			Local: scoreThreadPostQuality(result.Text),
 		})
 		candidates = append(candidates, threadPostCandidate{Result: result, AuditIndex: auditIndex})
@@ -380,11 +353,14 @@ func curatedThreadPostFallback(normalized normalizedThreadPostRequest, reason st
 	audit.SelectionMode = "curated_fallback"
 	audit.DecisionReason = "Anthropic generation was unavailable; selected the strongest of five validated local editorial finalists."
 	markThreadPostAuditWinner(&audit, winner)
+	audit.Objective = normalized.Objective
+	audit.ScenarioID = winner.Result.ScenarioID
+	audit.Mechanism = winner.Result.Mechanism
 	result := winner.Result
 	result.Provider = providerCurated
-	result.Model = "belcanto-editorial-v2"
+	result.Model = "belcanto-scenario-v3"
 	result.FallbackReason = reason
-	result.Visual = ThreadPostVisualRecommendation{Mode: "text_only", Query: defaultThreadPhotoQuery}
+	result.Visual = ThreadPostVisualRecommendation{Mode: "text_only", Query: SafeThreadPhotoQuery(result.ScenarioID)}
 	result.Usage = sumUsage(audit.GenerationUsage, audit.ReviewUsage)
 	result.Audit = audit
 	return result, nil
@@ -421,38 +397,54 @@ func safeThreadPostFallbackReason(err error) string {
 	return "provider_failure"
 }
 
-func (provider *AnthropicProvider) threadPostGenerationRequestBody(prompt string) ([]byte, error) {
+func (provider *AnthropicProvider) threadPostStageRequestBody(system, prompt string, schema json.RawMessage) ([]byte, error) {
 	payload := anthropicRequest{
 		Model:     provider.model,
-		MaxTokens: provider.maxTokens,
-		System:    threadPostSystemPrompt,
+		MaxTokens: provider.threadMaxTokens,
+		System:    system,
 		Messages: []anthropicMessage{{
 			Role: "user", Content: []anthropicContent{{Type: "text", Text: prompt}},
 		}},
 		OutputConfig: anthropicOutputConfig{
-			Effort: "high", Format: anthropicFormat{Type: "json_schema", Schema: threadPostJSONSchema()},
+			Effort: "high", Format: anthropicFormat{Type: "json_schema", Schema: schema},
 		},
 	}
 	return json.Marshal(payload)
 }
 
 func (provider *AnthropicProvider) threadPostReviewRequestBody(prompt string, schema json.RawMessage) ([]byte, error) {
-	effort := provider.effort
-	if effort == "low" {
-		effort = "medium"
-	}
 	payload := anthropicRequest{
 		Model:     provider.model,
-		MaxTokens: provider.maxTokens,
+		MaxTokens: provider.threadMaxTokens,
 		System:    threadPostReviewerSystemPrompt,
 		Messages: []anthropicMessage{{
 			Role: "user", Content: []anthropicContent{{Type: "text", Text: prompt}},
 		}},
 		OutputConfig: anthropicOutputConfig{
-			Effort: effort, Format: anthropicFormat{Type: "json_schema", Schema: schema},
+			Effort: "high", Format: anthropicFormat{Type: "json_schema", Schema: schema},
 		},
 	}
 	return json.Marshal(payload)
+}
+
+func recordThreadPostReviewCall(audit *ThreadPostAudit, call threadAnthropicCall, callErr error) {
+	if audit == nil {
+		return
+	}
+	addUsage(&audit.ReviewUsage, call.Usage)
+	if call.Model != "" {
+		audit.ReviewerModel = call.Model
+	}
+	requestID := call.RequestID
+	if requestID == "" {
+		var providerErr *ProviderError
+		if errors.As(callErr, &providerErr) {
+			requestID = providerErr.RequestID
+		}
+	}
+	if requestID != "" {
+		audit.ReviewerRequestID = requestID
+	}
 }
 
 func (provider *AnthropicProvider) callThreadPostStage(ctx context.Context, body []byte) (threadAnthropicCall, error) {
@@ -480,7 +472,7 @@ func (provider *AnthropicProvider) callThreadPostStage(ctx context.Context, body
 }
 
 func (provider *AnthropicProvider) doThreadPostRequest(ctx context.Context, body []byte) (threadAnthropicCall, time.Duration, bool, error) {
-	attemptCtx, cancel := context.WithTimeout(ctx, provider.timeout)
+	attemptCtx, cancel := context.WithTimeout(ctx, provider.threadTimeout)
 	defer cancel()
 
 	httpRequest, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, provider.endpoint, bytes.NewReader(body))

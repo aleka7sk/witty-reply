@@ -27,6 +27,15 @@ func TestLoadMinimalFakeConfig(t *testing.T) {
 	if cfg.Belcanto.ReviewLogMode != "full" {
 		t.Fatalf("review log mode = %q, want full finalist audit default", cfg.Belcanto.ReviewLogMode)
 	}
+	if cfg.AI.ThreadMaxTokens != 8192 {
+		t.Fatalf("Threads max tokens = %d, want 8192", cfg.AI.ThreadMaxTokens)
+	}
+	if cfg.AI.ThreadTimeout.String() != "1m30s" {
+		t.Fatalf("Threads call timeout = %s, want 1m30s", cfg.AI.ThreadTimeout)
+	}
+	if cfg.Belcanto.GenerationTimeout.String() != "5m0s" {
+		t.Fatalf("Threads end-to-end timeout = %s, want 5m0s", cfg.Belcanto.GenerationTimeout)
+	}
 }
 
 func TestLoadBelcantoOperatorsAndFakeThreads(t *testing.T) {
@@ -53,6 +62,8 @@ func TestBelcantoEditorialReviewAndPexelsConfiguration(t *testing.T) {
 	t.Setenv("STORE_DRIVER", "memory")
 	t.Setenv("BELCANTO_REVIEW_LOG_MODE", "metadata")
 	t.Setenv("THREADS_AI_TIMEOUT", "95s")
+	t.Setenv("THREADS_AI_MAX_TOKENS", "12288")
+	t.Setenv("THREADS_AI_CALL_TIMEOUT", "75s")
 	t.Setenv("THREADS_PHOTO_PROVIDER", "pexels")
 	t.Setenv("PEXELS_API_KEY", "pexels-secret")
 
@@ -60,8 +71,10 @@ func TestBelcantoEditorialReviewAndPexelsConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Belcanto.ReviewLogMode != "metadata" || cfg.Belcanto.GenerationTimeout.String() != "1m35s" || cfg.Belcanto.PhotoProvider != "pexels" {
-		t.Fatalf("Belcanto config = %+v", cfg.Belcanto)
+	if cfg.Belcanto.ReviewLogMode != "metadata" || cfg.Belcanto.GenerationTimeout.String() != "1m35s" ||
+		cfg.AI.ThreadMaxTokens != 12288 || cfg.AI.ThreadTimeout.String() != "1m15s" ||
+		cfg.Belcanto.PhotoProvider != "pexels" {
+		t.Fatalf("AI config = %+v; Belcanto config = %+v", cfg.AI, cfg.Belcanto)
 	}
 
 	t.Setenv("BELCANTO_REVIEW_LOG_MODE", "pretty")
@@ -69,6 +82,21 @@ func TestBelcantoEditorialReviewAndPexelsConfiguration(t *testing.T) {
 	_, err = Load()
 	if err == nil || !strings.Contains(err.Error(), "BELCANTO_REVIEW_LOG_MODE") || !strings.Contains(err.Error(), "PEXELS_API_KEY") {
 		t.Fatalf("invalid editorial config error = %v", err)
+	}
+}
+
+func TestLoadRejectsInvalidThreadAIBudget(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", strings.Repeat("x", 32))
+	t.Setenv("TELEGRAM_CALLBACK_SECRET", strings.Repeat("y", 32))
+	t.Setenv("AI_PROVIDER", "fake")
+	t.Setenv("STORE_DRIVER", "memory")
+	t.Setenv("THREADS_AI_MAX_TOKENS", "128")
+	t.Setenv("THREADS_AI_CALL_TIMEOUT", "500ms")
+
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "THREADS_AI_MAX_TOKENS") ||
+		!strings.Contains(err.Error(), "THREADS_AI_CALL_TIMEOUT") {
+		t.Fatalf("invalid Threads AI budget error = %v", err)
 	}
 }
 

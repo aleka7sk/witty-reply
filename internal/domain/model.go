@@ -173,6 +173,12 @@ type GenerationRecord struct {
 // preview stored in ThreadDraft is the text sent to Threads after approval.
 const MaxThreadPostRunes = 500
 
+// MaxThreadMaterialRunes bounds the operator-supplied factual brief used to
+// prepare one Belcanto Threads post. The material is durable until the normal
+// content-retention cleanup so a process restart never turns a real school
+// observation into an invented replacement.
+const MaxThreadMaterialRunes = 6_000
+
 // MaxThreadMediaBytes is the durable output bound for a normalized image used
 // by a first-party Threads post. The original Telegram upload may be larger;
 // only the metadata-free JPEG delivered to Meta must fit this eight MiB limit.
@@ -187,6 +193,206 @@ const (
 
 func (v ThreadVoice) Valid() bool {
 	return v == ThreadVoiceBelcanto || v == ThreadVoiceAlisher
+}
+
+// ThreadObjective is the operator-selected job of a Belcanto post. Legacy is
+// a migration-only value for publication drafts created before durable briefs
+// existed; it is never offered as a new Telegram choice.
+type ThreadObjective string
+
+const (
+	ThreadObjectiveReach     ThreadObjective = "reach"
+	ThreadObjectiveReplies   ThreadObjective = "replies"
+	ThreadObjectiveTrust     ThreadObjective = "trust"
+	ThreadObjectiveTrial     ThreadObjective = "trial"
+	ThreadObjectiveCommunity ThreadObjective = "community"
+	ThreadObjectiveLegacy    ThreadObjective = "legacy"
+)
+
+func ParseThreadObjective(value string) (ThreadObjective, bool) {
+	objective := ThreadObjective(strings.ToLower(strings.TrimSpace(value)))
+	return objective, objective.Valid()
+}
+
+func (o ThreadObjective) Valid() bool {
+	switch o {
+	case ThreadObjectiveReach, ThreadObjectiveReplies, ThreadObjectiveTrust,
+		ThreadObjectiveTrial, ThreadObjectiveCommunity, ThreadObjectiveLegacy:
+		return true
+	default:
+		return false
+	}
+}
+
+func (o ThreadObjective) Selectable() bool {
+	return o.Valid() && o != ThreadObjectiveLegacy
+}
+
+type ThreadMaterialKind string
+
+const (
+	ThreadMaterialNone ThreadMaterialKind = "none"
+	ThreadMaterialText ThreadMaterialKind = "text"
+)
+
+func ParseThreadMaterialKind(value string) (ThreadMaterialKind, bool) {
+	kind := ThreadMaterialKind(strings.ToLower(strings.TrimSpace(value)))
+	return kind, kind.Valid()
+}
+
+func (k ThreadMaterialKind) Valid() bool {
+	return k == ThreadMaterialNone || k == ThreadMaterialText
+}
+
+type ThreadBriefState string
+
+const (
+	ThreadBriefAwaitingGoal     ThreadBriefState = "awaiting_goal"
+	ThreadBriefAwaitingMaterial ThreadBriefState = "awaiting_material"
+	ThreadBriefMaterialReady    ThreadBriefState = "material_ready"
+	ThreadBriefDraftReady       ThreadBriefState = "draft_ready"
+	ThreadBriefCancelled        ThreadBriefState = "cancelled"
+)
+
+func (s ThreadBriefState) Valid() bool {
+	switch s {
+	case ThreadBriefAwaitingGoal, ThreadBriefAwaitingMaterial,
+		ThreadBriefMaterialReady, ThreadBriefDraftReady, ThreadBriefCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// ThreadBrief is the durable pre-publication intake for one Belcanto post.
+// It deliberately remains separate from ThreadDraft: a draft is always an
+// exact, publication-ready preview, while a brief may still be waiting for an
+// operator choice or factual material.
+type ThreadBrief struct {
+	ID               int64
+	TelegramID       int64
+	StartUpdateID    int64
+	Voice            ThreadVoice
+	Objective        ThreadObjective
+	MaterialKind     ThreadMaterialKind
+	MaterialText     string
+	MaterialUpdateID int64
+	State            ThreadBriefState
+	Revision         uint32
+	Current          bool
+	ErrorCode        string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+func (b ThreadBrief) ValidateForStart() error {
+	if b.TelegramID <= 0 {
+		return errors.New("thread brief owner is required")
+	}
+	if b.StartUpdateID <= 0 {
+		return errors.New("thread brief start update is required")
+	}
+	if !b.Voice.Valid() {
+		return errors.New("thread brief voice is invalid")
+	}
+	if b.Objective != "" || b.MaterialKind != "" || strings.TrimSpace(b.MaterialText) != "" || b.MaterialUpdateID != 0 {
+		return errors.New("new thread brief cannot contain completed choices")
+	}
+	if b.State != "" && b.State != ThreadBriefAwaitingGoal {
+		return errors.New("new thread brief must await a goal")
+	}
+	if b.Revision > 1 {
+		return errors.New("new thread brief revision is invalid")
+	}
+	if strings.TrimSpace(b.ErrorCode) != "" {
+		return errors.New("new thread brief cannot contain an error")
+	}
+	return nil
+}
+
+// Validate checks the persisted state machine, including the relationship
+// between its state and any operator-supplied material.
+func (b ThreadBrief) Validate() error {
+	if b.ID <= 0 {
+		return errors.New("thread brief id is required")
+	}
+	if b.TelegramID <= 0 || b.StartUpdateID <= 0 || !b.Voice.Valid() || b.Revision == 0 || !b.State.Valid() {
+		return errors.New("thread brief identity or lifecycle is invalid")
+	}
+	if !validThreadBriefErrorCode(b.ErrorCode) {
+		return errors.New("thread brief error code is invalid")
+	}
+	switch b.State {
+	case ThreadBriefAwaitingGoal:
+		if b.Objective != "" || b.MaterialKind != "" || b.MaterialText != "" || b.MaterialUpdateID != 0 {
+			return errors.New("thread brief awaiting a goal contains later choices")
+		}
+	case ThreadBriefAwaitingMaterial:
+		if !b.Objective.Selectable() || b.MaterialKind != "" || b.MaterialText != "" || b.MaterialUpdateID != 0 {
+			return errors.New("thread brief awaiting material is invalid")
+		}
+	case ThreadBriefMaterialReady, ThreadBriefDraftReady:
+		if !b.Objective.Selectable() || !validThreadBriefMaterial(b.MaterialKind, b.MaterialText, b.MaterialUpdateID) {
+			return errors.New("thread brief material is invalid")
+		}
+	case ThreadBriefCancelled:
+		if b.Current || !validCancelledThreadBriefChoices(b) {
+			return errors.New("cancelled thread brief is invalid")
+		}
+	}
+	return nil
+}
+
+func validThreadBriefMaterial(kind ThreadMaterialKind, text string, updateID int64) bool {
+	if updateID <= 0 || !kind.Valid() || !utf8.ValidString(text) || strings.ContainsRune(text, '\x00') || utf8.RuneCountInString(text) > MaxThreadMaterialRunes {
+		return false
+	}
+	for _, character := range text {
+		if (unicode.IsControl(character) && character != '\n' && character != '\t') || unicode.In(character, unicode.Cf) {
+			return false
+		}
+	}
+	switch kind {
+	case ThreadMaterialNone:
+		return text == ""
+	case ThreadMaterialText:
+		return strings.TrimSpace(text) != ""
+	default:
+		return false
+	}
+}
+
+func validCancelledThreadBriefChoices(brief ThreadBrief) bool {
+	if brief.Objective == "" {
+		return brief.MaterialKind == "" && brief.MaterialText == "" && brief.MaterialUpdateID == 0
+	}
+	if !brief.Objective.Selectable() {
+		return false
+	}
+	if brief.MaterialKind == "" {
+		return brief.MaterialText == "" && brief.MaterialUpdateID == 0
+	}
+	return validThreadBriefMaterial(brief.MaterialKind, brief.MaterialText, brief.MaterialUpdateID)
+}
+
+func validThreadBriefErrorCode(value string) bool {
+	return utf8.ValidString(value) && !strings.ContainsRune(value, '\x00') && utf8.RuneCountInString(value) <= 160
+}
+
+// ValidThreadScenarioID accepts stable machine identifiers. The current
+// scenario registry belongs to the editorial package; domain validation keeps
+// persisted historical IDs readable as that registry evolves.
+func ValidThreadScenarioID(value string) bool {
+	if len(value) < 3 || len(value) > 64 || value[0] < 'a' || value[0] > 'z' {
+		return false
+	}
+	for _, character := range value[1:] {
+		if (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') || character == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // ThreadMediaMode describes the operator-visible format of one exact preview.
@@ -376,6 +582,15 @@ type ThreadDraft struct {
 	TelegramID int64
 	Voice      ThreadVoice
 	Goal       string
+	// BriefID, Objective, ScenarioID, and GenerationID connect an exact
+	// preview to the durable editorial decision that produced it. Zero/empty
+	// values remain accepted only for pre-v4 legacy callers and are normalized
+	// by stores to explicit legacy metadata.
+	BriefID            int64
+	Objective          ThreadObjective
+	ScenarioID         string
+	GenerationID       string
+	GenerationUpdateID int64
 	// PhotoQuery is the editor's anonymous, safe Pexels fallback for this exact
 	// text. It is retained even when text-only is the recommended format so the
 	// operator can override that recommendation without regenerating the post.
@@ -415,6 +630,24 @@ func (d ThreadDraft) ValidateForCreate() error {
 	}
 	if !d.Voice.Valid() {
 		return errors.New("thread draft voice is invalid")
+	}
+	if d.BriefID < 0 || d.GenerationUpdateID < 0 {
+		return errors.New("thread draft editorial reference is invalid")
+	}
+	if d.Objective != "" && !d.Objective.Valid() {
+		return errors.New("thread draft objective is invalid")
+	}
+	if d.ScenarioID != "" && !ValidThreadScenarioID(d.ScenarioID) {
+		return errors.New("thread draft scenario is invalid")
+	}
+	if !utf8.ValidString(d.GenerationID) || strings.ContainsAny(d.GenerationID, "\x00\r\n\t") || utf8.RuneCountInString(d.GenerationID) > 64 {
+		return errors.New("thread draft generation id is invalid")
+	}
+	if d.BriefID > 0 {
+		if !d.Objective.Selectable() || d.ScenarioID == "" || d.ScenarioID == "legacy_unspecified" ||
+			strings.TrimSpace(d.GenerationID) == "" || d.GenerationUpdateID <= 0 {
+			return errors.New("thread draft brief metadata is incomplete")
+		}
 	}
 	if !utf8.ValidString(d.Goal) || strings.ContainsRune(d.Goal, '\x00') || strings.TrimSpace(d.Goal) == "" || utf8.RuneCountInString(d.Goal) > 120 {
 		return errors.New("thread draft goal must contain 1 to 120 characters")

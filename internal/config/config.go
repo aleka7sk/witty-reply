@@ -52,16 +52,18 @@ type Telegram struct {
 }
 
 type AI struct {
-	Provider       string
-	AnthropicKey   string
-	AnthropicURL   string
-	Model          string
-	MaxTokens      int
-	Effort         string
-	Timeout        time.Duration
-	MaxRetries     int
-	ClaudeCLIPath  string
-	ClaudeCLIModel string
+	Provider        string
+	AnthropicKey    string
+	AnthropicURL    string
+	Model           string
+	MaxTokens       int
+	ThreadMaxTokens int
+	Effort          string
+	Timeout         time.Duration
+	ThreadTimeout   time.Duration
+	MaxRetries      int
+	ClaudeCLIPath   string
+	ClaudeCLIModel  string
 }
 
 type Store struct {
@@ -149,8 +151,10 @@ func Load() (Config, error) {
 		AI: AI{
 			Provider: get("AI_PROVIDER", "fake"), AnthropicKey: get("ANTHROPIC_API_KEY", ""),
 			AnthropicURL: strings.TrimRight(get("ANTHROPIC_BASE_URL", "https://api.anthropic.com"), "/"), Model: get("ANTHROPIC_MODEL", "claude-sonnet-5"),
-			MaxTokens: integer("AI_MAX_TOKENS", 1800), Effort: get("AI_EFFORT", "low"), Timeout: duration("AI_TIMEOUT", 45*time.Second),
-			MaxRetries: integer("AI_MAX_RETRIES", 2), ClaudeCLIPath: get("CLAUDE_CLI_PATH", "claude"), ClaudeCLIModel: get("CLAUDE_CLI_MODEL", ""),
+			MaxTokens: integer("AI_MAX_TOKENS", 1800), ThreadMaxTokens: integer("THREADS_AI_MAX_TOKENS", 8192),
+			Effort: get("AI_EFFORT", "low"), Timeout: duration("AI_TIMEOUT", 45*time.Second),
+			ThreadTimeout: duration("THREADS_AI_CALL_TIMEOUT", 90*time.Second),
+			MaxRetries:    integer("AI_MAX_RETRIES", 2), ClaudeCLIPath: get("CLAUDE_CLI_PATH", "claude"), ClaudeCLIModel: get("CLAUDE_CLI_MODEL", ""),
 		},
 		Store: Store{
 			Driver: get("STORE_DRIVER", "memory"), DatabaseURL: get("DATABASE_URL", ""),
@@ -175,7 +179,7 @@ func Load() (Config, error) {
 			APIKey: get("SPEECH_API_KEY", ""), Model: get("SPEECH_MODEL", "whisper-1"), Timeout: duration("SPEECH_TIMEOUT", 60*time.Second),
 		},
 		Belcanto: Belcanto{
-			OperatorIDs: operatorIDs, GenerationTimeout: duration("THREADS_AI_TIMEOUT", 120*time.Second),
+			OperatorIDs: operatorIDs, GenerationTimeout: duration("THREADS_AI_TIMEOUT", 300*time.Second),
 			ReviewLogMode:   strings.ToLower(get("BELCANTO_REVIEW_LOG_MODE", "full")),
 			ThreadsProvider: strings.ToLower(get("THREADS_PROVIDER", "disabled")),
 			ThreadsUserID:   get("THREADS_USER_ID", ""), ThreadsAccessToken: get("THREADS_ACCESS_TOKEN", ""),
@@ -285,6 +289,12 @@ func (c Config) Validate() error {
 	}
 	if c.Belcanto.GenerationTimeout < 5*time.Second {
 		errs = append(errs, errors.New("THREADS_AI_TIMEOUT must be at least five seconds"))
+	}
+	if c.AI.ThreadMaxTokens < 256 || c.AI.ThreadMaxTokens > 64_000 {
+		errs = append(errs, errors.New("THREADS_AI_MAX_TOKENS must be between 256 and 64000"))
+	}
+	if c.AI.ThreadTimeout < time.Second {
+		errs = append(errs, errors.New("THREADS_AI_CALL_TIMEOUT must be at least one second"))
 	}
 	switch c.Belcanto.ReviewLogMode {
 	case "off", "metadata", "full":

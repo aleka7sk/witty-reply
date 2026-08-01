@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"errors"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,11 +41,19 @@ func (p *threadTestProvider) Generate(ctx context.Context, request domain.Genera
 	return ai.NewFake().Generate(ctx, request)
 }
 
-func (p *threadTestProvider) GenerateThreadPost(context.Context, ai.ThreadPostRequest) (ai.ThreadPostResult, error) {
-	return validTestThreadResult(p.text, "test", "thread-test"), nil
+func (p *threadTestProvider) GenerateThreadPost(_ context.Context, request ai.ThreadPostRequest) (ai.ThreadPostResult, error) {
+	return validTestThreadResultForRequest(request, p.text, "test", "thread-test"), nil
 }
 
 func validTestThreadResult(text, provider, model string) ai.ThreadPostResult {
+	return validTestThreadResultForRequest(ai.ThreadPostRequest{Objective: domain.ThreadObjectiveReplies}, text, provider, model)
+}
+
+func validTestThreadResultForRequest(request ai.ThreadPostRequest, text, provider, model string) ai.ThreadPostResult {
+	objective := request.Objective
+	if !objective.Selectable() {
+		objective = domain.ThreadObjectiveReplies
+	}
 	texts := []string{
 		text,
 		"Какую песню вы узнаете раньше, чем вспоминаете её название?",
@@ -52,21 +61,80 @@ func validTestThreadResult(text, provider, model string) ai.ThreadPostResult {
 		"Какой знакомый звук первым выдаёт начало любимой песни?",
 		"Припев иногда помнит настроение точнее календаря.",
 	}
+	scenarios := []string{"karaoke_archetype", "song_memory", "astana_soundtrack", "audience_choice", "adult_beginner"}
+	mechanisms := []string{"conversation_humor", "music_memory", "local_identity", "participation", "recognition"}
+	materialBasis, evidence := "none", ""
+	if strings.TrimSpace(request.Material) != "" {
+		materialBasis = "material"
+		evidence = request.Material
+	}
 	candidates := make([]ai.ThreadPostCandidateAudit, 0, len(texts))
 	for index, candidateText := range texts {
 		id := string(rune('A' + index))
 		candidates = append(candidates, ai.ThreadPostCandidateAudit{
-			Attempt: 1, SourceSlot: id, ReviewerID: id, Goal: "discussion", Text: candidateText,
+			Attempt: 1, SourceSlot: id, ReviewerID: id, Goal: string(objective), Objective: objective,
+			ScenarioID: scenarios[index], Mechanism: mechanisms[index], MaterialBasis: materialBasis,
+			Evidence: evidence, Text: candidateText,
 			Eligible: true, Considered: true, Selected: index == 0,
 		})
 	}
 	return ai.ThreadPostResult{
-		Goal: "discussion", Text: text, Provider: provider, Model: model,
+		Goal: string(objective), Objective: objective, ScenarioID: scenarios[0], Mechanism: mechanisms[0],
+		MaterialBasis: materialBasis, Evidence: evidence, Text: text, Provider: provider, Model: model,
 		Audit: ai.ThreadPostAudit{
-			ExplorationGoal: 10, GenerationCalls: 1, GeneratorProvider: provider, GeneratorModel: model,
+			Objective: objective, ScenarioID: scenarios[0], Mechanism: mechanisms[0],
+			ExplorationGoal: 12, GenerationCalls: 3, ConceptCalls: 1, WriterCalls: 1,
+			GeneratorProvider: provider, GeneratorModel: model,
 			SelectionMode: "test", DeliveredWinnerID: "A", Candidates: candidates,
 		},
 	}
+}
+
+// generateThreadDraftForTest enters the durable workflow below the Telegram
+// goal/material prompts. Most legacy publication/media tests are concerned
+// with the exact draft after generation; this helper keeps those assertions
+// focused while dedicated tests exercise the public three-step UX.
+func generateThreadDraftForTest(t *testing.T, service *Service, dataStore store.Store, startUpdateID int64) domain.ThreadDraft {
+	t.Helper()
+	user, brief, generationUpdateID := readyThreadBriefForTest(t, dataStore, startUpdateID)
+	ctx := context.Background()
+	if err := service.generateThreadBrief(ctx, generationUpdateID, 42, user, brief); err != nil {
+		t.Fatal(err)
+	}
+	draft, err := dataStore.GetCurrentThreadDraft(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return draft
+}
+
+func readyThreadBriefForTest(
+	t *testing.T,
+	dataStore store.Store,
+	startUpdateID int64,
+) (domain.User, domain.ThreadBrief, int64) {
+	t.Helper()
+	ctx := context.Background()
+	user, err := dataStore.GetUser(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, _, err := dataStore.StartThreadBrief(ctx, 42, startUpdateID, domain.ThreadVoiceBelcanto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err = dataStore.SetThreadBriefObjective(ctx, brief.ID, 42, brief.Revision, domain.ThreadObjectiveReplies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generationUpdateID := startUpdateID + 1_000_000
+	brief, err = dataStore.SetThreadBriefMaterial(
+		ctx, brief.ID, 42, brief.Revision, generationUpdateID, domain.ThreadMaterialNone, "",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return user, brief, generationUpdateID
 }
 
 type recordingThreadPublisher struct {
@@ -192,7 +260,12 @@ func authorizedThreadsService(
 ) (*Service, *fakeTelegram, *countingThreadProvider) {
 	t.Helper()
 	fake := ai.NewFake()
-	provider := &countingThreadProvider{base: fake, threads: fake}
+	provider := &countingThreadProvider{
+		base: fake,
+		threads: &threadTestProvider{
+			text: "Какую песню вы узнаёте раньше, чем вспоминаете её название?",
+		},
+	}
 	service, telegramClient, memory, _, _ := newTestService(t, provider)
 	service.threadPublisher = publisher
 	service.belcantoOperators[42] = struct{}{}
@@ -245,9 +318,7 @@ func TestThreadsPublishesExactPreviewAndSequentialDoubleTapIsIdempotent(t *testi
 	}}
 	service, telegramClient, memory, codec := newThreadService(t, exact, publisher)
 	ctx := context.Background()
-	if err := service.HandleUpdate(ctx, textUpdate(1, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, memory, 1)
 	messages := telegramClient.snapshotMessages()
 	if len(messages) != 1 {
 		t.Fatalf("preview messages = %+v", messages)
@@ -278,6 +349,17 @@ func TestThreadsPublishesExactPreviewAndSequentialDoubleTapIsIdempotent(t *testi
 		draftAfter.PublishStartedAt == nil || draftAfter.ClaimToken != "" {
 		t.Fatalf("published draft = %+v, %v", draftAfter, err)
 	}
+	recorder := httptest.NewRecorder()
+	service.metrics.Handler().ServeHTTP(recorder, httptest.NewRequest("GET", "/metrics", nil))
+	for _, want := range []string{
+		"witty_reply_belcanto_posts_published_total 1",
+		"witty_reply_belcanto_posts_published_objective_replies_total 1",
+		"witty_reply_belcanto_posts_published_scenario_karaoke_archetype_total 1",
+	} {
+		if !strings.Contains(recorder.Body.String(), want) {
+			t.Fatalf("published metrics missing %q:\n%s", want, recorder.Body.String())
+		}
+	}
 }
 
 func TestThreadContainerPollingUsesMetaSafeBounds(t *testing.T) {
@@ -297,11 +379,9 @@ func TestThreadsConcurrentDoubleTapCannotCrossPublishMarker(t *testing.T) {
 		publishStarted: make(chan struct{}),
 		releasePublish: make(chan struct{}),
 	}
-	service, telegramClient, _, _ := newThreadService(t, "Пост для проверки двойного нажатия.", publisher)
+	service, telegramClient, memory, _ := newThreadService(t, "Пост для проверки двойного нажатия.", publisher)
 	ctx := context.Background()
-	if err := service.HandleUpdate(ctx, textUpdate(10, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, memory, 10)
 	callbackData := threadPublishCallback(t, telegramClient.snapshotMessages())
 	firstDone := make(chan error, 1)
 	go func() {
@@ -338,9 +418,7 @@ func TestThreadsAmbiguousPublishIsUnknownUntilStatusProvesPublished(t *testing.T
 	}
 	service, telegramClient, memory, codec := newThreadService(t, "Пост с неоднозначным ответом Meta.", publisher)
 	ctx := context.Background()
-	if err := service.HandleUpdate(ctx, textUpdate(20, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, memory, 20)
 	callbackData := threadPublishCallback(t, telegramClient.snapshotMessages())
 	payload, err := codec.DecodeForUser(callbackData, 42)
 	if err != nil {
@@ -385,9 +463,7 @@ func TestThreadsFinalizationFailureDoesNotClaimUnknownWasSaved(t *testing.T) {
 	service, telegramClient, memory, codec := newThreadService(t, "Пост с отказом БД при финализации.", publisher)
 	service.store = &failingThreadFinalizationStore{Store: memory, failFailure: true}
 	ctx := context.Background()
-	if err := service.HandleUpdate(ctx, textUpdate(30, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, memory, 30)
 	callbackData := threadPublishCallback(t, telegramClient.snapshotMessages())
 	payload, err := codec.DecodeForUser(callbackData, 42)
 	if err != nil {

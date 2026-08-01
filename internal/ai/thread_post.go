@@ -15,14 +15,15 @@ import (
 )
 
 const (
-	maxThreadPostRunes        = domain.MaxThreadPostRunes
-	maxThreadEditorialRunes   = 360
-	maxShortThreadPostRunes   = 240
-	maxThreadPostGoal         = 40
-	maxThreadRecentTexts      = 24
-	threadPostFinalistCount   = 5
-	threadPostExplorationGoal = 10
-	defaultThreadPhotoQuery   = "vintage microphone close up"
+	maxThreadPostRunes         = domain.MaxThreadPostRunes
+	maxThreadEditorialRunes    = 360
+	maxShortThreadPostRunes    = 240
+	maxThreadPostGoal          = 40
+	maxThreadRecentTexts       = 24
+	threadPostFinalistCount    = 5
+	threadPostExplorationGoal  = 12
+	maxThreadPostMaterialRunes = 6_000
+	defaultThreadPhotoQuery    = "vintage microphone close up"
 )
 
 const threadPostSystemPrompt = `You are the editorial co-author for Belcanto's Threads presence.
@@ -58,71 +59,22 @@ AI-copy cliches such as "allow yourself to sound", "find your voice", "be your t
 characters per candidate and never exceed 360. Return only data matching the supplied
 JSON schema.`
 
-const threadPostSchema = `{
-  "type": "object",
-  "additionalProperties": false,
-  "properties": {
-    "finalist_one": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "goal": {"type": "string", "enum": ["discussion", "recognition", "warmth"]},
-        "text": {"type": "string", "description": "First publication-ready finalist. Aim for 80 to 300 Unicode characters; never exceed 360."}
-      },
-      "required": ["goal", "text"]
-    },
-    "finalist_two": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "goal": {"type": "string", "enum": ["discussion", "recognition", "warmth"]},
-        "text": {"type": "string", "description": "Second publication-ready finalist with a different premise and structure. Aim for 80 to 300 Unicode characters; never exceed 360."}
-      },
-      "required": ["goal", "text"]
-    },
-    "finalist_three": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "goal": {"type": "string", "enum": ["discussion", "recognition", "warmth"]},
-        "text": {"type": "string", "description": "Third publication-ready finalist with a different hook and rhythm. Aim for 80 to 300 Unicode characters; never exceed 360."}
-      },
-      "required": ["goal", "text"]
-    },
-    "finalist_four": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "goal": {"type": "string", "enum": ["discussion", "recognition", "warmth"]},
-        "text": {"type": "string", "description": "Fourth publication-ready finalist with a different ending. Aim for 80 to 300 Unicode characters; never exceed 360."}
-      },
-      "required": ["goal", "text"]
-    },
-    "finalist_five": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "goal": {"type": "string", "enum": ["discussion", "recognition", "warmth"]},
-        "text": {"type": "string", "description": "Fifth publication-ready finalist; clear, lively, and fact-safe. Aim for 80 to 300 Unicode characters; never exceed 360."}
-      },
-      "required": ["goal", "text"]
-    }
-  },
-  "required": ["finalist_one", "finalist_two", "finalist_three", "finalist_four", "finalist_five"]
-}`
-
-// ThreadPostRequest contains only editorial controls and previously generated
-// output. It intentionally has no arbitrary factual brief: this first vertical
-// slice can therefore never turn an unverified statement into a Belcanto claim.
+// ThreadPostRequest contains editorial controls, previously generated output,
+// and an optional operator-approved factual brief. Material remains untrusted
+// prompt data and is carried through exact evidence fields for local validation.
 type ThreadPostRequest struct {
-	GenerationID string
-	Voice        domain.ThreadVoice
-	Transform    string
-	PreviousText string
-	RecentTexts  []string
-	Language     string
-	Date         time.Time
-	Seed         uint32
+	GenerationID       string
+	Voice              domain.ThreadVoice
+	Objective          domain.ThreadObjective
+	MaterialKind       domain.ThreadMaterialKind
+	Material           string
+	PreviousScenarioID string
+	Transform          string
+	PreviousText       string
+	RecentTexts        []string
+	Language           string
+	Date               time.Time
+	Seed               uint32
 	// DeliveryCheck is a local-only deterministic moderation boundary. It is
 	// never serialized into an Anthropic request. Production supplies it so
 	// every finalist is reviewed in exactly the form that can be delivered.
@@ -133,6 +85,11 @@ type ThreadPostRequest struct {
 // excluded from the structured model schema and attached only after validation.
 type ThreadPostResult struct {
 	Goal           string                         `json:"goal"`
+	Objective      domain.ThreadObjective         `json:"objective,omitempty"`
+	ScenarioID     string                         `json:"scenario_id,omitempty"`
+	Mechanism      string                         `json:"mechanism,omitempty"`
+	MaterialBasis  string                         `json:"material_basis,omitempty"`
+	Evidence       string                         `json:"evidence,omitempty"`
 	Text           string                         `json:"text"`
 	Provider       string                         `json:"-"`
 	Model          string                         `json:"-"`
@@ -176,6 +133,10 @@ type ThreadPostReviewerScore struct {
 	Replies      int
 	Brevity      int
 	Voice        int
+	GoalFit      int
+	Grounding    int
+	Distinctive  int
+	FactSafe     bool
 	Total        int
 	WouldLike    string
 	WouldComment string
@@ -189,6 +150,11 @@ type ThreadPostCandidateAudit struct {
 	SourceSlot     string
 	ReviewerID     string
 	Goal           string
+	Objective      domain.ThreadObjective
+	ScenarioID     string
+	Mechanism      string
+	MaterialBasis  string
+	Evidence       string
 	Text           string
 	Eligible       bool
 	Considered     bool
@@ -200,13 +166,20 @@ type ThreadPostCandidateAudit struct {
 
 type ThreadPostAudit struct {
 	GenerationID         string
+	Objective            domain.ThreadObjective
+	ScenarioID           string
+	Mechanism            string
 	RecipeID             string
 	ExplorationGoal      int
+	ConceptCalls         int
+	WriterCalls          int
 	GenerationCalls      int
 	ReviewCalls          int
 	GeneratorProvider    string
 	GeneratorModel       string
 	GenerationRequestIDs []string
+	ConceptRequestIDs    []string
+	WriterRequestIDs     []string
 	ReviewerProvider     string
 	ReviewerModel        string
 	ReviewerRequestID    string
@@ -216,7 +189,10 @@ type ThreadPostAudit struct {
 	DecisionReason       string
 	ReviewerError        string
 	GenerationUsage      domain.Usage
+	ConceptUsage         domain.Usage
+	WriterUsage          domain.Usage
 	ReviewUsage          domain.Usage
+	Concepts             []ThreadPostConceptAudit
 	Candidates           []ThreadPostCandidateAudit
 }
 
@@ -227,15 +203,20 @@ type threadPostCandidate struct {
 }
 
 type normalizedThreadPostRequest struct {
-	GenerationID  string
-	Voice         string
-	Transform     string
-	PreviousText  string
-	RecentTexts   []string
-	Language      string
-	Date          time.Time
-	Seed          uint32
-	DeliveryCheck func(string) bool
+	GenerationID       string
+	Voice              string
+	Objective          domain.ThreadObjective
+	MaterialKind       domain.ThreadMaterialKind
+	Material           string
+	MaterialID         string
+	PreviousScenarioID string
+	Transform          string
+	PreviousText       string
+	RecentTexts        []string
+	Language           string
+	Date               time.Time
+	Seed               uint32
+	DeliveryCheck      func(string) bool
 }
 
 type threadPostRecipe struct {
@@ -252,6 +233,41 @@ func normalizeThreadPostRequest(request ThreadPostRequest) (normalizedThreadPost
 	voice := strings.ToLower(strings.TrimSpace(string(request.Voice)))
 	if voice != "belcanto" && voice != "alisher" {
 		return normalizedThreadPostRequest{}, fmt.Errorf("%w: unsupported Threads voice", ErrInvalidRequest)
+	}
+	objective := strings.ToLower(strings.TrimSpace(string(request.Objective)))
+	if objective == "" {
+		objective = "replies"
+	}
+	switch objective {
+	case "reach", "replies", "trust", "trial", "community":
+	default:
+		return normalizedThreadPostRequest{}, fmt.Errorf("%w: unsupported Threads objective", ErrInvalidRequest)
+	}
+	materialKind := strings.ToLower(strings.TrimSpace(string(request.MaterialKind)))
+	if materialKind == "" {
+		materialKind = "none"
+	}
+	switch materialKind {
+	case "none", "text":
+	default:
+		return normalizedThreadPostRequest{}, fmt.Errorf("%w: unsupported Threads material kind", ErrInvalidRequest)
+	}
+	material, err := cleanText(request.Material, maxThreadPostMaterialRunes, true)
+	if err != nil {
+		return normalizedThreadPostRequest{}, fmt.Errorf("%w: Threads material: %v", ErrInvalidRequest, err)
+	}
+	if materialKind == "none" && material != "" {
+		return normalizedThreadPostRequest{}, fmt.Errorf("%w: Threads material requires text kind", ErrInvalidRequest)
+	}
+	if materialKind == "text" && material == "" {
+		return normalizedThreadPostRequest{}, fmt.Errorf("%w: Threads text material is empty", ErrInvalidRequest)
+	}
+	if objective == "trial" && material == "" {
+		return normalizedThreadPostRequest{}, fmt.Errorf("%w: trial objective requires approved material", ErrInvalidRequest)
+	}
+	previousScenarioID := strings.ToLower(strings.TrimSpace(request.PreviousScenarioID))
+	if previousScenarioID != "" && !validThreadPostScenarioID(previousScenarioID) {
+		return normalizedThreadPostRequest{}, fmt.Errorf("%w: unsupported previous Threads scenario", ErrInvalidRequest)
 	}
 	transform := strings.ToLower(strings.TrimSpace(request.Transform))
 	switch transform {
@@ -292,8 +308,15 @@ func normalizeThreadPostRequest(request ThreadPostRequest) (normalizedThreadPost
 	}
 
 	return normalizedThreadPostRequest{
-		GenerationID: generationID,
-		Voice:        voice, Transform: transform, PreviousText: previous,
+		GenerationID: generationID, Voice: voice,
+		Objective: domain.ThreadObjective(objective), MaterialKind: domain.ThreadMaterialKind(materialKind),
+		Material: material, MaterialID: func() string {
+			if material != "" {
+				return "M1"
+			}
+			return ""
+		}(),
+		PreviousScenarioID: previousScenarioID, Transform: transform, PreviousText: previous,
 		RecentTexts: recent, Language: language, Date: request.Date, Seed: request.Seed,
 		DeliveryCheck: request.DeliveryCheck,
 	}, nil
@@ -387,10 +410,6 @@ func threadPostTransformInstruction(transform string) string {
 	default:
 		return "Use an evergreen observation about voice, music, adult self-expression, or the hesitation to be heard. "
 	}
-}
-
-func threadPostJSONSchema() json.RawMessage {
-	return append(json.RawMessage(nil), threadPostSchema...)
 }
 
 func decodeThreadPostCandidates(raw []byte, request normalizedThreadPostRequest, attempt int) ([]threadPostCandidate, []ThreadPostCandidateAudit, error) {
@@ -674,9 +693,15 @@ func validateThreadPostResult(result *ThreadPostResult, request normalizedThread
 	}
 	result.Goal = strings.ToLower(strings.TrimSpace(result.Goal))
 	switch result.Goal {
-	case "discussion", "recognition", "warmth":
+	case "reach", "replies", "trust", "trial", "community", "discussion", "recognition", "warmth":
 	default:
 		return fmt.Errorf("%w: unsupported Threads goal", ErrInvalidResponse)
+	}
+	if result.Objective == "" {
+		result.Objective = request.Objective
+	}
+	if string(result.Objective) != string(request.Objective) {
+		return fmt.Errorf("%w: Threads objective mismatch", ErrInvalidResponse)
 	}
 	if utf8.RuneCountInString(result.Goal) > maxThreadPostGoal {
 		return fmt.Errorf("%w: Threads goal exceeds limit", ErrInvalidResponse)
@@ -686,17 +711,24 @@ func validateThreadPostResult(result *ThreadPostResult, request normalizedThread
 		return invalidField("Threads text", err)
 	}
 	result.Text = text
-	if containsUnicodeDigit(text) {
-		return fmt.Errorf("%w: Threads text contains digits", ErrInvalidResponse)
-	}
 	if !threadPostLanguageMatches(text, request.Language) {
 		return fmt.Errorf("%w: Threads text does not match requested language", ErrInvalidResponse)
 	}
-	if reason := forbiddenThreadPostNarrative(text); reason != "" {
-		return fmt.Errorf("%w: Threads text contains forbidden %s narrative", ErrInvalidResponse, reason)
-	}
-	if reason := forbiddenThreadPostClaim(text); reason != "" {
-		return fmt.Errorf("%w: Threads text contains forbidden %s claim", ErrInvalidResponse, reason)
+	materialBacked := result.MaterialBasis == "material"
+	if !materialBacked {
+		if containsUnicodeDigit(text) {
+			return fmt.Errorf("%w: Threads text contains digits", ErrInvalidResponse)
+		}
+		if reason := forbiddenThreadPostNarrative(text); reason != "" {
+			return fmt.Errorf("%w: Threads text contains forbidden %s narrative", ErrInvalidResponse, reason)
+		}
+		if reason := forbiddenThreadPostClaim(text); reason != "" {
+			return fmt.Errorf("%w: Threads text contains forbidden %s claim", ErrInvalidResponse, reason)
+		}
+	} else {
+		if err := validateThreadPostGroundedText(text, result.Evidence, request); err != nil {
+			return err
+		}
 	}
 	for _, previous := range append([]string{request.PreviousText}, request.RecentTexts...) {
 		if previous != "" && threadPostsNearDuplicate(text, previous) {

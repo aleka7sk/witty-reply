@@ -1295,6 +1295,180 @@ func TestPostgresLicensedMediaMigrationUpgradesLegacyThreadMedia(t *testing.T) {
 	}
 }
 
+func TestPostgresThreadBriefLifecyclePersistsAndIsReplaySafe(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	postgres := newIsolatedPostgres(t, ctx, databaseURL)
+	const ownerID = int64(73001)
+	if _, err := postgres.UpsertUser(ctx, domain.User{TelegramID: ownerID, Language: "ru"}); err != nil {
+		t.Fatal(err)
+	}
+
+	brief, created, err := postgres.StartThreadBrief(ctx, ownerID, 8001, domain.ThreadVoiceBelcanto)
+	if err != nil || !created || brief.State != domain.ThreadBriefAwaitingGoal {
+		t.Fatalf("StartThreadBrief() = %+v, %v, %v", brief, created, err)
+	}
+	replayedStart, created, err := postgres.StartThreadBrief(ctx, ownerID, 8001, domain.ThreadVoiceBelcanto)
+	if err != nil || created || replayedStart.ID != brief.ID {
+		t.Fatalf("replayed start = %+v, %v, %v", replayedStart, created, err)
+	}
+	brief, err = postgres.SetThreadBriefObjective(ctx, brief.ID, ownerID, brief.Revision, domain.ThreadObjectiveReplies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err = postgres.SetThreadBriefObjective(ctx, brief.ID, ownerID, brief.Revision, domain.ThreadObjectiveTrust)
+	if err != nil || brief.Objective != domain.ThreadObjectiveTrust {
+		t.Fatalf("changed objective = %+v, %v", brief, err)
+	}
+	materialRevision := brief.Revision
+	material := "Педагог предложил сначала проговорить сложную строку, а затем спеть её."
+	brief, err = postgres.SetThreadBriefMaterial(
+		ctx, brief.ID, ownerID, materialRevision, 8002, domain.ThreadMaterialText, material,
+	)
+	if err != nil || brief.State != domain.ThreadBriefMaterialReady {
+		t.Fatalf("SetThreadBriefMaterial() = %+v, %v", brief, err)
+	}
+	replayedMaterial, err := postgres.SetThreadBriefMaterial(
+		ctx, brief.ID, ownerID, materialRevision, 8002, domain.ThreadMaterialText, material,
+	)
+	if err != nil || replayedMaterial.Revision != brief.Revision {
+		t.Fatalf("replayed material = %+v, %v", replayedMaterial, err)
+	}
+
+	draftInput := testThreadDraft(ownerID, 1, "Сложную строку не всегда нужно сразу петь. Иногда сначала полезно услышать её в обычной речи.")
+	draftInput.ScenarioID = "teacher_one_move"
+	draftInput.GenerationID = "postgres-generation-8002"
+	draftInput.GenerationUpdateID = 8002
+	premature := draftInput
+	premature.BriefID = brief.ID
+	premature.Objective = brief.Objective
+	if _, err := postgres.CreateThreadDraft(ctx, premature); !errors.Is(err, ErrThreadBriefState) {
+		t.Fatalf("generic initial draft bypass = %v", err)
+	}
+	wrongVoice := draftInput
+	wrongVoice.Voice = domain.ThreadVoiceAlisher
+	if _, _, err := postgres.CreateThreadDraftForBrief(ctx, brief.ID, brief.Revision, wrongVoice, nil); !errors.Is(err, ErrThreadBriefState) {
+		t.Fatalf("cross-voice brief draft = %v", err)
+	}
+	createdDraft, draftCreated, err := postgres.CreateThreadDraftForBrief(ctx, brief.ID, brief.Revision, draftInput, nil)
+	if err != nil || !draftCreated || createdDraft.BriefID != brief.ID ||
+		createdDraft.Objective != domain.ThreadObjectiveTrust {
+		t.Fatalf("CreateThreadDraftForBrief() = %+v, %v, %v", createdDraft, draftCreated, err)
+	}
+	replayedDraft, draftCreated, err := postgres.CreateThreadDraftForBrief(ctx, brief.ID, brief.Revision, draftInput, nil)
+	if err != nil || draftCreated || replayedDraft.ID != createdDraft.ID {
+		t.Fatalf("replayed draft = %+v, %v, %v", replayedDraft, draftCreated, err)
+	}
+	byUpdate, err := postgres.GetThreadDraftByGenerationUpdate(ctx, ownerID, 8002)
+	if err != nil || byUpdate.ID != createdDraft.ID || byUpdate.ScenarioID != "teacher_one_move" {
+		t.Fatalf("generation update lookup = %+v, %v", byUpdate, err)
+	}
+	storedBrief, err := postgres.GetThreadBrief(ctx, brief.ID, ownerID)
+	if err != nil || storedBrief.State != domain.ThreadBriefDraftReady || storedBrief.MaterialText != material {
+		t.Fatalf("stored brief = %+v, %v", storedBrief, err)
+	}
+	refinement := draftInput
+	refinement.BriefID = brief.ID
+	refinement.Objective = brief.Objective
+	refinement.Revision = 2
+	refinement.GenerationID = "postgres-refinement-8003"
+	refinement.GenerationUpdateID = 8003
+	refinement.Text = "Сложную строку иногда полезно сначала проговорить. Какую песню разобрать следующим постом?"
+	refinementID, err := postgres.CreateThreadDraft(ctx, refinement)
+	if err != nil {
+		t.Fatalf("current brief refinement: %v", err)
+	}
+
+	restartedPool, err := pgxpool.NewWithConfig(ctx, postgres.pool.Config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := &Postgres{pool: restartedPool}
+	reloadedBrief, briefErr := restarted.GetThreadBrief(ctx, brief.ID, ownerID)
+	reloadedDraft, draftErr := restarted.GetThreadDraft(ctx, createdDraft.ID, ownerID)
+	restarted.Close()
+	if briefErr != nil || draftErr != nil || reloadedBrief.MaterialText != material ||
+		reloadedDraft.GenerationID != draftInput.GenerationID || reloadedDraft.ScenarioID != draftInput.ScenarioID {
+		t.Fatalf("restart state brief=%+v/%v draft=%+v/%v", reloadedBrief, briefErr, reloadedDraft, draftErr)
+	}
+
+	second, created, err := postgres.StartThreadBrief(ctx, ownerID, 8004, domain.ThreadVoiceBelcanto)
+	if err != nil || !created {
+		t.Fatalf("second start = %+v, %v, %v", second, created, err)
+	}
+	staleDraft, err := postgres.GetThreadDraft(ctx, refinementID, ownerID)
+	if err != nil || staleDraft.Current {
+		t.Fatalf("previous draft stayed current: %+v, %v", staleDraft, err)
+	}
+	if err := postgres.CancelThreadBrief(ctx, second.ID, ownerID, second.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := postgres.CancelThreadBrief(ctx, second.ID, ownerID, second.Revision); err != nil {
+		t.Fatalf("replayed cancel: %v", err)
+	}
+}
+
+func TestPostgresThreadBriefMigrationUpgradesVersionThree(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	postgres := newIsolatedPostgresWithoutMigration(t, ctx, databaseURL)
+	for _, path := range []string{
+		"migrations/001_init.sql",
+		"migrations/002_licensed_thread_media.sql",
+		"migrations/003_manual_licensed_media.sql",
+	} {
+		script, err := migrationFS.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := postgres.pool.Exec(ctx, string(script)); err != nil {
+			t.Fatalf("apply %s fixture: %v", path, err)
+		}
+	}
+	if _, err := postgres.pool.Exec(ctx, `
+		INSERT INTO users (telegram_id) VALUES (73002);
+		INSERT INTO thread_drafts (
+			telegram_id, voice, goal, preview_text, provider, model, revision
+		) VALUES (
+			73002, 'belcanto', 'discussion', 'Старый version-three пост', 'legacy', 'legacy', 4
+		);`); err != nil {
+		t.Fatalf("insert version-three fixture: %v", err)
+	}
+	if err := postgres.Migrate(ctx); err != nil {
+		t.Fatalf("upgrade version 3 to version 4: %v", err)
+	}
+	if err := postgres.Migrate(ctx); err != nil {
+		t.Fatalf("rerun version-4 migration: %v", err)
+	}
+	versionFour, err := migrationFS.ReadFile("migrations/004_thread_briefs.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := postgres.pool.Exec(ctx, string(versionFour)); err != nil {
+		t.Fatalf("version-4 SQL is not idempotent: %v", err)
+	}
+	if err := postgres.Ping(ctx); err != nil {
+		t.Fatalf("version-4 schema is not ready: %v", err)
+	}
+	legacy, err := postgres.GetCurrentThreadDraft(ctx, 73002)
+	if err != nil || legacy.Objective != domain.ThreadObjectiveLegacy ||
+		legacy.ScenarioID != "legacy_unspecified" || legacy.BriefID != 0 || legacy.GenerationUpdateID != 0 {
+		t.Fatalf("legacy draft backfill = %+v, %v", legacy, err)
+	}
+	brief, created, err := postgres.StartThreadBrief(ctx, 73002, 9001, domain.ThreadVoiceBelcanto)
+	if err != nil || !created || brief.State != domain.ThreadBriefAwaitingGoal {
+		t.Fatalf("brief after upgrade = %+v, %v, %v", brief, created, err)
+	}
+}
+
 func TestPostgresManualLicensedMediaMigrationUpgradesVersionTwo(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {

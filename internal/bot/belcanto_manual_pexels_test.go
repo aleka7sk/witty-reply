@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aleka7sk/witty-reply/internal/ai"
 	"github.com/aleka7sk/witty-reply/internal/domain"
 	"github.com/aleka7sk/witty-reply/internal/photos"
 	"github.com/aleka7sk/witty-reply/internal/session"
@@ -99,8 +100,12 @@ func manualPexelsAsset(t *testing.T, id, author string, fill color.Color) photos
 
 func TestThreadTextDraftCanManuallySelectAndReplacePexelsPhoto(t *testing.T) {
 	service, telegramClient, memory, _, provider, observedStore := newBelcantoMediaService(t, &recordingImagePublisher{})
+	firstAsset := manualPexelsAsset(t, "101", "First Lens", color.RGBA{R: 30, G: 70, B: 120, A: 255})
+	// A custom/legacy source object must not be able to smuggle a model-derived
+	// person query into persistence or the next external replacement search.
+	firstAsset.Query = "anna private student portrait"
 	source := &rotatingLicensedPhotoSource{assets: []photos.Asset{
-		manualPexelsAsset(t, "101", "First Lens", color.RGBA{R: 30, G: 70, B: 120, A: 255}),
+		firstAsset,
 		manualPexelsAsset(t, "202", "Second Lens", color.RGBA{R: 130, G: 50, B: 80, A: 255}),
 	}}
 	service.threadPhotoSource = source
@@ -109,9 +114,7 @@ func TestThreadTextDraftCanManuallySelectAndReplacePexelsPhoto(t *testing.T) {
 	service.config.BelcantoReviewLogMode = "full"
 	ctx := context.Background()
 
-	if err := service.HandleUpdate(ctx, textUpdate(100, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, memory, 100)
 	messages := telegramClient.snapshotMessages()
 	selectPexels := threadButtonCallback(t, messages[0].ReplyMarkup, "📷 Подобрать фото в Pexels")
 	payload, err := service.callbacks.DecodeForUser(selectPexels, 42)
@@ -138,7 +141,8 @@ func TestThreadTextDraftCanManuallySelectAndReplacePexelsPhoto(t *testing.T) {
 		t.Fatal(err)
 	}
 	if first.MediaMode != domain.ThreadMediaImage || first.Revision != before.Revision+1 ||
-		firstMedia.SourceAssetID != "101" || firstMedia.AttachUpdateID != 101 {
+		firstMedia.SourceAssetID != "101" || firstMedia.AttachUpdateID != 101 ||
+		firstMedia.SourceQuery != ai.SafeThreadPhotoQuery(before.ScenarioID) {
 		t.Fatalf("first manual Pexels preview draft=%+v media=%+v", first, firstMedia)
 	}
 	photosSent := snapshotThreadPhotos(telegramClient)
@@ -175,7 +179,7 @@ func TestThreadTextDraftCanManuallySelectAndReplacePexelsPhoto(t *testing.T) {
 			provider.ordinaryCalls.Load(), provider.threadCalls.Load(), observedStore.consumeCalls.Load())
 	}
 	if strings.Count(logs.String(), `"event":"belcanto_threads_media_changed"`) != 2 ||
-		!strings.Contains(logs.String(), `"photo_asset_id":"202"`) {
+		!strings.Contains(logs.String(), `"photo_asset_id":"202"`) || strings.Contains(logs.String(), "anna") {
 		t.Fatalf("manual media audit = %q", logs.String())
 	}
 }
@@ -189,9 +193,7 @@ func TestManualPexelsCallbackRetryRedeliversCommittedPhotoWithoutResearch(t *tes
 	flaky := &failOnceThreadTelegram{base: telegramClient}
 	service.telegram = flaky
 	ctx := context.Background()
-	if err := service.HandleUpdate(ctx, textUpdate(200, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, memory, 200)
 	messages := telegramClient.snapshotMessages()
 	selectPexels := threadButtonCallback(t, messages[0].ReplyMarkup, "📷 Подобрать фото в Pexels")
 	payload, err := service.callbacks.DecodeForUser(selectPexels, 42)
@@ -238,9 +240,7 @@ func TestManualPexelsFailureLeavesExistingDraftUnchanged(t *testing.T) {
 	source := &rotatingLicensedPhotoSource{err: photos.ErrNotFound}
 	service.threadPhotoSource = source
 	ctx := context.Background()
-	if err := service.HandleUpdate(ctx, textUpdate(300, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, memory, 300)
 	messages := telegramClient.snapshotMessages()
 	selectPexels := threadButtonCallback(t, messages[0].ReplyMarkup, "📷 Подобрать фото в Pexels")
 	payload, err := service.callbacks.DecodeForUser(selectPexels, 42)
@@ -277,9 +277,7 @@ func TestManualPexelsChoiceSurvivesSmallTextRefinement(t *testing.T) {
 	}}
 	service.threadPhotoSource = source
 	ctx := context.Background()
-	if err := service.HandleUpdate(ctx, textUpdate(350, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, memory, 350)
 	selectPexels := threadButtonCallback(t, telegramClient.snapshotMessages()[0].ReplyMarkup, "📷 Подобрать фото в Pexels")
 	if err := service.HandleUpdate(ctx, threadCallbackUpdate(351, "select-manual-pexels", selectPexels)); err != nil {
 		t.Fatal(err)
@@ -308,9 +306,7 @@ func TestManualPexelsChoiceSurvivesSmallTextRefinement(t *testing.T) {
 func TestPexelsButtonIsHiddenAndOldSignedActionFailsClosedWhenDisabled(t *testing.T) {
 	service, telegramClient, memory, codec, _, _ := newBelcantoMediaService(t, &recordingImagePublisher{})
 	ctx := context.Background()
-	if err := service.HandleUpdate(ctx, textUpdate(400, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, memory, 400)
 	messages := telegramClient.snapshotMessages()
 	for _, row := range messages[0].ReplyMarkup.InlineKeyboard {
 		for _, button := range row {
@@ -405,9 +401,7 @@ func TestConcurrentManualPexelsReplayAuditsTheCommittedAsset(t *testing.T) {
 	service.threadPhotoSource = source
 	service.config.BelcantoReviewLogMode = "off"
 	ctx := context.Background()
-	if err := service.HandleUpdate(ctx, textUpdate(500, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, memory, 500)
 	selectPexels := threadButtonCallback(t, telegramClient.snapshotMessages()[0].ReplyMarkup, "📷 Подобрать фото в Pexels")
 	payload, err := service.callbacks.DecodeForUser(selectPexels, 42)
 	if err != nil {

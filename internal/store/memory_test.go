@@ -308,7 +308,8 @@ func TestMemoryThreadDraftLifecycleIsOwnedCurrentAndIdempotent(t *testing.T) {
 		t.Fatalf("CreateThreadDraft(): %v", err)
 	}
 	stored, err := memory.GetThreadDraft(ctx, firstID, 42)
-	if err != nil || !stored.Current || stored.State != domain.ThreadDraftReady || stored.Text != first.Text {
+	if err != nil || !stored.Current || stored.State != domain.ThreadDraftReady || stored.Text != first.Text ||
+		stored.Objective != domain.ThreadObjectiveLegacy || stored.ScenarioID != "legacy_unspecified" {
 		t.Fatalf("stored first = %+v, %v", stored, err)
 	}
 	if _, err := memory.GetThreadDraft(ctx, firstID, 99); !errors.Is(err, ErrNotFound) {
@@ -728,6 +729,191 @@ func TestMemoryCleanupRemovesOldThreadDraftsWithoutChangingGenerationCount(t *te
 	}
 	if _, err := memory.GetThreadDraft(ctx, newID, 42); err != nil {
 		t.Fatalf("fresh draft removed: %v", err)
+	}
+}
+
+func TestMemoryThreadBriefLifecycleIsDurableReplaySafeAndCreatesOneDraft(t *testing.T) {
+	ctx := context.Background()
+	memory := NewMemory()
+	now := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	memory.now = func() time.Time { return now }
+	if _, err := memory.UpsertUser(ctx, domain.User{TelegramID: 42, Language: "ru"}); err != nil {
+		t.Fatal(err)
+	}
+
+	brief, created, err := memory.StartThreadBrief(ctx, 42, 10, domain.ThreadVoiceBelcanto)
+	if err != nil || !created || brief.State != domain.ThreadBriefAwaitingGoal || brief.Revision != 1 {
+		t.Fatalf("StartThreadBrief() = %+v, %v, %v", brief, created, err)
+	}
+	replayedStart, created, err := memory.StartThreadBrief(ctx, 42, 10, domain.ThreadVoiceBelcanto)
+	if err != nil || created || replayedStart.ID != brief.ID {
+		t.Fatalf("replayed StartThreadBrief() = %+v, %v, %v", replayedStart, created, err)
+	}
+
+	brief, err = memory.SetThreadBriefObjective(ctx, brief.ID, 42, brief.Revision, domain.ThreadObjectiveReplies)
+	if err != nil || brief.State != domain.ThreadBriefAwaitingMaterial || brief.Revision != 2 {
+		t.Fatalf("SetThreadBriefObjective() = %+v, %v", brief, err)
+	}
+	// The same objective keyboard is also used by "change goal" while the
+	// brief is awaiting material.
+	brief, err = memory.SetThreadBriefObjective(ctx, brief.ID, 42, brief.Revision, domain.ThreadObjectiveTrust)
+	if err != nil || brief.Objective != domain.ThreadObjectiveTrust || brief.Revision != 3 {
+		t.Fatalf("changed objective = %+v, %v", brief, err)
+	}
+	material := "Педагог предложил сначала спокойно проговорить сложную строчку, а потом спеть её."
+	materialRevision := brief.Revision
+	brief, err = memory.SetThreadBriefMaterial(
+		ctx, brief.ID, 42, materialRevision, 11, domain.ThreadMaterialText, material,
+	)
+	if err != nil || brief.State != domain.ThreadBriefMaterialReady || brief.MaterialText != material {
+		t.Fatalf("SetThreadBriefMaterial() = %+v, %v", brief, err)
+	}
+	replayedMaterial, err := memory.SetThreadBriefMaterial(
+		ctx, brief.ID, 42, materialRevision, 11, domain.ThreadMaterialText, material,
+	)
+	if err != nil || replayedMaterial.Revision != brief.Revision {
+		t.Fatalf("replayed material = %+v, %v", replayedMaterial, err)
+	}
+
+	draftInput := testThreadDraft(42, 1, "Сложную строчку не всегда нужно сразу петь. Иногда сначала достаточно услышать, как она звучит в обычной речи.")
+	draftInput.ScenarioID = "teacher_one_move"
+	draftInput.GenerationID = "generation-11"
+	draftInput.GenerationUpdateID = 11
+	createdDraft, draftCreated, err := memory.CreateThreadDraftForBrief(ctx, brief.ID, brief.Revision, draftInput, nil)
+	if err != nil || !draftCreated || createdDraft.BriefID != brief.ID ||
+		createdDraft.Objective != domain.ThreadObjectiveTrust || createdDraft.State != domain.ThreadDraftReady {
+		t.Fatalf("CreateThreadDraftForBrief() = %+v, %v, %v", createdDraft, draftCreated, err)
+	}
+	replayedDraft, draftCreated, err := memory.CreateThreadDraftForBrief(ctx, brief.ID, brief.Revision, draftInput, nil)
+	if err != nil || draftCreated || replayedDraft.ID != createdDraft.ID {
+		t.Fatalf("replayed draft = %+v, %v, %v", replayedDraft, draftCreated, err)
+	}
+	byUpdate, err := memory.GetThreadDraftByGenerationUpdate(ctx, 42, 11)
+	if err != nil || byUpdate.ID != createdDraft.ID {
+		t.Fatalf("GetThreadDraftByGenerationUpdate() = %+v, %v", byUpdate, err)
+	}
+	storedBrief, err := memory.GetThreadBrief(ctx, brief.ID, 42)
+	if err != nil || storedBrief.State != domain.ThreadBriefDraftReady || storedBrief.Revision != brief.Revision+1 {
+		t.Fatalf("draft-ready brief = %+v, %v", storedBrief, err)
+	}
+
+	second, created, err := memory.StartThreadBrief(ctx, 42, 12, domain.ThreadVoiceBelcanto)
+	if err != nil || !created {
+		t.Fatalf("second StartThreadBrief() = %+v, %v, %v", second, created, err)
+	}
+	staleDraft, err := memory.GetThreadDraft(ctx, createdDraft.ID, 42)
+	if err != nil || staleDraft.Current {
+		t.Fatalf("new brief did not stale previous draft: %+v, %v", staleDraft, err)
+	}
+	if err := memory.CancelThreadBrief(ctx, second.ID, 42, second.Revision); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err := memory.GetThreadBrief(ctx, second.ID, 42)
+	if err != nil || cancelled.State != domain.ThreadBriefCancelled || cancelled.Current {
+		t.Fatalf("cancelled brief = %+v, %v", cancelled, err)
+	}
+	if err := memory.CancelThreadBrief(ctx, second.ID, 42, second.Revision); err != nil {
+		t.Fatalf("replayed CancelThreadBrief(): %v", err)
+	}
+}
+
+func TestMemoryThreadBriefNoMaterialAndDeletion(t *testing.T) {
+	ctx := context.Background()
+	memory := NewMemory()
+	if _, err := memory.UpsertUser(ctx, domain.User{TelegramID: 77}); err != nil {
+		t.Fatal(err)
+	}
+	brief, _, err := memory.StartThreadBrief(ctx, 77, 20, domain.ThreadVoiceBelcanto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err = memory.SetThreadBriefObjective(ctx, brief.ID, 77, brief.Revision, domain.ThreadObjectiveReach)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err = memory.SetThreadBriefMaterial(ctx, brief.ID, 77, brief.Revision, 21, domain.ThreadMaterialNone, "")
+	if err != nil || brief.MaterialKind != domain.ThreadMaterialNone || brief.MaterialUpdateID != 21 {
+		t.Fatalf("no-material brief = %+v, %v", brief, err)
+	}
+	if err := memory.DeleteUser(ctx, 77); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := memory.GetThreadBrief(ctx, brief.ID, 77); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("brief survived DeleteUser(): %v", err)
+	}
+}
+
+func TestMemoryThreadBriefFencesInitialCreationAndAllowsCurrentRefinement(t *testing.T) {
+	ctx := context.Background()
+	memory := NewMemory()
+	if _, err := memory.UpsertUser(ctx, domain.User{TelegramID: 88}); err != nil {
+		t.Fatal(err)
+	}
+	brief, _, err := memory.StartThreadBrief(ctx, 88, 30, domain.ThreadVoiceBelcanto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err = memory.SetThreadBriefObjective(ctx, brief.ID, 88, brief.Revision, domain.ThreadObjectiveCommunity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err = memory.SetThreadBriefMaterial(
+		ctx, brief.ID, 88, brief.Revision, 31, domain.ThreadMaterialText,
+		"После занятия ученики остались выбрать песню для общего караоке.",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft := testThreadDraft(88, 1, "После урока никто не спешил домой: выбирали песню, которую споют вместе.")
+	draft.BriefID = brief.ID
+	draft.Objective = brief.Objective
+	draft.ScenarioID = "community_after_class"
+	draft.GenerationID = "generation-31"
+	draft.GenerationUpdateID = 31
+	if _, err := memory.CreateThreadDraft(ctx, draft); !errors.Is(err, ErrThreadBriefState) {
+		t.Fatalf("generic initial draft bypass = %v", err)
+	}
+
+	wrongVoice := draft
+	wrongVoice.BriefID = 0
+	wrongVoice.Voice = domain.ThreadVoiceAlisher
+	if _, _, err := memory.CreateThreadDraftForBrief(ctx, brief.ID, brief.Revision, wrongVoice, nil); !errors.Is(err, ErrThreadBriefState) {
+		t.Fatalf("cross-voice brief draft = %v", err)
+	}
+	draft.BriefID = 0
+	draft.MediaMode = domain.ThreadMediaImage
+	mediaValue := testPexelsThreadMedia(88)
+	created, wasCreated, err := memory.CreateThreadDraftForBrief(
+		ctx, brief.ID, brief.Revision, draft, &mediaValue,
+	)
+	if err != nil || !wasCreated || created.MediaID <= 0 {
+		t.Fatalf("initial draft with media = %+v, %v, %v", created, wasCreated, err)
+	}
+
+	refinement := draft
+	refinement.BriefID = brief.ID
+	refinement.Revision = 2
+	refinement.MediaMode = domain.ThreadMediaText
+	refinement.MediaID = 0
+	refinement.GenerationID = "generation-32"
+	refinement.GenerationUpdateID = 32
+	refinement.Text = "После урока ученики остались выбрать одну песню для общего караоке. Какую выбрали бы вы?"
+	refinementID, err := memory.CreateThreadDraft(ctx, refinement)
+	if err != nil {
+		t.Fatalf("current draft refinement: %v", err)
+	}
+	if refined, err := memory.GetThreadDraft(ctx, refinementID, 88); err != nil || refined.BriefID != brief.ID {
+		t.Fatalf("stored refinement = %+v, %v", refined, err)
+	}
+
+	if _, _, err := memory.StartThreadBrief(ctx, 88, 33, domain.ThreadVoiceBelcanto); err != nil {
+		t.Fatal(err)
+	}
+	refinement.Revision = 3
+	refinement.GenerationID = "generation-34"
+	refinement.GenerationUpdateID = 34
+	if _, err := memory.CreateThreadDraft(ctx, refinement); !errors.Is(err, ErrThreadBriefState) {
+		t.Fatalf("stale brief refinement = %v", err)
 	}
 }
 

@@ -46,9 +46,7 @@ func TestThreadsDisabledPublisherKeepsApprovedPreviewReady(t *testing.T) {
 		t, "Готовый пост при отключённой публикации.", threadspub.NewDisabled(),
 	)
 	ctx := context.Background()
-	if err := service.HandleUpdate(ctx, textUpdate(10, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, memory, 10)
 	messages := telegramClient.snapshotMessages()
 	callbackData := threadPublishCallback(t, messages)
 	payload, err := codec.DecodeForUser(callbackData, 42)
@@ -73,14 +71,12 @@ func TestThreadsDisabledPublisherKeepsApprovedPreviewReady(t *testing.T) {
 
 func TestThreadsOldRevisionCannotReachMetaAfterRefinement(t *testing.T) {
 	publisher := &recordingThreadPublisher{}
-	service, telegramClient, _, _ := newThreadService(t, "Первый готовый пост.", publisher)
+	service, telegramClient, memory, _ := newThreadService(t, "Первый готовый пост.", publisher)
 	ctx := context.Background()
-	if err := service.HandleUpdate(ctx, textUpdate(20, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, memory, 20)
 	messages := telegramClient.snapshotMessages()
 	oldPublish := threadPublishCallback(t, messages)
-	refine := threadButtonCallback(t, messages[0].ReplyMarkup, "🔄 Другой пост")
+	refine := threadButtonCallback(t, messages[0].ReplyMarkup, "🔄 Другой сценарий")
 	if err := service.HandleUpdate(ctx, threadCallbackUpdate(21, "refine", refine)); err != nil {
 		t.Fatal(err)
 	}

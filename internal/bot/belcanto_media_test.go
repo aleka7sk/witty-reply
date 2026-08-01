@@ -41,9 +41,9 @@ func (p *mediaRouteProvider) Generate(ctx context.Context, request domain.Genera
 	return ai.NewFake().Generate(ctx, request)
 }
 
-func (p *mediaRouteProvider) GenerateThreadPost(context.Context, ai.ThreadPostRequest) (ai.ThreadPostResult, error) {
+func (p *mediaRouteProvider) GenerateThreadPost(_ context.Context, request ai.ThreadPostRequest) (ai.ThreadPostResult, error) {
 	p.threadCalls.Add(1)
-	return validTestThreadResult(p.threadText, "media-test", "media-test"), nil
+	return validTestThreadResultForRequest(request, p.threadText, "media-test", "media-test"), nil
 }
 
 type quotaObservingStore struct {
@@ -268,9 +268,7 @@ func preparePendingThreadImage(
 ) (initialPublish string, pending domain.ThreadDraft) {
 	t.Helper()
 	ctx := context.Background()
-	if err := service.HandleUpdate(ctx, textUpdate(commandUpdateID, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, service.store, commandUpdateID)
 	messages := telegramClient.snapshotMessages()
 	if len(messages) != 1 {
 		t.Fatalf("Threads text preview messages = %+v", messages)
@@ -315,9 +313,7 @@ func TestThreadTextPreviewOffersSignedImageChoiceAndPersistsPendingState(t *test
 	service, telegramClient, memory, codec, _, observedStore := newBelcantoMediaService(t, &recordingImagePublisher{})
 	ctx := context.Background()
 
-	if err := service.HandleUpdate(ctx, textUpdate(1, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, service.store, 1)
 	messages := telegramClient.snapshotMessages()
 	if len(messages) != 1 || !strings.Contains(messages[0].Text, "Формат: 📝 только текст") {
 		t.Fatalf("text preview = %+v", messages)
@@ -802,9 +798,7 @@ func TestThreadMediaModeCallbackRetryRedeliversCommittedTransition(t *testing.T)
 		flaky := &failOnceThreadTelegram{base: telegramClient}
 		service.telegram = flaky
 		ctx := context.Background()
-		if err := service.HandleUpdate(ctx, textUpdate(80, "/threads")); err != nil {
-			t.Fatal(err)
-		}
+		generateThreadDraftForTest(t, service, service.store, 80)
 		messages := telegramClient.snapshotMessages()
 		useImage := threadButtonCallback(t, messages[0].ReplyMarkup, "🖼 Загрузить своё фото")
 		payload, err := service.callbacks.DecodeForUser(useImage, 42)

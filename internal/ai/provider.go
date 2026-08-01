@@ -78,6 +78,22 @@ type ProviderError struct {
 func invalidOutputCode(err error) string {
 	message := strings.ToLower(fmt.Sprint(err))
 	switch {
+	case strings.Contains(message, "threads concepts") || strings.Contains(message, "threads concept"):
+		return "invalid_output_thread_concepts"
+	case strings.Contains(message, "threads evidence") || strings.Contains(message, "exact approved evidence"):
+		return "invalid_output_thread_evidence"
+	case strings.Contains(message, "digit absent from evidence"):
+		return "invalid_output_thread_ungrounded_digit"
+	case strings.Contains(message, "quotation absent from evidence") || strings.Contains(message, "unmatched quotation"):
+		return "invalid_output_thread_ungrounded_quote"
+	case strings.Contains(message, "at least four mechanisms") || strings.Contains(message, "duplicate threads finalist scenario"):
+		return "invalid_output_thread_diversity"
+	case strings.Contains(message, "at least two material-backed"):
+		return "invalid_output_thread_material_quota"
+	case strings.Contains(message, "objective anchor"):
+		return "invalid_output_thread_objective_anchor"
+	case strings.Contains(message, "no publishable fact-safe finalist") || strings.Contains(message, "grounded threads review"):
+		return "invalid_output_thread_grounding_review"
 	case strings.Contains(message, "threads text contains forbidden current-anecdote narrative"):
 		return "invalid_output_thread_current_anecdote"
 	case strings.Contains(message, "threads text contains forbidden organization-experience narrative"):

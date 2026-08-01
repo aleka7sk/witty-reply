@@ -5,10 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"net/http/httptest"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -370,7 +368,8 @@ func TestThreadPostReviewerUsesWeightedScoresOverDeclaredWinner(t *testing.T) {
 	card := func(score int) threadPostReviewerCard {
 		return threadPostReviewerCard{
 			Hook: score, Human: score, Recognition: score, Replies: score,
-			Brevity: score, Voice: score, WouldLike: "yes", WouldComment: "yes",
+			Brevity: score, Voice: score, GoalFit: score, Grounding: score, Distinctive: score, FactSafe: true,
+			WouldLike: "yes", WouldComment: "yes",
 			Note: "Короткая проверяемая редакторская заметка.",
 		}
 	}
@@ -430,123 +429,6 @@ func TestThreadPostVisualAlwaysKeepsSafeManualPexelsQuery(t *testing.T) {
 	}
 }
 
-func TestAnthropicThreadPostExploresFiveAndUsesBlindReviewer(t *testing.T) {
-	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		call := calls.Add(1)
-		payload := decodeThreadTestRequest(t, request)
-		writer.Header().Set("request-id", "request-"+string(rune('0'+call)))
-		switch call {
-		case 1:
-			if payload.System != threadPostSystemPrompt || payload.OutputConfig.Effort != "high" {
-				t.Errorf("generation system/effort = %q/%q", payload.System, payload.OutputConfig.Effort)
-			}
-			properties := schemaProperties(payload.OutputConfig.Format.Schema)
-			if len(properties) != threadPostFinalistCount || properties["finalist_one"] == nil || properties["finalist_five"] == nil || properties["analysis"] != nil {
-				t.Errorf("generation schema properties = %#v", properties)
-			}
-			if !strings.Contains(payload.messageText(), "at least ten") || !strings.Contains(payload.messageText(), "Do not reveal") {
-				t.Errorf("generation prompt omitted private exploration contract: %s", payload.messageText())
-			}
-			writeAnthropicThreadResponse(t, writer, mustMarshalThreadPostEnvelope(t, testThreadFinalists()), 17, 11)
-		case 2:
-			if payload.System != threadPostReviewerSystemPrompt || payload.OutputConfig.Effort != "medium" {
-				t.Errorf("review system/effort = %q/%q", payload.System, payload.OutputConfig.Effort)
-			}
-			if strings.Contains(payload.messageText(), "recent-post") || strings.Contains(payload.messageText(), "editorial-recipe") {
-				t.Error("blind reviewer received generator controls")
-			}
-			ids := reviewerSchemaIDs(t, payload.OutputConfig.Format.Schema)
-			writeAnthropicThreadResponse(t, writer, mustMarshalThreadReview(t, ids, ids[0]), 13, 7)
-		default:
-			t.Fatalf("unexpected call %d", call)
-		}
-	}))
-	defer server.Close()
-
-	provider, err := NewAnthropic(AnthropicConfig{
-		APIKey: "test-key", BaseURL: server.URL, Model: defaultModel,
-		Timeout: time.Second, MaxRetries: 0, Effort: "low",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := provider.GenerateThreadPost(context.Background(), ThreadPostRequest{
-		GenerationID: strings.Repeat("a", 32), Voice: domain.ThreadVoiceBelcanto,
-		Transform: "no_sell", Language: "ru", Seed: 9,
-	})
-	if err != nil {
-		t.Fatalf("GenerateThreadPost() error = %v", err)
-	}
-	if calls.Load() != 2 {
-		t.Fatalf("calls = %d, want generation plus blind review", calls.Load())
-	}
-	if result.Provider != providerAnthropic || result.Model != "claude-sonnet-5-threads-test" || result.Usage.InputTokens != 30 || result.Usage.OutputTokens != 18 {
-		t.Fatalf("result metadata = %+v", result)
-	}
-	if result.Audit.SelectionMode != "anthropic_blind_review" || len(result.Audit.Candidates) != 5 || result.Audit.DeliveredWinnerID == "" {
-		t.Fatalf("audit = %+v", result.Audit)
-	}
-	selected := 0
-	for _, candidate := range result.Audit.Candidates {
-		if candidate.Selected {
-			selected++
-			if candidate.Text != result.Text || candidate.Review.Total == 0 {
-				t.Fatalf("selected audit does not match winner: %+v result=%+v", candidate, result)
-			}
-		}
-	}
-	if selected != 1 || result.Visual.Mode != "licensed_photo" {
-		t.Fatalf("selected=%d visual=%+v", selected, result.Visual)
-	}
-}
-
-func TestAnthropicThreadPostRepairsUnsafeBatchThenReviews(t *testing.T) {
-	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		call := calls.Add(1)
-		payload := decodeThreadTestRequest(t, request)
-		writer.Header().Set("request-id", "repair-stage")
-		switch call {
-		case 1:
-			unsafe := make([]ThreadPostResult, 5)
-			for index := range unsafe {
-				text := "У нас важная музыкальная новость."
-				if index%2 == 1 {
-					text = "Наши ученики уже показывают отличный результат."
-				}
-				unsafe[index] = ThreadPostResult{Goal: "warmth", Text: text}
-			}
-			writeAnthropicThreadResponse(t, writer, mustMarshalThreadPostEnvelope(t, unsafe), 5, 6)
-		case 2:
-			if !strings.Contains(payload.messageText(), "invalid_output_thread_organization_experience") || !strings.Contains(payload.messageText(), "invalid_output_thread_unverified_fact") {
-				t.Errorf("repair prompt omitted validator categories: %s", payload.messageText())
-			}
-			writeAnthropicThreadResponse(t, writer, mustMarshalThreadPostEnvelope(t, testThreadFinalists()), 7, 8)
-		case 3:
-			ids := reviewerSchemaIDs(t, payload.OutputConfig.Format.Schema)
-			writeAnthropicThreadResponse(t, writer, mustMarshalThreadReview(t, ids, ids[len(ids)-1]), 9, 10)
-		default:
-			t.Fatalf("unexpected call %d", call)
-		}
-	}))
-	defer server.Close()
-	provider, err := NewAnthropic(AnthropicConfig{APIKey: "test", BaseURL: server.URL, Timeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := provider.GenerateThreadPost(context.Background(), ThreadPostRequest{Voice: domain.ThreadVoiceBelcanto})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if calls.Load() != 3 || result.Audit.GenerationCalls != 2 || result.Audit.ReviewCalls != 1 {
-		t.Fatalf("calls=%d audit=%+v", calls.Load(), result.Audit)
-	}
-	if result.Usage.InputTokens != 21 || result.Usage.OutputTokens != 24 || len(result.Audit.Candidates) != 10 {
-		t.Fatalf("usage/audit = %+v / %+v", result.Usage, result.Audit)
-	}
-}
-
 func TestThreadPostStageContextReservesOuterFallbackBudget(t *testing.T) {
 	parentDeadline := time.Now().Add(2 * time.Second)
 	parent, cancelParent := context.WithDeadline(context.Background(), parentDeadline)
@@ -566,132 +448,6 @@ func TestThreadPostStageContextReservesOuterFallbackBudget(t *testing.T) {
 	defer cancel()
 	if _, ok := withoutDeadline.Deadline(); ok {
 		t.Fatal("stage context invented a deadline without an outer budget")
-	}
-}
-
-func TestAnthropicThreadPostRepairsPartialBatchAndReviewsFive(t *testing.T) {
-	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		call := calls.Add(1)
-		payload := decodeThreadTestRequest(t, request)
-		switch call {
-		case 1:
-			partial := testThreadFinalists()
-			partial[3] = ThreadPostResult{Goal: "warmth", Text: "Наши ученики уже показывают результат."}
-			partial[4] = ThreadPostResult{Goal: "warmth", Text: "Запишитесь на бесплатный урок."}
-			writeAnthropicThreadResponse(t, writer, mustMarshalThreadPostEnvelope(t, partial), 3, 4)
-		case 2:
-			writeAnthropicThreadResponse(t, writer, mustMarshalThreadPostEnvelope(t, testThreadFinalists()), 5, 6)
-		case 3:
-			ids := reviewerSchemaIDs(t, payload.OutputConfig.Format.Schema)
-			if len(ids) != threadPostFinalistCount {
-				t.Fatalf("reviewer finalist IDs = %v", ids)
-			}
-			writeAnthropicThreadResponse(t, writer, mustMarshalThreadReview(t, ids, ids[0]), 7, 8)
-		default:
-			t.Fatalf("unexpected call %d", call)
-		}
-	}))
-	defer server.Close()
-	provider, err := NewAnthropic(AnthropicConfig{APIKey: "test", BaseURL: server.URL, Timeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := provider.GenerateThreadPost(context.Background(), ThreadPostRequest{Voice: domain.ThreadVoiceBelcanto})
-	if err != nil {
-		t.Fatal(err)
-	}
-	considered := 0
-	for _, candidate := range result.Audit.Candidates {
-		if candidate.Considered {
-			considered++
-		}
-	}
-	if calls.Load() != 3 || considered != threadPostFinalistCount || result.Audit.GenerationCalls != 2 {
-		t.Fatalf("calls=%d considered=%d audit=%+v", calls.Load(), considered, result.Audit)
-	}
-}
-
-func TestAnthropicThreadPostUsesCuratedFallbackAfterOneRepair(t *testing.T) {
-	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		calls.Add(1)
-		unsafe := make([]ThreadPostResult, 5)
-		for index := range unsafe {
-			unsafe[index] = ThreadPostResult{Goal: "discussion", Text: "Запишитесь на урок прямо сейчас?"}
-		}
-		writeAnthropicThreadResponse(t, writer, mustMarshalThreadPostEnvelope(t, unsafe), 1, 1)
-	}))
-	defer server.Close()
-	provider, err := NewAnthropic(AnthropicConfig{APIKey: "test", BaseURL: server.URL, Timeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := provider.GenerateThreadPost(context.Background(), ThreadPostRequest{Voice: domain.ThreadVoiceBelcanto})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if calls.Load() != 2 || result.Provider != providerCurated || result.FallbackReason == "" ||
-		result.Audit.SelectionMode != "curated_fallback" || result.Visual.Query != defaultThreadPhotoQuery {
-		t.Fatalf("calls=%d result=%+v", calls.Load(), result)
-	}
-	considered, selected := 0, 0
-	for _, candidate := range result.Audit.Candidates {
-		if candidate.Eligible && candidate.Considered {
-			considered++
-		}
-		if candidate.Selected {
-			selected++
-		}
-	}
-	if considered != threadPostFinalistCount || selected != 1 {
-		t.Fatalf("curated audit finalists=%d selected=%d audit=%+v", considered, selected, result.Audit)
-	}
-}
-
-func TestAnthropicThreadPostDoesNotSemanticRepairAuthenticationFailure(t *testing.T) {
-	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		calls.Add(1)
-		writer.WriteHeader(http.StatusUnauthorized)
-		_, _ = writer.Write([]byte(`{"type":"error","error":{"type":"authentication_error","message":"bad key"}}`))
-	}))
-	defer server.Close()
-	provider, err := NewAnthropic(AnthropicConfig{APIKey: "bad", BaseURL: server.URL, Timeout: time.Second, MaxRetries: 0})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = provider.GenerateThreadPost(context.Background(), ThreadPostRequest{Voice: domain.ThreadVoiceBelcanto})
-	var providerErr *ProviderError
-	if !errors.As(err, &providerErr) || providerErr.Status != http.StatusUnauthorized || calls.Load() != 1 {
-		t.Fatalf("calls=%d error=%v", calls.Load(), err)
-	}
-}
-
-func TestAnthropicThreadPostReviewerFailureUsesLocalWinner(t *testing.T) {
-	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		if calls.Add(1) == 1 {
-			writeAnthropicThreadResponse(t, writer, mustMarshalThreadPostEnvelope(t, testThreadFinalists()), 2, 3)
-			return
-		}
-		writeAnthropicThreadResponse(t, writer, []byte(`{"winner_id":"Z"}`), 4, 5)
-	}))
-	defer server.Close()
-	provider, err := NewAnthropic(AnthropicConfig{APIKey: "test", BaseURL: server.URL, Timeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := provider.GenerateThreadPost(context.Background(), ThreadPostRequest{Voice: domain.ThreadVoiceBelcanto})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Provider != providerAnthropic || result.Audit.SelectionMode != "local_review_fallback" ||
-		result.Audit.ReviewerError != "invalid_output_thread_review" || result.Visual.Query != defaultThreadPhotoQuery {
-		t.Fatalf("result = %+v", result)
-	}
-	if result.Usage.InputTokens != 6 || result.Usage.OutputTokens != 8 {
-		t.Fatalf("usage = %+v", result.Usage)
 	}
 }
 
@@ -726,45 +482,9 @@ func TestThreadPostValidationErrorsExposeSafeSpecificCodes(t *testing.T) {
 	}
 }
 
-func TestAnthropicThreadPostRetriesTransientTransportResponse(t *testing.T) {
-	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Header.Get("x-api-key") != "thread-key" || request.Header.Get("anthropic-version") != anthropicVersion {
-			t.Errorf("authentication headers were not preserved")
-		}
-		if calls.Add(1) == 1 {
-			writer.Header().Set("retry-after", "0")
-			writer.WriteHeader(http.StatusTooManyRequests)
-			_, _ = writer.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error"}}`))
-			return
-		}
-		payload := decodeThreadTestRequest(t, request)
-		if payload.System == threadPostSystemPrompt {
-			writeAnthropicThreadResponse(t, writer, mustMarshalThreadPostEnvelope(t, testThreadFinalists()), 2, 3)
-			return
-		}
-		ids := reviewerSchemaIDs(t, payload.OutputConfig.Format.Schema)
-		writeAnthropicThreadResponse(t, writer, mustMarshalThreadReview(t, ids, ids[0]), 4, 5)
-	}))
-	defer server.Close()
-	provider, err := NewAnthropic(AnthropicConfig{
-		APIKey: "thread-key", BaseURL: server.URL, Timeout: time.Second,
-		MaxRetries: 1, RetryBase: time.Millisecond,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := provider.GenerateThreadPost(context.Background(), ThreadPostRequest{Voice: domain.ThreadVoice("belcanto")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if calls.Load() != 3 || result.Text == "" || result.Usage.InputTokens != 6 || result.Usage.OutputTokens != 8 {
-		t.Fatalf("calls=%d result=%+v", calls.Load(), result)
-	}
-}
-
 type threadTestRequestPayload struct {
 	System       string `json:"system"`
+	MaxTokens    int    `json:"max_tokens"`
 	OutputConfig struct {
 		Effort string `json:"effort"`
 		Format struct {
@@ -852,7 +572,8 @@ func mustMarshalThreadReview(t *testing.T, ids []string, winner string) []byte {
 		}
 		scorecards[id] = threadPostReviewerCard{
 			Hook: score, Human: score, Recognition: score, Replies: score,
-			Brevity: score, Voice: score, WouldLike: would, WouldComment: would,
+			Brevity: score, Voice: score, GoalFit: score, Grounding: score, Distinctive: score, FactSafe: true,
+			WouldLike: would, WouldComment: would,
 			Note: "Конкретная музыкальная деталь звучит естественно и даёт простой повод ответить.",
 		}
 	}

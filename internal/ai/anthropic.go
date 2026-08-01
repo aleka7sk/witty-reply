@@ -24,27 +24,31 @@ const anthropicVersion = "2023-06-01"
 // deliberately absent: structured output plus low effort is the stable product
 // contract, and the current API does not need sampling controls for this task.
 type AnthropicConfig struct {
-	APIKey     string
-	BaseURL    string
-	Model      string
-	Effort     string
-	MaxTokens  int
-	Timeout    time.Duration
-	MaxRetries int
-	RetryBase  time.Duration
-	HTTPClient *http.Client
+	APIKey          string
+	BaseURL         string
+	Model           string
+	Effort          string
+	MaxTokens       int
+	ThreadMaxTokens int
+	Timeout         time.Duration
+	ThreadTimeout   time.Duration
+	MaxRetries      int
+	RetryBase       time.Duration
+	HTTPClient      *http.Client
 }
 
 type AnthropicProvider struct {
-	apiKey     string
-	endpoint   string
-	model      string
-	effort     string
-	maxTokens  int
-	timeout    time.Duration
-	maxRetries int
-	retryBase  time.Duration
-	client     *http.Client
+	apiKey          string
+	endpoint        string
+	model           string
+	effort          string
+	maxTokens       int
+	threadMaxTokens int
+	timeout         time.Duration
+	threadTimeout   time.Duration
+	maxRetries      int
+	retryBase       time.Duration
+	client          *http.Client
 }
 
 func NewAnthropic(config AnthropicConfig) (*AnthropicProvider, error) {
@@ -82,11 +86,23 @@ func NewAnthropic(config AnthropicConfig) (*AnthropicProvider, error) {
 	if config.MaxTokens < 256 || config.MaxTokens > 64_000 {
 		return nil, fmt.Errorf("%w: max tokens must be between 256 and 64000", ErrConfiguration)
 	}
+	if config.ThreadMaxTokens == 0 {
+		config.ThreadMaxTokens = 8_192
+	}
+	if config.ThreadMaxTokens < 256 || config.ThreadMaxTokens > 64_000 {
+		return nil, fmt.Errorf("%w: Threads max tokens must be between 256 and 64000", ErrConfiguration)
+	}
 	if config.Timeout == 0 {
 		config.Timeout = 45 * time.Second
 	}
 	if config.Timeout < time.Second {
 		return nil, fmt.Errorf("%w: timeout must be at least one second", ErrConfiguration)
+	}
+	if config.ThreadTimeout == 0 {
+		config.ThreadTimeout = config.Timeout
+	}
+	if config.ThreadTimeout < time.Second {
+		return nil, fmt.Errorf("%w: Threads timeout must be at least one second", ErrConfiguration)
 	}
 	if config.MaxRetries < 0 || config.MaxRetries > 5 {
 		return nil, fmt.Errorf("%w: max retries must be between 0 and 5", ErrConfiguration)
@@ -109,15 +125,17 @@ func NewAnthropic(config AnthropicConfig) (*AnthropicProvider, error) {
 	}
 
 	return &AnthropicProvider{
-		apiKey:     config.APIKey,
-		endpoint:   strings.TrimRight(baseURL, "/") + "/v1/messages",
-		model:      config.Model,
-		effort:     config.Effort,
-		maxTokens:  config.MaxTokens,
-		timeout:    config.Timeout,
-		maxRetries: config.MaxRetries,
-		retryBase:  config.RetryBase,
-		client:     client,
+		apiKey:          config.APIKey,
+		endpoint:        strings.TrimRight(baseURL, "/") + "/v1/messages",
+		model:           config.Model,
+		effort:          config.Effort,
+		maxTokens:       config.MaxTokens,
+		threadMaxTokens: config.ThreadMaxTokens,
+		timeout:         config.Timeout,
+		threadTimeout:   config.ThreadTimeout,
+		maxRetries:      config.MaxRetries,
+		retryBase:       config.RetryBase,
+		client:          client,
 	}, nil
 }
 

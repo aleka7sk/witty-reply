@@ -12,12 +12,14 @@ flowchart TD
     MODE --> AI["Classify + generate"]
     B --> STT["Speech adapter"]
     B --> MEME["Meme renderer"]
-    B --> EDIT["Belcanto editor"]
+    B --> TB["Durable Threads brief"]
+    TB --> EDIT["Belcanto editor"]
     EDIT --> TD["Durable Threads draft"]
     TD --> TH["Threads API"]
     Q --> PG["PostgreSQL"]
     QI --> PG
     AI --> C["Anthropic API / Claude CLI"]
+    EDIT --> C
 ```
 
 ## Boundaries
@@ -26,10 +28,10 @@ flowchart TD
 - `internal/bot` owns commands, consent, auto/explicit scenario transitions, quota selection, generation, and callbacks.
 - `internal/telegram` owns Bot API transport and Telegram-specific JSON types.
 - `internal/ai` exposes one provider interface with Anthropic API, Claude CLI, and deterministic fake implementations. One structured call resolves `reply`/`comment`, reports high/low confidence, drafts three candidates, and—in comment mode—performs an internal multi-angle ranking pass.
-- `internal/ai` also exposes a separate optional `ThreadPostGenerator`. Its system prompt, JSON schema, immutable fact boundary, validation, and repair retry are independent from reply/comment generation.
+- `internal/ai` also exposes a separate optional `ThreadPostGenerator`. It normalizes the selected objective and optional material, plans twelve scenario slots, calls a structured concept planner, calls a portfolio writer for five scenario-distinct finalists, and finally calls an objective-aware blind reviewer. Its schemas, grounding boundary, validation, and repair/fallback policy are independent from reply/comment generation.
 - `internal/threads` owns the official Meta two-step text/image publication transport, disabled/fake modes, bounded responses, sanitized errors, and ambiguity classification. Access tokens never enter AI prompts, persistence, or logs.
 - `internal/threadmedia` exposes only normalized owned JPEGs through short-lived signed HTTPS capability URLs so Meta never receives a Telegram file URL or bot token.
-- `internal/store` owns durable metadata and opaque encrypted inbox payloads. It never receives plaintext source text, screenshots, voice bytes, or transcripts.
+- `internal/store` owns durable metadata and opaque encrypted inbox payloads. Ordinary private reply/comment source text, screenshots, voice bytes, and transcripts never enter its domain records. The explicit Belcanto operator workflow is a narrower exception: its bounded text material and fixed objective are stored in an owned, retention-limited `ThreadBrief` so goal/material collection is restart-safe and idempotent.
 - `internal/session` keeps private source context in memory with a short TTL and last-write-wins cancellation.
 - `internal/safety` provides an explicit deterministic moderation/filter stage before delivery. It normalizes common Unicode evasions and blocks high-confidence RU/KK/EN threats, doxxing, blackmail, self-harm encouragement, and hate/degradation.
 - `internal/meme` renders an original branded card; it does not scrape internet memes.
@@ -51,7 +53,17 @@ flowchart TD
 11. Telegram receives scenario-specific native copy/refinement buttons and signed mode/feedback callbacks. A refinement includes the original source and previous three candidates. If Telegram accepts the response but job completion is not recorded, a retry can produce a duplicate response; the system does not claim exactly-once outbound delivery.
 12. Session source data expires automatically. Durable generated data is removed by the hourly retention cleanup job.
 
-The Belcanto path is separate: an allowlisted operator sends `/threads`; the post generator chooses an evergreen premise; last-mile fact and safety checks run; and PostgreSQL stores exactly the WYSIWYG preview as the only current draft for that operator. The editor persists an anonymous object-or-space Pexels query even when it recommends text-only, so the operator may deliberately attach or replace a licensed suggestion without regenerating the post. Pexels bytes and attribution are validated and normalized before one owner/revision-scoped transaction swaps the media; the previous image survives every failed search and is deleted only after a successful replacement. A callback-operation tombstone makes post-commit Telegram retries reuse the exact asset and prevents moving a delayed selection to another draft. The operator can alternatively request one real photo; that Telegram update is processed in strict order, resized/re-encoded without EXIF, stored owner-scoped, and returned as the exact photo-plus-caption preview. Format changes and attachments advance the durable revision. A signed publish callback atomically claims that revision with a short fenced lease before the first Meta call, stores the returned text/image container ID, waits for a ready status, and durably marks the irreversible phase immediately before `threads_publish`. Image containers use a one-hour signed media URL; text containers require no public media origin. A crash before the marker is safely recoverable with the known container; a crash or ambiguous result after it can only be reconciled from a later `PUBLISHED` status and is otherwise terminal `unknown`. Older revisions, stale workers, duplicate taps, queue redelivery, and restarts cannot publish the draft twice.
+The Belcanto path is separate and durable:
+
+1. An allowlisted, consented operator sends `/threads`. PostgreSQL idempotently creates or reloads an owned brief in `awaiting_goal`.
+2. A signed callback stores one fixed objective: `reach`, `replies`, `trust`, `trial`, or `community`, then advances the brief to `awaiting_material`.
+3. The next bounded text message becomes quoted evidence with kind `text`; for `reach`, `replies`, `trust`, and `community`, `✨ Без материала дня` records kind `none`. `trial` rejects that action before any AI call and remains `awaiting_material`, because conversion details cannot be invented. Duplicate Telegram updates resolve to the same brief through start/material update IDs. A valid material choice advances the brief to `material_ready` and survives a process restart.
+4. The AI concept stage evaluates a deterministic twelve-slot scenario plan against the objective and evidence. A material-backed plan reserves at least four evidence-dependent slots. The writer stage produces five unique scenario IDs spanning at least four mechanisms and, when material exists, at least two evidence-backed finalists. Objective-specific scenario anchors prevent a formally diverse but strategically irrelevant portfolio. The blind-review stage applies objective-conditioned weights and grounding checks; with material, it must choose an evidence-backed winner. Material-backed review failure is fail-closed, so a weak local score may not silently replace evidence-aware review.
+5. Local schema, evidence, fact, language, diversity, repetition, editorial, and last-mile safety gates run. One transaction commits the winning scenario metadata and exact WYSIWYG preview, advances the brief to `draft_ready`, and makes that draft current. A retry returns the already committed draft rather than spending tokens or creating another preview.
+6. The editor may recommend a visual mode, but the application discards every model-written search query and derives a fixed object-or-space Pexels query from the validated scenario ID. It persists that application-derived fallback even when the recommendation is text-only, and derives it again for manual search, so operator material and generated prose never become Pexels input. Pexels bytes and attribution are validated and normalized before one owner/revision-scoped transaction swaps media; a failed search leaves the previous preview authoritative. The operator can alternatively upload one verified Belcanto photo, which is resized and re-encoded without EXIF and never enters an AI prompt.
+7. Format changes, attachments, and text refinements advance the durable draft revision and make previous signed keyboards stale. A signed publish callback atomically claims the exact revision with a fenced lease, stores the returned Threads container ID, waits for readiness, and marks the irreversible phase immediately before `threads_publish`. Image containers use a short-lived signed media URL; text containers require no public media origin. A crash before the marker is recoverable; an ambiguous result after it can only be reconciled from a later `PUBLISHED` status and otherwise becomes terminal `unknown`.
+
+Brief material, drafts, and media are owner-scoped and removed by `/delete_me` or normal content-retention cleanup. Raw operator material is never written to logs or metrics.
 
 ## Delivery modes
 
@@ -65,14 +77,16 @@ Polling is the default local mode and permits one bot instance. Webhook is the p
 - Outbound acknowledgement ambiguity: a reply accepted by Telegram immediately before a worker crash may be sent again when the job is retried.
 - New input during generation: previous job is cancelled/obsolete and may not send a late result.
 - Provider timeout or malformed output: controlled user-facing retry message; raw provider output is never exposed.
+- Threads concept/writer failure: a no-material workflow may use only a scenario-compatible validated fallback; material-backed generation never fabricates a replacement story from an unavailable stage.
+- Threads reviewer failure with material: generation fails closed so a local stylistic score cannot certify factual grounding. The durable brief remains available for an explicit retry.
 - Threads provider disabled: draft generation remains available, while confirmation makes zero Meta calls and explains how to connect the deployment. Selecting `meta` with incomplete credentials fails startup.
 - Definite Threads failure: the draft becomes retryable and keeps any known container ID. An expired pre-publish lease is recoverable; an expired or ambiguous post-attempt lease becomes `unknown`. Only a later `PUBLISHED` container status can reconcile it automatically; the service never repeats an unproven publish call.
 - Low-confidence scenario: no uncertain candidate is exposed; the signed choice callback reuses the same source and original input quota.
 - Wrong automatic scenario: the first signed correction is free, reuses the same source digest, and disables further free switches for that interaction.
 - Database unavailable: readiness fails and generation does not start.
 - Meme font/render failure: text candidates remain available.
-- Restart/session expiry: durable queue, generations, and user settings survive; raw refinement/mode-switch sessions intentionally do not, so the user is asked to resend the source.
+- Restart/session expiry: durable queue, generations, user settings, and the Belcanto goal/material brief survive. Ordinary raw refinement/mode-switch sessions intentionally do not, so an ordinary user is asked to resend that source.
 
 ## Scaling path
 
-The durable inbox supports multiple workers and crash recovery inside one application process. The refinement session is process-local, while any replica can claim a job from the shared inbox, so HTTP sticky routing alone cannot preserve callbacks across replicas. Run exactly one application replica until shared encrypted sessions or consistent per-user worker ownership exists. The v2 deployment remains intentionally single-region; Kafka, Kubernetes, and microservices add no value at the current validation stage.
+The durable inbox and Belcanto brief support worker crash recovery. The ordinary reply/comment refinement session remains process-local, while any replica can claim a job from the shared inbox, so HTTP sticky routing alone cannot preserve those callbacks across replicas. Run exactly one application replica until shared encrypted sessions or consistent per-user worker ownership exists. The v2 deployment remains intentionally single-region; Kafka, Kubernetes, and microservices add no value at the current validation stage.

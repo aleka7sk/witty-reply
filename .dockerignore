@@ -1,6 +1,7 @@
 .git
 .github
 .env
+/witty-reply
 bin
 coverage.out
 *.log

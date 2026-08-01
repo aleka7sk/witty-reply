@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/aleka7sk/witty-reply/internal/ai"
 	"github.com/aleka7sk/witty-reply/internal/domain"
@@ -40,7 +42,7 @@ var (
 	errThreadMediaDeliveryUnavailable = errors.New("threads media delivery is unavailable")
 )
 
-func (b *Service) handleBelcantoCommand(ctx context.Context, chatID int64, user domain.User, lang language) error {
+func (b *Service) handleBelcantoCommand(ctx context.Context, updateID, chatID int64, user domain.User, lang language) error {
 	if !b.isBelcantoOperator(user.TelegramID) {
 		b.metrics.Inc("belcanto_access_denied")
 		return b.sendText(ctx, chatID, belcantoOwnerOnlyText(lang), nil)
@@ -52,7 +54,19 @@ func (b *Service) handleBelcantoCommand(ctx context.Context, chatID int64, user 
 		}
 		return b.sendText(ctx, chatID, consentRequiredText(lang), keyboard)
 	}
-	return b.prepareThreadDraft(ctx, chatID, user, domain.ThreadVoiceBelcanto, "", nil)
+	if b.threadGenerator == nil {
+		return b.sendText(ctx, chatID, belcantoGeneratorUnavailableText(lang), nil)
+	}
+	brief, _, err := b.store.StartThreadBrief(ctx, user.TelegramID, updateID, domain.ThreadVoiceBelcanto)
+	if err != nil {
+		return fmt.Errorf("start Threads brief: %w", err)
+	}
+	keyboard, err := threadBriefObjectiveKeyboard(b.callbacks, user.TelegramID, brief)
+	if err != nil {
+		return err
+	}
+	b.metrics.Inc("belcanto_briefs_started")
+	return b.sendText(ctx, chatID, threadBriefObjectivePromptText(), keyboard)
 }
 
 func (b *Service) isBelcantoOperator(telegramID int64) bool {
@@ -60,19 +74,325 @@ func (b *Service) isBelcantoOperator(telegramID int64) bool {
 	return ok
 }
 
-func (b *Service) prepareThreadDraft(
+func threadObjectiveForAction(action session.Action) (domain.ThreadObjective, bool) {
+	switch action {
+	case session.ActionThreadObjectiveReach:
+		return domain.ThreadObjectiveReach, true
+	case session.ActionThreadObjectiveReplies:
+		return domain.ThreadObjectiveReplies, true
+	case session.ActionThreadObjectiveTrust:
+		return domain.ThreadObjectiveTrust, true
+	case session.ActionThreadObjectiveTrial:
+		return domain.ThreadObjectiveTrial, true
+	case session.ActionThreadObjectiveCommunity:
+		return domain.ThreadObjectiveCommunity, true
+	default:
+		return "", false
+	}
+}
+
+func (b *Service) selectThreadBriefObjective(
 	ctx context.Context,
 	chatID int64,
+	user domain.User,
+	payload session.CallbackPayload,
+	objective domain.ThreadObjective,
+) error {
+	if !b.isBelcantoOperator(user.TelegramID) {
+		return b.sendText(ctx, chatID, belcantoOwnerOnlyText(userLanguage(user.Language)), nil)
+	}
+	brief, err := b.store.SetThreadBriefObjective(
+		ctx, payload.InteractionID, user.TelegramID, payload.Revision, objective,
+	)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrThreadBriefState) {
+			// A durable callback may be retried after the objective transition
+			// committed but before Telegram acknowledged the material prompt.
+			current, lookupErr := b.store.GetThreadBrief(ctx, payload.InteractionID, user.TelegramID)
+			if lookupErr == nil && current.Current && current.State == domain.ThreadBriefAwaitingMaterial && current.Objective == objective {
+				keyboard, keyboardErr := threadBriefMaterialKeyboard(b.callbacks, user.TelegramID, current)
+				if keyboardErr != nil {
+					return keyboardErr
+				}
+				return b.sendText(ctx, chatID, threadBriefMaterialPromptText(current.Objective), keyboard)
+			}
+			return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+		}
+		return err
+	}
+	keyboard, err := threadBriefMaterialKeyboard(b.callbacks, user.TelegramID, brief)
+	if err != nil {
+		return err
+	}
+	b.metrics.Inc("belcanto_brief_objective_selected")
+	return b.sendText(ctx, chatID, threadBriefMaterialPromptText(brief.Objective), keyboard)
+}
+
+func (b *Service) showThreadBriefObjectives(
+	ctx context.Context,
+	chatID int64,
+	user domain.User,
+	payload session.CallbackPayload,
+) error {
+	brief, err := b.store.GetThreadBrief(ctx, payload.InteractionID, user.TelegramID)
+	if err != nil || !brief.Current || brief.Revision != payload.Revision || brief.State != domain.ThreadBriefAwaitingMaterial {
+		if err == nil || errors.Is(err, store.ErrNotFound) {
+			return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+		}
+		return err
+	}
+	keyboard, err := threadBriefObjectiveKeyboard(b.callbacks, user.TelegramID, brief)
+	if err != nil {
+		return err
+	}
+	return b.sendText(ctx, chatID, threadBriefObjectivePromptText(), keyboard)
+}
+
+func (b *Service) cancelThreadBrief(
+	ctx context.Context,
+	chatID int64,
+	user domain.User,
+	payload session.CallbackPayload,
+) error {
+	err := b.store.CancelThreadBrief(ctx, payload.InteractionID, user.TelegramID, payload.Revision)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrThreadBriefState) {
+			return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+		}
+		return err
+	}
+	b.metrics.Inc("belcanto_briefs_cancelled")
+	return b.sendText(ctx, chatID, threadBriefCancelledText(), nil)
+}
+
+func (b *Service) cancelCurrentThreadBriefIfPending(
+	ctx context.Context,
+	chatID int64,
+	user domain.User,
+) (bool, error) {
+	if !b.isBelcantoOperator(user.TelegramID) {
+		return false, nil
+	}
+	brief, err := b.store.GetCurrentThreadBrief(ctx, user.TelegramID)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return true, err
+	}
+	switch brief.State {
+	case domain.ThreadBriefAwaitingGoal, domain.ThreadBriefAwaitingMaterial, domain.ThreadBriefMaterialReady:
+	default:
+		return false, nil
+	}
+	if err := b.store.CancelThreadBrief(ctx, brief.ID, user.TelegramID, brief.Revision); err != nil {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrThreadBriefState) {
+			return true, b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+		}
+		return true, err
+	}
+	b.metrics.Inc("belcanto_briefs_cancelled")
+	return true, b.sendText(ctx, chatID, threadBriefCancelledText(), nil)
+}
+
+func validThreadBriefMaterial(value string) bool {
+	if !utf8.ValidString(value) || strings.TrimSpace(value) == "" || utf8.RuneCountInString(value) > domain.MaxThreadMaterialRunes {
+		return false
+	}
+	for _, character := range value {
+		if (unicode.IsControl(character) && character != '\n' && character != '\t') || unicode.In(character, unicode.Cf) {
+			return false
+		}
+	}
+	return true
+}
+
+func threadBriefMaterialText(message telegram.Message) string {
+	if text := strings.TrimSpace(message.Text); text != "" {
+		return text
+	}
+	return strings.TrimSpace(message.Caption)
+}
+
+func (b *Service) tryHandleThreadBriefMaterial(
+	ctx context.Context,
+	updateID int64,
+	message telegram.Message,
+	user domain.User,
+) (bool, error) {
+	if !b.isBelcantoOperator(user.TelegramID) {
+		return false, nil
+	}
+	// Recover the exact preview when this message already completed a brief but
+	// the worker crashed before Telegram acknowledged the outbound send.
+	if existing, lookupErr := b.store.GetThreadDraftByGenerationUpdate(ctx, user.TelegramID, updateID); lookupErr == nil {
+		keyboard, keyboardErr := b.threadDraftKeyboard(ctx, user.TelegramID, existing)
+		if keyboardErr != nil {
+			return true, keyboardErr
+		}
+		return true, b.sendThreadDraftPreview(ctx, message.Chat.ID, existing, keyboard)
+	} else if !errors.Is(lookupErr, store.ErrNotFound) {
+		return true, lookupErr
+	}
+	brief, err := b.store.GetCurrentThreadBrief(ctx, user.TelegramID)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return true, err
+	}
+	if brief.State == domain.ThreadBriefMaterialReady && brief.MaterialUpdateID == updateID {
+		return true, b.generateThreadBrief(ctx, updateID, message.Chat.ID, user, brief)
+	}
+	if brief.State != domain.ThreadBriefAwaitingMaterial {
+		return false, nil
+	}
+	material := threadBriefMaterialText(message)
+	if !validThreadBriefMaterial(material) {
+		keyboard, keyboardErr := threadBriefMaterialKeyboard(b.callbacks, user.TelegramID, brief)
+		if keyboardErr != nil {
+			return true, keyboardErr
+		}
+		return true, b.sendText(ctx, message.Chat.ID, threadBriefMaterialInvalidText(), keyboard)
+	}
+	brief, err = b.store.SetThreadBriefMaterial(
+		ctx, brief.ID, user.TelegramID, brief.Revision, updateID, domain.ThreadMaterialText, material,
+	)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrThreadBriefState) {
+			return true, b.sendText(ctx, message.Chat.ID, threadDraftStaleText(), nil)
+		}
+		return true, err
+	}
+	return true, b.generateThreadBrief(ctx, updateID, message.Chat.ID, user, brief)
+}
+
+func (b *Service) completeThreadBriefWithoutMaterial(
+	ctx context.Context,
+	updateID, chatID int64,
+	user domain.User,
+	payload session.CallbackPayload,
+) error {
+	current, currentErr := b.store.GetThreadBrief(ctx, payload.InteractionID, user.TelegramID)
+	if currentErr != nil {
+		if errors.Is(currentErr, store.ErrNotFound) {
+			return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+		}
+		return currentErr
+	}
+	if current.Objective == domain.ThreadObjectiveTrial && current.Current && current.State == domain.ThreadBriefAwaitingMaterial && current.Revision == payload.Revision {
+		keyboard, keyboardErr := threadBriefMaterialKeyboard(b.callbacks, user.TelegramID, current)
+		if keyboardErr != nil {
+			return keyboardErr
+		}
+		return b.sendText(ctx, chatID, threadBriefTrialMaterialRequiredText(), keyboard)
+	}
+	brief, err := b.store.SetThreadBriefMaterial(
+		ctx, payload.InteractionID, user.TelegramID, payload.Revision, updateID, domain.ThreadMaterialNone, "",
+	)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrThreadBriefState) {
+			if draft, lookupErr := b.store.GetThreadDraftByGenerationUpdate(ctx, user.TelegramID, updateID); lookupErr == nil {
+				keyboard, keyboardErr := b.threadDraftKeyboard(ctx, user.TelegramID, draft)
+				if keyboardErr != nil {
+					return keyboardErr
+				}
+				return b.sendThreadDraftPreview(ctx, chatID, draft, keyboard)
+			}
+			if current.State == domain.ThreadBriefMaterialReady && current.MaterialUpdateID == updateID {
+				return b.generateThreadBrief(ctx, updateID, chatID, user, current)
+			}
+			return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+		}
+		return err
+	}
+	return b.generateThreadBrief(ctx, updateID, chatID, user, brief)
+}
+
+func (b *Service) retryThreadBrief(
+	ctx context.Context,
+	updateID, chatID int64,
+	user domain.User,
+	payload session.CallbackPayload,
+) error {
+	if existing, lookupErr := b.store.GetThreadDraftByGenerationUpdate(ctx, user.TelegramID, updateID); lookupErr == nil {
+		keyboard, keyboardErr := b.threadDraftKeyboard(ctx, user.TelegramID, existing)
+		if keyboardErr != nil {
+			return keyboardErr
+		}
+		return b.sendThreadDraftPreview(ctx, chatID, existing, keyboard)
+	} else if !errors.Is(lookupErr, store.ErrNotFound) {
+		return lookupErr
+	}
+	brief, err := b.store.GetThreadBrief(ctx, payload.InteractionID, user.TelegramID)
+	if err != nil || !brief.Current || brief.Revision != payload.Revision || brief.State != domain.ThreadBriefMaterialReady {
+		if err == nil || errors.Is(err, store.ErrNotFound) {
+			return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+		}
+		return err
+	}
+	return b.generateThreadBrief(ctx, updateID, chatID, user, brief)
+}
+
+func (b *Service) generateThreadBrief(
+	ctx context.Context,
+	updateID, chatID int64,
+	user domain.User,
+	brief domain.ThreadBrief,
+) error {
+	return b.prepareThreadDraft(ctx, updateID, chatID, user, brief.Voice, "", nil, &brief)
+}
+
+func (b *Service) prepareThreadDraft(
+	ctx context.Context,
+	generationUpdateID, chatID int64,
 	user domain.User,
 	voice domain.ThreadVoice,
 	transform string,
 	previous *domain.ThreadDraft,
+	brief *domain.ThreadBrief,
 ) error {
 	if !b.isBelcantoOperator(user.TelegramID) {
 		return b.sendText(ctx, chatID, belcantoOwnerOnlyText(userLanguage(user.Language)), nil)
 	}
 	if b.threadGenerator == nil {
 		return b.sendText(ctx, chatID, belcantoGeneratorUnavailableText(userLanguage(user.Language)), nil)
+	}
+	if generationUpdateID > 0 {
+		if existing, lookupErr := b.store.GetThreadDraftByGenerationUpdate(ctx, user.TelegramID, generationUpdateID); lookupErr == nil {
+			keyboard, keyboardErr := b.threadDraftKeyboard(ctx, user.TelegramID, existing)
+			if keyboardErr != nil {
+				return keyboardErr
+			}
+			return b.sendThreadDraftPreview(ctx, chatID, existing, keyboard)
+		} else if !errors.Is(lookupErr, store.ErrNotFound) {
+			return lookupErr
+		}
+	}
+
+	objective := domain.ThreadObjectiveReplies
+	materialKind := domain.ThreadMaterialNone
+	material := ""
+	previousScenarioID := ""
+	if brief != nil {
+		objective = brief.Objective
+		materialKind = brief.MaterialKind
+		material = brief.MaterialText
+	}
+	if previous != nil {
+		previousScenarioID = previous.ScenarioID
+		if previous.Objective.Valid() && previous.Objective != domain.ThreadObjectiveLegacy {
+			objective = previous.Objective
+		}
+		if previous.BriefID > 0 {
+			storedBrief, briefErr := b.store.GetThreadBrief(ctx, previous.BriefID, user.TelegramID)
+			if briefErr != nil {
+				return fmt.Errorf("load Threads brief for refinement: %w", briefErr)
+			}
+			brief = &storedBrief
+			materialKind = storedBrief.MaterialKind
+			material = storedBrief.MaterialText
+		}
 	}
 
 	stopAction := b.startChatAction(ctx, chatID, telegram.ChatActionTyping)
@@ -82,7 +402,8 @@ func (b *Service) prepareThreadDraft(
 		return fmt.Errorf("list recent Threads drafts: %w", err)
 	}
 	request := ai.ThreadPostRequest{
-		Voice: voice, Transform: transform, RecentTexts: recent,
+		Voice: voice, Objective: objective, MaterialKind: materialKind, Material: material,
+		Transform: transform, PreviousScenarioID: previousScenarioID, RecentTexts: recent,
 		Language: "ru", Date: b.now(), Seed: uint32(b.now().UnixNano()),
 		DeliveryCheck: b.threadPostDeliverySafe,
 	}
@@ -102,7 +423,7 @@ func (b *Service) prepareThreadDraft(
 	if err != nil {
 		b.metrics.Inc("belcanto_generation_errors")
 		b.logError("Belcanto post generation failed", user.TelegramID, "error", safeErrorCode(err))
-		return b.sendText(ctx, chatID, belcantoGenerationErrorText(userLanguage(user.Language)), nil)
+		return b.sendThreadGenerationFailure(ctx, chatID, user, previous, brief)
 	}
 	if result.FallbackReason != "" {
 		b.metrics.Inc("belcanto_curated_fallbacks")
@@ -115,12 +436,22 @@ func (b *Service) prepareThreadDraft(
 	result, ok := b.selectLastMileThreadPost(result)
 	if !ok {
 		b.metrics.Inc("belcanto_safety_rejections")
-		return b.sendText(ctx, chatID, belcantoGenerationErrorText(userLanguage(user.Language)), nil)
+		return b.sendThreadGenerationFailure(ctx, chatID, user, previous, brief)
 	}
+	// The application, not a model/provider implementation, owns the external
+	// stock-search boundary. Derive the only allowed query from bounded scenario
+	// metadata before persistence or any automatic Pexels call.
+	result.Visual.Query = ai.SafeThreadPhotoQuery(result.ScenarioID)
 	draft := domain.ThreadDraft{
-		TelegramID: user.TelegramID, Voice: voice, Goal: result.Goal, PhotoQuery: result.Visual.Query, Text: result.Text,
+		TelegramID: user.TelegramID, Voice: voice, Goal: result.Goal,
+		Objective: result.Objective, ScenarioID: result.ScenarioID,
+		GenerationID: generationID, GenerationUpdateID: generationUpdateID,
+		PhotoQuery: result.Visual.Query, Text: result.Text,
 		Provider: result.Provider, Model: result.Model, Revision: revision,
 		MediaMode: domain.ThreadMediaText, State: domain.ThreadDraftReady, Current: true,
+	}
+	if brief != nil {
+		draft.BriefID = brief.ID
 	}
 	if strings.TrimSpace(draft.PhotoQuery) == "" {
 		draft.PhotoQuery = fallbackLicensedPhotoQuery
@@ -168,28 +499,42 @@ func (b *Service) prepareThreadDraft(
 			previewMedia = sourcedMedia
 		}
 	}
-	var draftID int64
-	if sourcedMedia != nil {
-		draftID, err = b.store.CreateThreadDraftWithMedia(ctx, draft, *sourcedMedia)
-	} else {
-		draftID, err = b.store.CreateThreadDraft(ctx, draft)
-	}
-	if err != nil {
-		return fmt.Errorf("save Threads draft: %w", err)
-	}
-	if sourcedMedia != nil {
-		draft, err = b.store.GetThreadDraft(ctx, draftID, user.TelegramID)
+	if brief != nil && previous == nil {
+		draft, _, err = b.store.CreateThreadDraftForBrief(ctx, brief.ID, brief.Revision, draft, sourcedMedia)
 		if err != nil {
-			return fmt.Errorf("load sourced Threads draft: %w", err)
+			return fmt.Errorf("save Threads draft for brief: %w", err)
 		}
 	} else {
-		draft.ID = draftID
+		var draftID int64
+		if sourcedMedia != nil {
+			draftID, err = b.store.CreateThreadDraftWithMedia(ctx, draft, *sourcedMedia)
+		} else {
+			draftID, err = b.store.CreateThreadDraft(ctx, draft)
+		}
+		if err != nil {
+			return fmt.Errorf("save Threads draft: %w", err)
+		}
+		if sourcedMedia != nil {
+			draft, err = b.store.GetThreadDraft(ctx, draftID, user.TelegramID)
+			if err != nil {
+				return fmt.Errorf("load sourced Threads draft: %w", err)
+			}
+		} else {
+			draft.ID = draftID
+		}
+	}
+	if draft.MediaID > 0 {
+		storedMedia, mediaErr := b.store.GetThreadMedia(ctx, draft.MediaID, user.TelegramID)
+		if mediaErr != nil {
+			return fmt.Errorf("load stored Threads preview media: %w", mediaErr)
+		}
+		previewMedia = &storedMedia
 	}
 	keyboard, err := b.threadDraftKeyboard(ctx, user.TelegramID, draft)
 	if err != nil {
 		return err
 	}
-	b.metrics.Inc("belcanto_drafts_ready")
+	b.recordBelcantoDraftReady(draft)
 	b.metrics.Add("input_tokens", int64(result.Usage.InputTokens))
 	b.metrics.Add("output_tokens", int64(result.Usage.OutputTokens))
 	previewErr := b.sendThreadDraftPreview(ctx, chatID, draft, keyboard)
@@ -197,8 +542,32 @@ func (b *Service) prepareThreadDraft(
 	if previewErr != nil {
 		previewStatus = "send_error_unknown"
 	}
-	b.logBelcantoEditorialAudit(user.TelegramID, draft, transform, result, previewMedia, previewStatus)
+	b.logBelcantoEditorialAudit(user.TelegramID, draft, transform, result, previewMedia, previewStatus, brief)
 	return previewErr
+}
+
+func (b *Service) sendThreadGenerationFailure(
+	ctx context.Context,
+	chatID int64,
+	user domain.User,
+	previous *domain.ThreadDraft,
+	brief *domain.ThreadBrief,
+) error {
+	if previous != nil {
+		keyboard, err := b.threadDraftKeyboard(ctx, user.TelegramID, *previous)
+		if err != nil {
+			return err
+		}
+		return b.sendText(ctx, chatID, belcantoRefinementErrorText(userLanguage(user.Language)), keyboard)
+	}
+	if brief != nil {
+		keyboard, err := threadBriefRetryKeyboard(b.callbacks, user.TelegramID, *brief)
+		if err != nil {
+			return err
+		}
+		return b.sendText(ctx, chatID, belcantoGenerationErrorText(userLanguage(user.Language)), keyboard)
+	}
+	return b.sendText(ctx, chatID, belcantoGenerationErrorText(userLanguage(user.Language)), nil)
 }
 
 func (b *Service) selectLastMileThreadPost(result ai.ThreadPostResult) (ai.ThreadPostResult, bool) {
@@ -238,6 +607,11 @@ func (b *Service) selectLastMileThreadPost(result ai.ThreadPostResult) (ai.Threa
 			result.Audit.Candidates[other].Selected = other == index
 		}
 		result.Goal = candidate.Goal
+		result.Objective = candidate.Objective
+		result.ScenarioID = candidate.ScenarioID
+		result.Mechanism = candidate.Mechanism
+		result.MaterialBasis = candidate.MaterialBasis
+		result.Evidence = candidate.Evidence
 		result.Text = candidate.Text
 		result.Visual = ai.ThreadPostVisualRecommendation{Mode: "text_only", Query: fallbackLicensedPhotoQuery}
 		result.Audit.DeliveredWinnerID = candidate.ReviewerID
@@ -254,8 +628,13 @@ func validThreadPostEditorialResult(result ai.ThreadPostResult) bool {
 	selected := 0
 	selectedID := ""
 	selectedGoal := ""
+	selectedObjective := domain.ThreadObjective("")
+	selectedScenarioID := ""
+	selectedMechanism := ""
 	selectedText := ""
 	ids := make(map[string]struct{}, requiredFinalists)
+	scenarios := make(map[string]struct{}, requiredFinalists)
+	mechanisms := make(map[string]struct{}, requiredFinalists)
 	for _, candidate := range result.Audit.Candidates {
 		if !candidate.Eligible || !candidate.Considered {
 			if candidate.Selected {
@@ -264,22 +643,35 @@ func validThreadPostEditorialResult(result ai.ThreadPostResult) bool {
 			continue
 		}
 		finalists++
-		if strings.TrimSpace(candidate.ReviewerID) == "" || strings.TrimSpace(candidate.Goal) == "" || strings.TrimSpace(candidate.Text) == "" {
+		if strings.TrimSpace(candidate.ReviewerID) == "" || strings.TrimSpace(candidate.Goal) == "" ||
+			!candidate.Objective.Valid() || strings.TrimSpace(candidate.ScenarioID) == "" ||
+			!knownThreadScenario(candidate.ScenarioID) || candidate.ScenarioID == "legacy_unspecified" ||
+			strings.TrimSpace(candidate.Mechanism) == "" || strings.TrimSpace(candidate.Text) == "" {
 			return false
 		}
 		if _, duplicate := ids[candidate.ReviewerID]; duplicate {
 			return false
 		}
 		ids[candidate.ReviewerID] = struct{}{}
+		if _, duplicate := scenarios[candidate.ScenarioID]; duplicate {
+			return false
+		}
+		scenarios[candidate.ScenarioID] = struct{}{}
+		mechanisms[candidate.Mechanism] = struct{}{}
 		if candidate.Selected {
 			selected++
 			selectedID = candidate.ReviewerID
 			selectedGoal = candidate.Goal
+			selectedObjective = candidate.Objective
+			selectedScenarioID = candidate.ScenarioID
+			selectedMechanism = candidate.Mechanism
 			selectedText = candidate.Text
 		}
 	}
-	return finalists == requiredFinalists && selected == 1 &&
-		result.Audit.DeliveredWinnerID == selectedID && result.Goal == selectedGoal && result.Text == selectedText
+	return finalists == requiredFinalists && len(scenarios) == requiredFinalists && len(mechanisms) >= 4 && selected == 1 &&
+		result.Audit.DeliveredWinnerID == selectedID && result.Goal == selectedGoal &&
+		result.Objective == selectedObjective && result.ScenarioID == selectedScenarioID &&
+		result.Mechanism == selectedMechanism && result.Text == selectedText
 }
 
 func (b *Service) threadPostDeliverySafe(text string) bool {
@@ -334,7 +726,7 @@ func (b *Service) prepareLicensedThreadMedia(
 	mediaValue := domain.ThreadMedia{
 		TelegramID: telegramID, SourceKind: domain.ThreadMediaSourcePexels,
 		SourceAssetID: asset.AssetID, SourcePageURL: asset.PageURL,
-		SourceAuthor: asset.Author, SourceAuthorURL: asset.AuthorURL, SourceQuery: asset.Query,
+		SourceAuthor: asset.Author, SourceAuthorURL: asset.AuthorURL, SourceQuery: recommendation.Query,
 		Data: normalized.Data, MediaType: normalized.MediaType, Width: normalized.Width, Height: normalized.Height,
 		Digest: hex.EncodeToString(digest[:]), DeliveryKey: deliveryKey,
 	}
@@ -386,10 +778,10 @@ func (b *Service) selectThreadDraftLicensedPhoto(
 		(draft.State != domain.ThreadDraftReady && draft.State != domain.ThreadDraftFailed) {
 		return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
 	}
-	query := strings.TrimSpace(draft.PhotoQuery)
-	if query == "" {
-		query = fallbackLicensedPhotoQuery
-	}
+	// Never forward a persisted model-authored query to an external photo
+	// provider. Older drafts may predate the fixed-query boundary, so derive the
+	// search phrase again from the bounded scenario ID on every manual search.
+	query := ai.SafeThreadPhotoQuery(draft.ScenarioID)
 	var excludedAssetIDs []string
 	var currentAssetID, currentDigest string
 	if draft.MediaID > 0 {
@@ -400,9 +792,6 @@ func (b *Service) selectThreadDraftLicensedPhoto(
 		currentDigest = currentMedia.Digest
 		if currentMedia.EffectiveSourceKind() == domain.ThreadMediaSourcePexels {
 			currentAssetID = currentMedia.SourceAssetID
-			if strings.TrimSpace(currentMedia.SourceQuery) != "" {
-				query = currentMedia.SourceQuery
-			}
 			excludedAssetIDs = append(excludedAssetIDs, currentMedia.SourceAssetID)
 		}
 	}
@@ -465,8 +854,16 @@ func (b *Service) sendThreadDraftPreview(
 	draft domain.ThreadDraft,
 	keyboard *telegram.InlineKeyboardMarkup,
 ) error {
+	materialKind := domain.ThreadMaterialNone
+	if draft.BriefID > 0 {
+		brief, err := b.store.GetThreadBrief(ctx, draft.BriefID, draft.TelegramID)
+		if err != nil {
+			return fmt.Errorf("load Threads brief for preview: %w", err)
+		}
+		materialKind = brief.MaterialKind
+	}
 	if draft.MediaMode != domain.ThreadMediaImage {
-		return b.sendText(ctx, chatID, threadDraftText(draft), keyboard)
+		return b.sendText(ctx, chatID, threadDraftTextWithBrief(draft, materialKind), keyboard)
 	}
 	mediaValue, err := b.store.GetThreadMedia(ctx, draft.MediaID, draft.TelegramID)
 	if err != nil {
@@ -475,7 +872,7 @@ func (b *Service) sendThreadDraftPreview(
 	keyboard = threadDraftKeyboardWithMediaSource(keyboard, mediaValue)
 	_, err = b.telegram.SendPhoto(ctx, telegram.SendPhotoParams{
 		ChatID: chatID, Photo: telegram.FileUpload("belcanto-threads.jpg", mediaValue.Data),
-		Caption: threadDraftTextWithMedia(draft, mediaValue), ReplyMarkup: keyboard, ProtectContent: true,
+		Caption: threadDraftTextWithMediaAndBrief(draft, mediaValue, materialKind), ReplyMarkup: keyboard, ProtectContent: true,
 	})
 	return err
 }
@@ -512,7 +909,7 @@ func threadDraftKeyboardWithMediaSource(
 
 func (b *Service) refineThreadDraft(
 	ctx context.Context,
-	chatID int64,
+	updateID, chatID int64,
 	user domain.User,
 	payload session.CallbackPayload,
 	voice domain.ThreadVoice,
@@ -520,6 +917,15 @@ func (b *Service) refineThreadDraft(
 ) error {
 	if !b.isBelcantoOperator(user.TelegramID) {
 		return b.sendText(ctx, chatID, belcantoOwnerOnlyText(userLanguage(user.Language)), nil)
+	}
+	if existing, lookupErr := b.store.GetThreadDraftByGenerationUpdate(ctx, user.TelegramID, updateID); lookupErr == nil {
+		keyboard, keyboardErr := b.threadDraftKeyboard(ctx, user.TelegramID, existing)
+		if keyboardErr != nil {
+			return keyboardErr
+		}
+		return b.sendThreadDraftPreview(ctx, chatID, existing, keyboard)
+	} else if !errors.Is(lookupErr, store.ErrNotFound) {
+		return lookupErr
 	}
 	draft, err := b.store.GetThreadDraft(ctx, payload.InteractionID, user.TelegramID)
 	if err != nil {
@@ -534,7 +940,7 @@ func (b *Service) refineThreadDraft(
 	if voice == "" {
 		voice = draft.Voice
 	}
-	return b.prepareThreadDraft(ctx, chatID, user, voice, transform, &draft)
+	return b.prepareThreadDraft(ctx, updateID, chatID, user, voice, transform, &draft, nil)
 }
 
 func (b *Service) setThreadDraftMediaMode(
@@ -807,7 +1213,7 @@ func (b *Service) publishThreadDraft(
 		if err := b.store.ConfirmThreadDraftPublished(ctx, draft.ID, user.TelegramID, containerID); err != nil {
 			return fmt.Errorf("reconcile already published Threads container: %w", err)
 		}
-		b.metrics.Inc("belcanto_posts_published")
+		b.recordBelcantoPublished(draft)
 		return b.sendText(ctx, chatID, threadPublishedText(threadspub.Publication{}), nil)
 	}
 
@@ -820,7 +1226,7 @@ func (b *Service) publishThreadDraft(
 			if reconciled, reconcileErr := b.reconcilePublishedContainer(ctx, draft, containerID); reconcileErr != nil {
 				return reconcileErr
 			} else if reconciled {
-				b.metrics.Inc("belcanto_posts_published")
+				b.recordBelcantoPublished(draft)
 				return b.sendText(ctx, chatID, threadPublishedText(threadspub.Publication{}), nil)
 			}
 		}
@@ -836,7 +1242,7 @@ func (b *Service) publishThreadDraft(
 	if err := b.store.CompleteThreadDraft(ctx, draft.ID, user.TelegramID, claimToken, publication.ID, publication.Permalink); err != nil {
 		return fmt.Errorf("complete Threads publication: %w", err)
 	}
-	b.metrics.Inc("belcanto_posts_published")
+	b.recordBelcantoPublished(draft)
 	return b.sendText(ctx, chatID, threadPublishedText(publication), nil)
 }
 
@@ -937,11 +1343,31 @@ func (b *Service) reconcileUnknownThreadDraft(ctx context.Context, chatID int64,
 			return err
 		}
 		if reconciled {
-			b.metrics.Inc("belcanto_posts_published")
+			b.recordBelcantoPublished(draft)
 			return b.sendText(ctx, chatID, threadPublishedText(threadspub.Publication{}), nil)
 		}
 	}
 	return b.sendText(ctx, chatID, threadPublishUnknownText(), nil)
+}
+
+func (b *Service) recordBelcantoDraftReady(draft domain.ThreadDraft) {
+	b.metrics.Inc("belcanto_drafts_ready")
+	if draft.Objective.Selectable() {
+		b.metrics.Inc("belcanto_drafts_ready_objective_" + string(draft.Objective))
+	}
+	if knownThreadScenario(draft.ScenarioID) && draft.ScenarioID != "legacy_unspecified" {
+		b.metrics.Inc("belcanto_drafts_ready_scenario_" + draft.ScenarioID)
+	}
+}
+
+func (b *Service) recordBelcantoPublished(draft domain.ThreadDraft) {
+	b.metrics.Inc("belcanto_posts_published")
+	if draft.Objective.Selectable() {
+		b.metrics.Inc("belcanto_posts_published_objective_" + string(draft.Objective))
+	}
+	if knownThreadScenario(draft.ScenarioID) && draft.ScenarioID != "legacy_unspecified" {
+		b.metrics.Inc("belcanto_posts_published_scenario_" + draft.ScenarioID)
+	}
 }
 
 func (b *Service) cancelThreadDraft(ctx context.Context, chatID int64, user domain.User, payload session.CallbackPayload) error {

@@ -16,7 +16,7 @@ The product supports witty teasing and firm boundaries. It is not an automated h
 - Reply refinements: funnier, sharper, softer, shorter, more, and meme.
 - Public-comment refinements: funnier, subtler, bolder, more absurd, shorter, a genuinely different angle, and three more.
 - Original 1080×1080 Cyrillic PNG meme cards rendered locally with DejaVu — no scraping or unlicensed template catalog.
-- Operator-only Belcanto Threads Copilot: `/threads` prepares one complete school post with no topic required, lets the operator choose text-only or attach one real photo, offers Belcanto/Alisher voices and optional refinements, and publishes only after an explicit confirmation.
+- Operator-only Belcanto Threads Copilot: `/threads` asks for a publication goal and optional real material, runs a three-stage scenario/editorial pipeline, then shows one exact school-post preview that can be refined, illustrated, or explicitly published.
 - Two-step official Threads API publishing with durable draft state and an atomic claim that blocks duplicate publication after double taps, Telegram redelivery, or a process restart.
 - Consent gate, user-owned signed callbacks, atomic daily quotas, feedback, saved style examples, reset, and complete profile deletion.
 - AES-256-GCM encrypted durable Telegram inbox with per-user ordering, at-least-once processing, retries, lease recovery, dead-lettering, and payload scrubbing at a terminal state.
@@ -48,6 +48,8 @@ AI_PROVIDER=fake
 
 `AI_PROVIDER=fake` exercises the entire Telegram experience without making paid AI calls. Unlike a static stub, it has separate reply/comment banks and changes output after refinement buttons.
 
+The fake AI and fake Threads publisher still use the real Telegram Bot API. `TELEGRAM_BOT_TOKEN` must therefore be a valid BotFather token; a placeholder cannot become healthy.
+
 Docker Compose reads `.env` automatically. The Go binary deliberately does not, so a native run must export it first.
 
 ### 3. Run
@@ -55,8 +57,13 @@ Docker Compose reads `.env` automatically. The Go binary deliberately does not, 
 With Docker:
 
 ```bash
-docker compose up --build
+docker compose config --quiet
+docker compose up --build -d
+docker compose ps
+curl -fsS http://127.0.0.1:8080/readyz
 ```
+
+The included Compose file is a local-development stack: it starts its own PostgreSQL with `sslmode=disable` and binds the app to loopback. Use a deployment-specific override rather than setting `APP_ENV=production` on this file unchanged.
 
 Or with Go and the in-memory store:
 
@@ -108,6 +115,9 @@ AI_PROVIDER=anthropic
 ANTHROPIC_API_KEY=sk-ant-...
 ANTHROPIC_MODEL=claude-sonnet-5
 AI_EFFORT=low
+THREADS_AI_MAX_TOKENS=8192
+THREADS_AI_CALL_TIMEOUT=90s
+THREADS_AI_TIMEOUT=300s
 ```
 
 For a public product, use a commercial Anthropic API key. Do not route user traffic through an individual Claude Free/Pro/Max OAuth subscription. `claude_cli` exists for operator-controlled development/evaluation and uses secure `--bare` mode with an API key.
@@ -122,7 +132,7 @@ For a public product, use a commercial Anthropic API key. Do not route user traf
 | `/style` | View/change the default tone, saved examples, or reset personalization |
 | `/plan` | Show plan and current daily use |
 | `/privacy` | Show the in-bot privacy summary |
-| `/threads` | Prepare a publish-ready Belcanto Threads post (operators only) |
+| `/threads` | Choose a goal and material for a publish-ready Belcanto Threads post (operators only) |
 | `/delete_me` | Confirm and permanently delete profile data |
 | `/help` | Supported inputs and commands |
 
@@ -144,9 +154,19 @@ help - Помощь
 
 This is a separate, operator-only workspace inside the same Telegram bot. It does not change the ordinary reply/comment flow or consume its quotas.
 
-Send `/threads`. The first Anthropic request uses high effort, privately explores at least ten substantially different approaches, discards predictable drafts, and returns five publication-ready finalists. It does not expose chain-of-thought or rejected scratch work. Every finalist passes the local fact, sales, language, repetition, length, and editorial-quality gates. A second, separate Anthropic request receives the safe finalists in shuffled order, scores hook, human voice, recognition, reply desire, brevity, and voice fit, and chooses the winner. Only that WYSIWYG winner is stored and shown in Telegram.
+The operator flow is deliberate and short:
 
-The complete checkable editorial decision is emitted as one structured JSON log event: finalist texts, deterministic and reviewer scores, concise notes, rejection codes, selected winner, preview delivery status, and a shared `generation_id`. `BELCANTO_REVIEW_LOG_MODE=full` is the default for this allowlisted workspace; use `metadata` to retain only hashes/scores or `off` to disable the event. Hidden Anthropic reasoning and discarded internal ideas are never requested or logged. The default end-to-end budget is `THREADS_AI_TIMEOUT=120s`, separate from the per-call `AI_TIMEOUT`; internal stage deadlines reserve time for a curated generation fallback or local review fallback before that outer deadline.
+1. Send `/threads` and choose the goal: reach, replies, trust, trial lesson, or community.
+2. Send one real text material for the day—a phrase, observation, event, question, verified fact, or teacher note—or explicitly continue without material. The `trial` objective always requires confirmed material because the system cannot invent an offer, date, format, price, capacity, or next step.
+3. Receive one exact WYSIWYG preview. Only after this point can the operator refine the text, attach or replace a photo, cancel, or explicitly publish.
+
+The goal and material collection is durable. A Telegram retry reuses the same workflow, and a process restart resumes the current step instead of generating a second draft. The submitted material is treated as quoted, untrusted evidence: it can ground a real scene or fact, but can never issue instructions to the model or authorize invention. For `reach`, `replies`, `trust`, and `community`, continuing without material keeps the post evergreen and inside the small immutable Belcanto fact set; `trial` instead asks for confirmed material before generation.
+
+Anthropic then runs three separate high-effort stages. The concept planner evaluates a deterministic twelve-slot portfolio of market-informed scenarios for the selected goal and material. The writer turns the chosen portfolio into five publication-ready finalists with unique scenario IDs and at least four different mechanisms; generic aphorisms are not a valid portfolio. Finally, a blind editor receives only the safe finalists, applies goal-specific weights, checks grounding and Belcanto fit, and selects the winner. Hidden scratch work and chain-of-thought are neither requested nor logged. Every exposed finalist also passes local fact, language, repetition, length, diversity, delivery-safety, and editorial-quality gates. Only the selected WYSIWYG winner is committed as the current draft and shown in Telegram.
+
+The complete checkable editorial decision is emitted as one structured JSON log event: objective, selected scenario and mechanism, material basis, deterministic and reviewer scores, rejection codes, selected winner, preview delivery status, and a shared `generation_id`. In the default `BELCANTO_REVIEW_LOG_MODE=full`, evergreen generations also include locally safe finalist texts and concise reviewer notes. Material-backed generations automatically suppress every model-authored free-form field and retain only secret-keyed, domain-separated HMAC digests, scores, and bounded IDs so submitted material cannot be echoed or cheaply dictionary-tested from logs. Use `metadata` to apply that content-free shape to every generation or `off` to disable the event. Raw operator material and hidden Anthropic reasoning are never logged. Threads calls use their own `THREADS_AI_MAX_TOKENS=8192` output cap and `THREADS_AI_CALL_TIMEOUT=90s`; the complete planner → writer → reviewer flow has `THREADS_AI_TIMEOUT=300s`. These are safety ceilings, not token-spending targets, so a one- or two-post daily cadence gets enough creative headroom without forcing the provider to consume the cap.
+
+Prometheus counters segment both ready drafts and confirmed publications by bounded objective and `scenario_id`: `belcanto_drafts_ready_objective_*`, `belcanto_drafts_ready_scenario_*`, `belcanto_posts_published_objective_*`, and `belcanto_posts_published_scenario_*`. This makes the editorial mix and publish-through rate measurable without putting material or post text into metric labels.
 
 Pretty-print only these reviews from Compose logs:
 
@@ -164,9 +184,9 @@ docker compose logs --no-color --no-log-prefix app \
         review, text}]}'
 ```
 
-Text-only remains available whenever a photo would be decorative. If the independent editor decides a photographic object or atmosphere adds meaning and `THREADS_PHOTO_PROVIDER=pexels` is configured, it supplies only the visual strategy and a short anonymous English query. The app then takes the first result that passes its host, metadata, people-hint, size, and decode checks; Anthropic does not inspect or certify that concrete file. The app downloads it from the allowlisted Pexels CDN, re-encodes it as JPEG to remove EXIF/GPS, and stores source/author attribution. A failed search never blocks the winning text. The operator sees the exact combined preview and remains the final editor: the suggested photo can be removed or replaced with a real Belcanto photo. No image is generated by AI, but a public stock API cannot provide a cryptographic guarantee about how every uploaded file was created, so the strictest non-AI option is the school's own verified media library.
+Text-only remains available whenever a photo would be decorative. If the independent editor decides a photographic object or atmosphere adds meaning and `THREADS_PHOTO_PROVIDER=pexels` is configured, it supplies only the visual strategy. The application discards any model-written query and derives a fixed English object-or-space query from the validated `scenario_id`; neither operator material nor generated post text can become a Pexels request. The app then takes the first result that passes its host, metadata, people-hint, size, and decode checks; Anthropic does not inspect or certify that concrete file. The app downloads it from the allowlisted Pexels CDN, re-encodes it as JPEG to remove EXIF/GPS, and stores source/author attribution. A failed search never blocks the winning text. The operator sees the exact combined preview and remains the final editor: the suggested photo can be removed or replaced with a real Belcanto photo. No image is generated by AI, but a public stock API cannot provide a cryptographic guarantee about how every uploaded file was created, so the strictest non-AI option is the school's own verified media library.
 
-The editor also stores a safe anonymous Pexels query when it recommends `text_only` or an authentic Belcanto photo. This makes the visual mode a recommendation rather than a lock. Every current preview exposes the applicable controls: `📷 Подобрать фото в Pexels`, `🔄 Другое фото из Pexels`, `🖼 Загрузить своё фото`, and `📝 Только текст`. A manual search or replacement never changes the post text. The previous preview remains authoritative until the new asset has been downloaded, normalized, and atomically attached; a retry after Telegram delivery failure reuses the exact committed asset instead of searching twice.
+The draft also stores that application-derived fallback query when the editor recommends `text_only` or an authentic Belcanto photo. This makes the visual mode a recommendation rather than a lock. Every current preview exposes the applicable controls: `📷 Подобрать фото в Pexels`, `🔄 Другое фото из Pexels`, `🖼 Загрузить своё фото`, and `📝 Только текст`. A manual search or replacement derives the query again from the stored scenario and never changes the post text. The previous preview remains authoritative until the new asset has been downloaded, normalized, and atomically attached; a retry after Telegram delivery failure reuses the exact committed asset instead of searching twice.
 
 Manual visual changes are separate from the immutable generation-time editorial review. Inspect the latest successful override with:
 
@@ -177,7 +197,7 @@ docker compose logs --no-color --no-log-prefix app \
 
 An operator-supplied image is resized to the Threads limit, re-encoded as JPEG to remove EXIF/GPS metadata, stored with the owned draft, and never sent to Anthropic. The confirmation label records that Belcanto may use the image and has consent from identifiable people (and a legal representative for children). For a Pexels illustration it additionally asks the operator to confirm that the context does not imply endorsement by a depicted person.
 
-The first slice is deliberately fact-closed. It knows only that Belcanto is a vocal school in Astana. The model and application validator reject invented prices, discounts, trial terms, students, teachers, testimonials, results, events, schedules, availability, and current happenings.
+The no-material path is deliberately fact-closed: it knows only the immutable Belcanto facts supplied by the application. A material-backed post may use only the bounded operator evidence from that workflow. Both paths reject unsupported prices, discounts, trial terms, students, teachers, testimonials, results, events, schedules, availability, addresses, promotions, and current happenings.
 
 ### Safe local smoke test
 
@@ -188,7 +208,7 @@ THREADS_PHOTO_PROVIDER=disabled
 BELCANTO_REVIEW_LOG_MODE=full
 ```
 
-Restart the app, accept the normal consent gate, and send `/threads`. The fake publisher exercises the complete confirmation and durable idempotency flow without contacting Meta.
+Restart the app, accept the normal consent gate, and send `/threads`. Choose each goal at least once, use confirmed text material for `trial`, and test the explicit no-material path with one of the other four goals. Then inspect the exact preview. The fake publisher exercises confirmation and durable idempotency without contacting Meta.
 
 ### Connect the Belcanto Threads account
 

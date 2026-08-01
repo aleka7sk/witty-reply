@@ -233,10 +233,7 @@ func buildProvider(cfg config.Config) (ai.Provider, error) {
 	case "fake":
 		return ai.NewFake(), nil
 	case "anthropic":
-		provider, err := ai.NewAnthropic(ai.AnthropicConfig{
-			APIKey: cfg.AI.AnthropicKey, BaseURL: cfg.AI.AnthropicURL, Model: cfg.AI.Model, Effort: cfg.AI.Effort,
-			MaxTokens: cfg.AI.MaxTokens, Timeout: cfg.AI.Timeout, MaxRetries: cfg.AI.MaxRetries,
-		})
+		provider, err := ai.NewAnthropic(buildAnthropicConfig(cfg))
 		if err != nil {
 			return nil, fmt.Errorf("create Anthropic provider: %w", err)
 		}
@@ -252,6 +249,14 @@ func buildProvider(cfg config.Config) (ai.Provider, error) {
 		return provider, nil
 	default:
 		return nil, fmt.Errorf("unknown AI provider %q", cfg.AI.Provider)
+	}
+}
+
+func buildAnthropicConfig(cfg config.Config) ai.AnthropicConfig {
+	return ai.AnthropicConfig{
+		APIKey: cfg.AI.AnthropicKey, BaseURL: cfg.AI.AnthropicURL, Model: cfg.AI.Model, Effort: cfg.AI.Effort,
+		MaxTokens: cfg.AI.MaxTokens, ThreadMaxTokens: cfg.AI.ThreadMaxTokens,
+		Timeout: cfg.AI.Timeout, ThreadTimeout: cfg.AI.ThreadTimeout, MaxRetries: cfg.AI.MaxRetries,
 	}
 }
 

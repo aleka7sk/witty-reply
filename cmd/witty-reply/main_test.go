@@ -12,9 +12,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aleka7sk/witty-reply/internal/config"
 	"github.com/aleka7sk/witty-reply/internal/observability"
 	"github.com/aleka7sk/witty-reply/internal/store"
 )
+
+func TestBuildAnthropicConfigCarriesSeparateThreadBudget(t *testing.T) {
+	cfg := config.Config{AI: config.AI{
+		AnthropicKey: "anthropic-key", AnthropicURL: "https://api.anthropic.test", Model: "claude-test", Effort: "medium",
+		MaxTokens: 1800, ThreadMaxTokens: 8192,
+		Timeout: 45 * time.Second, ThreadTimeout: 90 * time.Second, MaxRetries: 2,
+	}}
+
+	providerConfig := buildAnthropicConfig(cfg)
+	if providerConfig.MaxTokens != 1800 || providerConfig.ThreadMaxTokens != 8192 {
+		t.Fatalf("token budgets = ordinary:%d Threads:%d", providerConfig.MaxTokens, providerConfig.ThreadMaxTokens)
+	}
+	if providerConfig.Timeout != 45*time.Second || providerConfig.ThreadTimeout != 90*time.Second {
+		t.Fatalf("timeouts = ordinary:%s Threads:%s", providerConfig.Timeout, providerConfig.ThreadTimeout)
+	}
+}
 
 func TestRunContextPollingSmoke(t *testing.T) {
 	updatesObserved := make(chan struct{})

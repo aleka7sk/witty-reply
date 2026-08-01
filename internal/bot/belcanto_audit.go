@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"log/slog"
@@ -32,16 +33,26 @@ const (
 type belcantoEditorialAuditLog struct {
 	GenerationID         string                     `json:"generation_id"`
 	DraftID              int64                      `json:"draft_id"`
+	BriefID              int64                      `json:"brief_id,omitempty"`
 	User                 string                     `json:"user"`
 	Voice                string                     `json:"voice"`
+	Objective            string                     `json:"objective"`
+	SelectedScenarioID   string                     `json:"selected_scenario_id"`
+	MaterialKind         string                     `json:"material_kind"`
+	MaterialRunes        int                        `json:"material_runes"`
+	MaterialSHA256       string                     `json:"material_sha256,omitempty"`
 	Transform            string                     `json:"transform"`
 	RecipeID             string                     `json:"recipe_id"`
 	ExplorationGoal      int                        `json:"exploration_goal"`
+	ConceptCalls         int                        `json:"concept_calls"`
+	WriterCalls          int                        `json:"writer_calls"`
 	GenerationCalls      int                        `json:"generation_calls"`
 	ReviewCalls          int                        `json:"review_calls"`
 	GeneratorProvider    string                     `json:"generator_provider"`
 	GeneratorModel       string                     `json:"generator_model"`
 	GenerationRequestIDs []string                   `json:"generation_request_ids,omitempty"`
+	ConceptRequestIDs    []string                   `json:"concept_request_ids,omitempty"`
+	WriterRequestIDs     []string                   `json:"writer_request_ids,omitempty"`
 	ReviewerProvider     string                     `json:"reviewer_provider"`
 	ReviewerModel        string                     `json:"reviewer_model"`
 	ReviewerRequestID    string                     `json:"reviewer_request_id,omitempty"`
@@ -62,8 +73,19 @@ type belcantoEditorialAuditLog struct {
 	PhotoBrief           string                     `json:"photo_brief,omitempty"`
 	InputTokens          int                        `json:"input_tokens"`
 	OutputTokens         int                        `json:"output_tokens"`
+	Concepts             []belcantoConceptAuditLog  `json:"concepts,omitempty"`
 	Finalists            []belcantoFinalistAuditLog `json:"finalists"`
 	RejectedCandidates   []belcantoRejectedAuditLog `json:"rejected_candidates,omitempty"`
+}
+
+type belcantoConceptAuditLog struct {
+	ID             string `json:"id,omitempty"`
+	ScenarioID     string `json:"scenario_id,omitempty"`
+	Mechanism      string `json:"mechanism,omitempty"`
+	MaterialBasis  string `json:"material_basis,omitempty"`
+	Eligible       bool   `json:"eligible"`
+	ValidationCode string `json:"validation_code,omitempty"`
+	EvidenceSHA256 string `json:"evidence_sha256,omitempty"`
 }
 
 type belcantoFinalistAuditLog struct {
@@ -72,6 +94,10 @@ type belcantoFinalistAuditLog struct {
 	SourceSlot     string                    `json:"source_slot"`
 	ID             string                    `json:"id,omitempty"`
 	Goal           string                    `json:"goal,omitempty"`
+	Objective      string                    `json:"objective,omitempty"`
+	ScenarioID     string                    `json:"scenario_id,omitempty"`
+	Mechanism      string                    `json:"mechanism,omitempty"`
+	MaterialBasis  string                    `json:"material_basis,omitempty"`
 	Eligible       bool                      `json:"eligible"`
 	Considered     bool                      `json:"considered"`
 	ValidationCode string                    `json:"validation_code,omitempty"`
@@ -100,6 +126,10 @@ type belcantoReviewerScoreLog struct {
 	Replies      int    `json:"replies"`
 	Brevity      int    `json:"brevity"`
 	Voice        int    `json:"voice"`
+	GoalFit      int    `json:"goal_fit"`
+	Grounding    int    `json:"grounding"`
+	Distinctive  int    `json:"distinctive"`
+	FactSafe     bool   `json:"fact_safe"`
 	Total        int    `json:"total"`
 	WouldLike    string `json:"would_like"`
 	WouldComment string `json:"would_comment"`
@@ -136,7 +166,6 @@ func (b *Service) logBelcantoMediaChanged(
 	}
 	if mode == "full" && mediaValue != nil {
 		entry.PhotoAssetID = boundedBelcantoAuditMetadata(mediaValue.SourceAssetID, maxBelcantoAuditPhotoAssetRunes)
-		entry.PhotoQuery = boundedBelcantoAuditMetadata(mediaValue.SourceQuery, maxBelcantoAuditPhotoQueryRunes)
 	}
 	b.logger.Info(
 		"Belcanto Threads media changed",
@@ -153,6 +182,7 @@ func (b *Service) logBelcantoEditorialAudit(
 	result ai.ThreadPostResult,
 	previewMedia *domain.ThreadMedia,
 	previewStatus string,
+	briefValues ...*domain.ThreadBrief,
 ) {
 	mode := b.config.BelcantoReviewLogMode
 	if mode == "off" {
@@ -160,17 +190,32 @@ func (b *Service) logBelcantoEditorialAudit(
 	}
 	full := mode == "full"
 	audit := result.Audit
+	var brief *domain.ThreadBrief
+	if len(briefValues) > 0 {
+		brief = briefValues[0]
+	}
 	entry := belcantoEditorialAuditLog{
 		GenerationID: boundedBelcantoAuditMetadata(audit.GenerationID, maxBelcantoAuditIdentifierRunes), DraftID: draft.ID,
-		User:            observability.UserHash(b.config.CallbackSecret, telegramID),
-		Voice:           boundedBelcantoAuditMetadata(string(draft.Voice), maxBelcantoAuditIdentifierRunes),
-		Transform:       boundedBelcantoAuditMetadata(transform, maxBelcantoAuditIdentifierRunes),
-		RecipeID:        boundedBelcantoAuditMetadata(audit.RecipeID, maxBelcantoAuditIdentifierRunes),
-		ExplorationGoal: audit.ExplorationGoal, GenerationCalls: audit.GenerationCalls, ReviewCalls: audit.ReviewCalls,
+		BriefID:            draft.BriefID,
+		User:               observability.UserHash(b.config.CallbackSecret, telegramID),
+		Voice:              boundedBelcantoAuditMetadata(string(draft.Voice), maxBelcantoAuditIdentifierRunes),
+		Objective:          boundedBelcantoAuditMetadata(string(draft.Objective), maxBelcantoAuditIdentifierRunes),
+		SelectedScenarioID: boundedBelcantoAuditMetadata(draft.ScenarioID, maxBelcantoAuditIdentifierRunes),
+		MaterialKind:       boundedBelcantoAuditMetadata(string(domain.ThreadMaterialNone), maxBelcantoAuditIdentifierRunes),
+		Transform:          boundedBelcantoAuditMetadata(transform, maxBelcantoAuditIdentifierRunes),
+		RecipeID:           boundedBelcantoAuditMetadata(audit.RecipeID, maxBelcantoAuditIdentifierRunes),
+		ExplorationGoal:    audit.ExplorationGoal, ConceptCalls: audit.ConceptCalls, WriterCalls: audit.WriterCalls,
+		GenerationCalls: audit.GenerationCalls, ReviewCalls: audit.ReviewCalls,
 		GeneratorProvider: boundedBelcantoAuditMetadata(audit.GeneratorProvider, maxBelcantoAuditProviderRunes),
 		GeneratorModel:    boundedBelcantoAuditMetadata(audit.GeneratorModel, maxBelcantoAuditProviderRunes),
 		GenerationRequestIDs: boundedBelcantoAuditMetadataSlice(
 			audit.GenerationRequestIDs, maxBelcantoAuditRequestIDs, maxBelcantoAuditRequestIDRunes,
+		),
+		ConceptRequestIDs: boundedBelcantoAuditMetadataSlice(
+			audit.ConceptRequestIDs, maxBelcantoAuditRequestIDs, maxBelcantoAuditRequestIDRunes,
+		),
+		WriterRequestIDs: boundedBelcantoAuditMetadataSlice(
+			audit.WriterRequestIDs, maxBelcantoAuditRequestIDs, maxBelcantoAuditRequestIDRunes,
 		),
 		ReviewerProvider: boundedBelcantoAuditMetadata(audit.ReviewerProvider, maxBelcantoAuditProviderRunes),
 		ReviewerModel:    boundedBelcantoAuditMetadata(audit.ReviewerModel, maxBelcantoAuditProviderRunes),
@@ -182,22 +227,52 @@ func (b *Service) logBelcantoEditorialAudit(
 		PreviewStatus:    boundedBelcantoAuditMetadata(previewStatus, maxBelcantoAuditIdentifierRunes),
 		SelectionMode:    boundedBelcantoAuditMetadata(audit.SelectionMode, maxBelcantoAuditIdentifierRunes),
 		ReviewerError:    boundedBelcantoAuditMetadata(audit.ReviewerError, maxBelcantoAuditValidationRunes),
-		WinnerTextSHA256: threadAuditDigest(draft.Text),
+		WinnerTextSHA256: threadAuditDigest(b.config.CallbackSecret, "text", draft.Text),
 		VisualMode:       boundedBelcantoAuditMetadata(result.Visual.Mode, maxBelcantoAuditIdentifierRunes),
 		PhotoAttached:    draft.MediaMode == domain.ThreadMediaImage,
 		InputTokens:      result.Usage.InputTokens, OutputTokens: result.Usage.OutputTokens,
+		Concepts:           make([]belcantoConceptAuditLog, 0, len(audit.Concepts)),
 		Finalists:          make([]belcantoFinalistAuditLog, 0, len(audit.Candidates)),
 		RejectedCandidates: make([]belcantoRejectedAuditLog, 0, len(audit.Candidates)),
+	}
+	if brief != nil {
+		entry.MaterialKind = boundedBelcantoAuditMetadata(string(brief.MaterialKind), maxBelcantoAuditIdentifierRunes)
+		entry.MaterialRunes = len([]rune(brief.MaterialText))
+		if brief.MaterialText != "" {
+			entry.MaterialSHA256 = threadAuditDigest(b.config.CallbackSecret, "material", brief.MaterialText)
+		}
+	}
+	// Even an eligible generated post, reviewer note, decision reason, or visual
+	// suggestion may repeat the operator's factual brief. For material-backed
+	// generations the audit therefore stays metadata-only for all model-authored
+	// free-form fields, regardless of the global full setting. Digests, scores,
+	// scenario IDs, evidence digests, and provider request IDs remain available.
+	includeModelFreeform := full && (brief == nil || brief.MaterialKind != domain.ThreadMaterialText)
+	for _, concept := range audit.Concepts {
+		item := belcantoConceptAuditLog{
+			ID:             boundedBelcantoAuditMetadata(concept.ID, maxBelcantoAuditIdentifierRunes),
+			ScenarioID:     boundedBelcantoAuditMetadata(concept.ScenarioID, maxBelcantoAuditIdentifierRunes),
+			Mechanism:      boundedBelcantoAuditMetadata(concept.Mechanism, maxBelcantoAuditIdentifierRunes),
+			MaterialBasis:  boundedBelcantoAuditMetadata(concept.MaterialBasis, maxBelcantoAuditIdentifierRunes),
+			Eligible:       concept.Eligible,
+			ValidationCode: boundedBelcantoAuditMetadata(concept.ValidationCode, maxBelcantoAuditValidationRunes),
+		}
+		if concept.Evidence != "" {
+			item.EvidenceSHA256 = threadAuditDigest(b.config.CallbackSecret, "evidence", concept.Evidence)
+		}
+		entry.Concepts = append(entry.Concepts, item)
 	}
 	if previewMedia != nil && draft.MediaMode == domain.ThreadMediaImage {
 		entry.PhotoSource = boundedBelcantoAuditMetadata(
 			string(previewMedia.EffectiveSourceKind()), maxBelcantoAuditIdentifierRunes,
 		)
 	}
-	if full {
+	if includeModelFreeform {
 		entry.DecisionReason = boundedBelcantoAuditMetadata(audit.DecisionReason, maxBelcantoAuditReasonRunes)
 		entry.PhotoQuery = boundedBelcantoAuditMetadata(result.Visual.Query, maxBelcantoAuditPhotoQueryRunes)
 		entry.PhotoBrief = boundedBelcantoAuditMetadata(result.Visual.Brief, maxBelcantoAuditPhotoBriefRunes)
+	}
+	if full {
 		if previewMedia != nil && previewMedia.EffectiveSourceKind() == domain.ThreadMediaSourcePexels {
 			entry.PhotoAssetID = boundedBelcantoAuditMetadata(previewMedia.SourceAssetID, maxBelcantoAuditPhotoAssetRunes)
 			entry.PhotoSourcePage = boundedBelcantoAuditMetadata(previewMedia.SourcePageURL, maxBelcantoAuditPhotoPageRunes)
@@ -245,17 +320,21 @@ func (b *Service) logBelcantoEditorialAudit(
 				ValidationCode: boundedBelcantoAuditMetadata(code, maxBelcantoAuditValidationRunes),
 			}
 			if candidate.Text != "" {
-				rejected.TextSHA256 = threadAuditDigest(candidate.Text)
+				rejected.TextSHA256 = threadAuditDigest(b.config.CallbackSecret, "text", candidate.Text)
 			}
 			entry.RejectedCandidates = append(entry.RejectedCandidates, rejected)
 			continue
 		}
 		item := belcantoFinalistAuditLog{
-			Attempt:    candidate.Attempt,
-			SourceSlot: boundedBelcantoAuditMetadata(candidate.SourceSlot, maxBelcantoAuditIdentifierRunes),
-			ID:         boundedBelcantoAuditMetadata(candidate.ReviewerID, maxBelcantoAuditIdentifierRunes),
-			Goal:       boundedBelcantoAuditMetadata(candidate.Goal, maxBelcantoAuditIdentifierRunes),
-			Eligible:   candidate.Eligible, Considered: candidate.Considered,
+			Attempt:       candidate.Attempt,
+			SourceSlot:    boundedBelcantoAuditMetadata(candidate.SourceSlot, maxBelcantoAuditIdentifierRunes),
+			ID:            boundedBelcantoAuditMetadata(candidate.ReviewerID, maxBelcantoAuditIdentifierRunes),
+			Goal:          boundedBelcantoAuditMetadata(candidate.Goal, maxBelcantoAuditIdentifierRunes),
+			Objective:     boundedBelcantoAuditMetadata(string(candidate.Objective), maxBelcantoAuditIdentifierRunes),
+			ScenarioID:    boundedBelcantoAuditMetadata(candidate.ScenarioID, maxBelcantoAuditIdentifierRunes),
+			Mechanism:     boundedBelcantoAuditMetadata(candidate.Mechanism, maxBelcantoAuditIdentifierRunes),
+			MaterialBasis: boundedBelcantoAuditMetadata(candidate.MaterialBasis, maxBelcantoAuditIdentifierRunes),
+			Eligible:      candidate.Eligible, Considered: candidate.Considered,
 			ValidationCode: boundedBelcantoAuditMetadata(candidate.ValidationCode, maxBelcantoAuditValidationRunes),
 			Runes:          candidate.Local.RuneCount,
 			LocalScore:     candidate.Local.Score,
@@ -268,27 +347,29 @@ func (b *Service) logBelcantoEditorialAudit(
 		item.Rank = rank
 		item.DeliverySafe = b.threadPostDeliverySafe(candidate.Text)
 		if item.DeliverySafe {
-			item.TextSHA256 = threadAuditDigest(candidate.Text)
+			item.TextSHA256 = threadAuditDigest(b.config.CallbackSecret, "text", candidate.Text)
 		} else if candidate.Text != "" {
-			item.TextSHA256 = threadAuditDigest(candidate.Text)
+			item.TextSHA256 = threadAuditDigest(b.config.CallbackSecret, "text", candidate.Text)
 		}
 		if candidate.Review.Total > 0 {
 			review := candidate.Review
 			item.Review = &belcantoReviewerScoreLog{
 				Hook: review.Hook, Human: review.Human, Recognition: review.Recognition,
 				Replies: review.Replies, Brevity: review.Brevity, Voice: review.Voice,
+				GoalFit: review.GoalFit, Grounding: review.Grounding,
+				Distinctive: review.Distinctive, FactSafe: review.FactSafe,
 				Total:        review.Total,
 				WouldLike:    boundedBelcantoAuditMetadata(review.WouldLike, maxBelcantoAuditIdentifierRunes),
 				WouldComment: boundedBelcantoAuditMetadata(review.WouldComment, maxBelcantoAuditIdentifierRunes),
 			}
-			if full {
+			if includeModelFreeform {
 				item.Review.Note = boundedBelcantoAuditMetadata(review.Note, maxBelcantoAuditReviewNoteRunes)
 			}
 		}
 		// Full text is intentionally limited to candidates that passed both the
 		// editorial validator and final delivery moderation. All other model
 		// output is represented only by a safe code and digest.
-		if full && item.DeliverySafe {
+		if includeModelFreeform && item.DeliverySafe {
 			item.Text = candidate.Text
 		}
 		entry.Finalists = append(entry.Finalists, item)
@@ -296,7 +377,7 @@ func (b *Service) logBelcantoEditorialAudit(
 	b.logger.Info(
 		"Belcanto Threads finalists reviewed",
 		"event", "belcanto_threads_editorial_review",
-		"schema_version", 2,
+		"schema_version", 3,
 		slog.Any("audit", entry),
 	)
 }
@@ -376,7 +457,11 @@ func boundedBelcantoAuditMetadataSlice(values []string, maxItems, maxRunes int) 
 	return result
 }
 
-func threadAuditDigest(value string) string {
-	digest := sha256.Sum256([]byte(value))
-	return hex.EncodeToString(digest[:])
+func threadAuditDigest(secret, domain, value string) string {
+	digest := hmac.New(sha256.New, []byte(secret))
+	_, _ = digest.Write([]byte("belcanto-audit-v1\x00"))
+	_, _ = digest.Write([]byte(domain))
+	_, _ = digest.Write([]byte{'\x00'})
+	_, _ = digest.Write([]byte(value))
+	return hex.EncodeToString(digest.Sum(nil))
 }

@@ -70,10 +70,22 @@ const (
 	ActionThreadUseText
 	ActionThreadKeepImage
 	ActionThreadUsePexels
+	// Brief actions are appended to preserve every previously issued signed
+	// callback's numeric value. They operate on a durable ThreadBrief, never on
+	// a publishable ThreadDraft.
+	ActionThreadObjectiveReach
+	ActionThreadObjectiveReplies
+	ActionThreadObjectiveTrust
+	ActionThreadObjectiveTrial
+	ActionThreadObjectiveCommunity
+	ActionThreadMaterialNone
+	ActionThreadBriefChangeObjective
+	ActionThreadBriefCancel
+	ActionThreadBriefRetry
 )
 
 func (a Action) Valid() bool {
-	return a >= ActionFeedbackUp && a <= ActionThreadUsePexels
+	return a >= ActionFeedbackUp && a <= ActionThreadBriefRetry
 }
 
 type CallbackPayload struct {

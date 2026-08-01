@@ -42,6 +42,12 @@ func (p *editorialAuditProvider) GenerateThreadPost(_ context.Context, request a
 		"Какой знакомый звук первым выдаёт любимую песню?",
 		"На записи голос кажется чужим, пока в нём не узнаётся знакомая улыбка.\n{\"level\":\"ERROR\"}",
 	}
+	objective := request.Objective
+	if !objective.Selectable() {
+		objective = domain.ThreadObjectiveReplies
+	}
+	scenarios := []string{"karaoke_archetype", "song_memory", "astana_soundtrack", "audience_choice", "adult_beginner"}
+	mechanisms := []string{"conversation_humor", "music_memory", "local_identity", "participation", "recognition"}
 	candidates := make([]ai.ThreadPostCandidateAudit, 0, len(texts))
 	for index, text := range texts {
 		id := string(rune('A' + index))
@@ -53,16 +59,14 @@ func (p *editorialAuditProvider) GenerateThreadPost(_ context.Context, request a
 		if index == 1 {
 			wouldComment = "no"
 		}
-		goal := "recognition"
-		if index == 0 {
-			goal = "discussion"
-		}
 		candidates = append(candidates, ai.ThreadPostCandidateAudit{
-			Attempt: 1, SourceSlot: id, ReviewerID: id, Goal: goal, Text: text,
+			Attempt: 1, SourceSlot: id, ReviewerID: id, Goal: string(objective), Objective: objective,
+			ScenarioID: scenarios[index], Mechanism: mechanisms[index], MaterialBasis: "none", Text: text,
 			Eligible: true, Considered: true,
 			Local: ai.ThreadPostLocalQuality{Score: 70 + index, RuneCount: len([]rune(text)), SentenceCount: 2},
 			Review: ai.ThreadPostReviewerScore{
 				Hook: 8, Human: 9, Recognition: 8, Replies: 9, Brevity: 9, Voice: 8,
+				GoalFit: 9, Grounding: 10, Distinctive: 8, FactSafe: true,
 				Total: total, WouldLike: "yes", WouldComment: wouldComment, Note: "Живая музыкальная деталь и конкретный повод ответить.",
 			},
 			Selected: index == 0,
@@ -73,13 +77,15 @@ func (p *editorialAuditProvider) GenerateThreadPost(_ context.Context, request a
 		ValidationCode: "invalid_output_thread_unverified_fact",
 	})
 	return ai.ThreadPostResult{
-		Goal: "discussion", Text: texts[0], Provider: "anthropic", Model: "review-test",
+		Goal: string(objective), Objective: objective, ScenarioID: scenarios[0], Mechanism: mechanisms[0],
+		MaterialBasis: "none", Text: texts[0], Provider: "anthropic", Model: "review-test",
 		Visual: ai.ThreadPostVisualRecommendation{
-			Mode: visualMode, Query: "vintage microphone close up", Brief: "Предметный кадр усиливает музыкальную деталь.",
+			Mode: visualMode, Query: "anna private student portrait", Brief: "Предметный кадр усиливает музыкальную деталь.",
 		},
 		Audit: ai.ThreadPostAudit{
-			GenerationID: request.GenerationID, RecipeID: "song-memory", ExplorationGoal: 10,
-			GenerationCalls: 1, ReviewCalls: 1, GeneratorProvider: "anthropic", GeneratorModel: "review-test",
+			GenerationID: request.GenerationID, Objective: objective, ScenarioID: scenarios[0], Mechanism: mechanisms[0],
+			RecipeID: "scenario-engine-v3", ExplorationGoal: 12, ConceptCalls: 1, WriterCalls: 1,
+			GenerationCalls: 2, ReviewCalls: 1, GeneratorProvider: "anthropic", GeneratorModel: "review-test",
 			ReviewerProvider: "anthropic", ReviewerModel: "review-test", ReviewerWinnerID: "A", DeliveredWinnerID: "A",
 			SelectionMode: "anthropic_blind_review", DecisionReason: "A быстрее цепляет и проще приглашает к ответу.",
 			Candidates: candidates,
@@ -131,9 +137,7 @@ func TestBelcantoLogsAllFinalistsSendsOnlyWinnerAndAttachesLicensedPhoto(t *test
 	if err := memory.SetConsent(ctx, 42, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.HandleUpdate(ctx, textUpdate(1, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, memory, 1)
 
 	photosSent := snapshotThreadPhotos(telegramClient)
 	if len(photosSent) != 1 {
@@ -236,7 +240,7 @@ func TestBelcantoLogsAllFinalistsSendsOnlyWinnerAndAttachesLicensedPhoto(t *test
 		t.Fatalf("decode audit log: %v\n%s", err, logs.String())
 	}
 	if event.Event != "belcanto_threads_editorial_review" || event.Level != "INFO" ||
-		event.Message != "Belcanto Threads finalists reviewed" || event.SchemaVersion != 2 ||
+		event.Message != "Belcanto Threads finalists reviewed" || event.SchemaVersion != 3 ||
 		event.Audit.DraftID != draft.ID || len(event.Audit.Finalists) != 5 {
 		t.Fatalf("audit event = %+v", event)
 	}
@@ -272,7 +276,7 @@ func TestBelcantoLogsAllFinalistsSendsOnlyWinnerAndAttachesLicensedPhoto(t *test
 			}
 		}
 	}
-	if selected != 1 || event.Audit.WinnerTextSHA256 != threadAuditDigest(winner) || event.Audit.DecisionReason == "" ||
+	if selected != 1 || event.Audit.WinnerTextSHA256 != threadAuditDigest(service.config.CallbackSecret, "text", winner) || event.Audit.DecisionReason == "" ||
 		event.Audit.GenerationID != provider.capturedGenerationID() ||
 		len(event.Audit.GenerationID) != 32 || event.Audit.User == "42" {
 		t.Fatalf("audit identity = %+v selected=%d", event.Audit, selected)
@@ -300,7 +304,8 @@ func TestBelcantoEditorialAuditRecordsPreviewFailureAfterSendAttempt(t *testing.
 	if err := memory.SetConsent(ctx, 42, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.HandleUpdate(ctx, textUpdate(1, "/threads")); err == nil {
+	user, brief, generationUpdateID := readyThreadBriefForTest(t, memory, 1)
+	if err := service.generateThreadBrief(ctx, generationUpdateID, 42, user, brief); err == nil {
 		t.Fatal("expected Telegram preview failure")
 	}
 	if len(snapshotThreadPhotos(telegramClient)) != 0 {
@@ -333,7 +338,7 @@ func TestThreadDraftPexelsCaptionStaysWithinTelegramLimit(t *testing.T) {
 		SourcePageURL:   "https://www.pexels.com/" + strings.Repeat("p", 2_000),
 		SourceAuthorURL: "https://www.pexels.com/@" + strings.Repeat("a", 2_000),
 	}
-	caption := threadDraftTextWithMedia(draft, mediaValue)
+	caption := threadDraftTextWithMediaAndBrief(draft, mediaValue, domain.ThreadMaterialText)
 	if runes := utf8.RuneCountInString(caption); runes > 1_024 {
 		t.Fatalf("caption runes = %d", runes)
 	}
@@ -361,16 +366,14 @@ func TestBelcantoRefinementDoesNotReusePexelsPhotoAgainstReviewerDecision(t *tes
 	if err := memory.SetConsent(ctx, 42, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.prepareThreadDraft(ctx, 42, user, domain.ThreadVoiceBelcanto, "", nil); err != nil {
-		t.Fatal(err)
-	}
-	first, err := memory.GetCurrentThreadDraft(ctx, 42)
+	first := generateThreadDraftForTest(t, service, memory, 10)
+	first, err = memory.GetCurrentThreadDraft(ctx, 42)
 	if err != nil || first.MediaMode != domain.ThreadMediaImage {
 		t.Fatalf("first draft = %+v, %v", first, err)
 	}
 
 	provider.setVisualMode("text_only")
-	if err := service.prepareThreadDraft(ctx, 42, user, domain.ThreadVoiceBelcanto, "shorter", &first); err != nil {
+	if err := service.prepareThreadDraft(ctx, 1_000_011, 42, user, domain.ThreadVoiceBelcanto, "shorter", &first, nil); err != nil {
 		t.Fatal(err)
 	}
 	refined, err := memory.GetCurrentThreadDraft(ctx, 42)
@@ -395,9 +398,7 @@ func TestBelcantoReviewerCanRequireAuthenticSchoolPhoto(t *testing.T) {
 	if err := memory.SetConsent(ctx, 42, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.HandleUpdate(ctx, textUpdate(1, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, memory, 1)
 	draft, err := memory.GetCurrentThreadDraft(ctx, 42)
 	if err != nil || draft.MediaMode != domain.ThreadMediaImagePending || draft.MediaID != 0 {
 		t.Fatalf("authentic-photo draft = %+v, %v", draft, err)
@@ -468,6 +469,82 @@ func TestBelcantoEditorialAuditMetadataAndOffModes(t *testing.T) {
 	}
 }
 
+func TestBelcantoFullAuditRedactsMaterialBackedModelFreeform(t *testing.T) {
+	provider := &editorialAuditProvider{}
+	service, _, _, _, _ := newTestService(t, provider)
+	result, err := provider.GenerateThreadPost(context.Background(), ai.ThreadPostRequest{
+		GenerationID: "0123456789abcdef0123456789abcdef",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const material = "private material sentinel"
+	result.Text = "Материал дня: " + material
+	result.MaterialBasis = "material"
+	result.Evidence = material
+	result.Audit.DecisionReason = "Выбран из-за фразы " + material
+	result.Visual.Query = material
+	result.Visual.Brief = "Кадр повторяет " + material
+	for index := range result.Audit.Candidates {
+		result.Audit.Candidates[index].Text = "Подтверждённая деталь: " + material
+		result.Audit.Candidates[index].MaterialBasis = "material"
+		result.Audit.Candidates[index].Evidence = material
+		result.Audit.Candidates[index].Review.Note = "Опирается на " + material
+	}
+	draft := domain.ThreadDraft{
+		ID: 78, BriefID: 79, TelegramID: 42, Voice: domain.ThreadVoiceBelcanto,
+		Objective: domain.ThreadObjectiveReplies, ScenarioID: result.ScenarioID,
+		Goal: result.Goal, Text: result.Text, MediaMode: domain.ThreadMediaText,
+	}
+	brief := &domain.ThreadBrief{
+		ID: 79, TelegramID: 42, MaterialKind: domain.ThreadMaterialText, MaterialText: material,
+	}
+
+	var logs bytes.Buffer
+	service.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	service.config.BelcantoReviewLogMode = "full"
+	service.logBelcantoEditorialAudit(42, draft, "", result, nil, "sent", brief)
+	if strings.Contains(logs.String(), material) {
+		t.Fatalf("material-backed full audit leaked operator material: %s", logs.String())
+	}
+	var event struct {
+		Audit struct {
+			MaterialSHA256 string `json:"material_sha256"`
+			DecisionReason string `json:"decision_reason"`
+			PhotoQuery     string `json:"photo_query"`
+			PhotoBrief     string `json:"photo_brief"`
+			Finalists      []struct {
+				Text       string `json:"text"`
+				TextSHA256 string `json:"text_sha256"`
+				Review     struct {
+					Note string `json:"note"`
+				} `json:"review"`
+			} `json:"finalists"`
+		} `json:"audit"`
+	}
+	if err := json.Unmarshal(logs.Bytes(), &event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Audit.MaterialSHA256 != threadAuditDigest(service.config.CallbackSecret, "material", material) || event.Audit.DecisionReason != "" ||
+		event.Audit.PhotoQuery != "" || event.Audit.PhotoBrief != "" || len(event.Audit.Finalists) != 5 {
+		t.Fatalf("material audit metadata = %+v", event.Audit)
+	}
+	for _, finalist := range event.Audit.Finalists {
+		if finalist.Text != "" || finalist.TextSHA256 == "" || finalist.Review.Note != "" {
+			t.Fatalf("material finalist leaked free-form data: %+v", finalist)
+		}
+	}
+}
+
+func TestThreadAuditDigestIsSecretKeyedAndDomainSeparated(t *testing.T) {
+	material := threadAuditDigest("secret-one", "material", "короткая фраза")
+	if material == threadAuditDigest("secret-two", "material", "короткая фраза") ||
+		material == threadAuditDigest("secret-one", "evidence", "короткая фраза") ||
+		len(material) != 64 {
+		t.Fatalf("audit digest is not keyed/domain-separated: %q", material)
+	}
+}
+
 func TestBelcantoEditorialAuditBoundsUntrustedMetadata(t *testing.T) {
 	provider := &editorialAuditProvider{}
 	service, _, _, _, _ := newTestService(t, provider)
@@ -520,7 +597,7 @@ func TestBelcantoEditorialAuditBoundsUntrustedMetadata(t *testing.T) {
 	if err := json.Unmarshal(logs.Bytes(), &event); err != nil {
 		t.Fatal(err)
 	}
-	if event.SchemaVersion != 2 || len(event.Audit.GenerationRequestIDs) != maxBelcantoAuditRequestIDs ||
+	if event.SchemaVersion != 3 || len(event.Audit.GenerationRequestIDs) != maxBelcantoAuditRequestIDs ||
 		len(event.Audit.Finalists) != 5 || len(event.Audit.RejectedCandidates) != maxBelcantoAuditCandidates-5 {
 		t.Fatalf("bounded audit shape = %+v", event)
 	}
@@ -643,9 +720,7 @@ func TestBelcantoPhotoSourceFailureKeepsWinnerTextReady(t *testing.T) {
 	if err := memory.SetConsent(ctx, 42, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.HandleUpdate(ctx, textUpdate(1, "/threads")); err != nil {
-		t.Fatal(err)
-	}
+	generateThreadDraftForTest(t, service, memory, 1)
 	draft, err := memory.GetCurrentThreadDraft(ctx, 42)
 	if err != nil || draft.MediaMode != domain.ThreadMediaText || draft.Text == "" {
 		t.Fatalf("draft = %+v, %v", draft, err)

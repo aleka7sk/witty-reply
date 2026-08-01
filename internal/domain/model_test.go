@@ -191,3 +191,125 @@ func TestThreadVoiceAndDraftStateValidity(t *testing.T) {
 		t.Fatal("unknown draft state was accepted")
 	}
 }
+
+func TestThreadEditorialMetadataValidation(t *testing.T) {
+	for _, objective := range []ThreadObjective{
+		ThreadObjectiveReach, ThreadObjectiveReplies, ThreadObjectiveTrust,
+		ThreadObjectiveTrial, ThreadObjectiveCommunity,
+	} {
+		if !objective.Valid() || !objective.Selectable() {
+			t.Fatalf("objective %q is not selectable", objective)
+		}
+		parsed, ok := ParseThreadObjective(" " + strings.ToUpper(string(objective)) + " ")
+		if !ok || parsed != objective {
+			t.Fatalf("ParseThreadObjective(%q) = %q, %v", objective, parsed, ok)
+		}
+	}
+	if !ThreadObjectiveLegacy.Valid() || ThreadObjectiveLegacy.Selectable() {
+		t.Fatal("legacy objective must be valid but not selectable")
+	}
+	if _, ok := ParseThreadObjective("sales"); ok {
+		t.Fatal("unknown objective was accepted")
+	}
+	for _, kind := range []ThreadMaterialKind{ThreadMaterialNone, ThreadMaterialText} {
+		parsed, ok := ParseThreadMaterialKind(" " + strings.ToUpper(string(kind)) + " ")
+		if !ok || parsed != kind || !kind.Valid() {
+			t.Fatalf("material kind %q is invalid", kind)
+		}
+	}
+	for _, scenarioID := range []string{"karaoke_archetype", "teacher_one_move", "scenario2"} {
+		if !ValidThreadScenarioID(scenarioID) {
+			t.Fatalf("scenario ID %q was rejected", scenarioID)
+		}
+	}
+	for _, scenarioID := range []string{"", "A_bad", "has-dash", "кириллица", strings.Repeat("a", 65)} {
+		if ValidThreadScenarioID(scenarioID) {
+			t.Fatalf("invalid scenario ID %q was accepted", scenarioID)
+		}
+	}
+}
+
+func TestThreadBriefValidationFollowsDurableStateMachine(t *testing.T) {
+	start := ThreadBrief{TelegramID: 42, StartUpdateID: 100, Voice: ThreadVoiceBelcanto}
+	if err := start.ValidateForStart(); err != nil {
+		t.Fatalf("ValidateForStart(): %v", err)
+	}
+	base := ThreadBrief{
+		ID: 1, TelegramID: 42, StartUpdateID: 100, Voice: ThreadVoiceBelcanto,
+		State: ThreadBriefAwaitingGoal, Revision: 1, Current: true,
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("awaiting goal: %v", err)
+	}
+	awaitingMaterial := base
+	awaitingMaterial.Objective = ThreadObjectiveReplies
+	awaitingMaterial.State = ThreadBriefAwaitingMaterial
+	awaitingMaterial.Revision = 2
+	if err := awaitingMaterial.Validate(); err != nil {
+		t.Fatalf("awaiting material: %v", err)
+	}
+	withText := awaitingMaterial
+	withText.MaterialKind = ThreadMaterialText
+	withText.MaterialText = "После работы ученица сначала боялась услышать запись своего голоса."
+	withText.MaterialUpdateID = 101
+	withText.State = ThreadBriefMaterialReady
+	withText.Revision = 3
+	if err := withText.Validate(); err != nil {
+		t.Fatalf("material ready: %v", err)
+	}
+	withoutMaterial := awaitingMaterial
+	withoutMaterial.MaterialKind = ThreadMaterialNone
+	withoutMaterial.MaterialUpdateID = 102
+	withoutMaterial.State = ThreadBriefMaterialReady
+	withoutMaterial.Revision = 3
+	if err := withoutMaterial.Validate(); err != nil {
+		t.Fatalf("no material: %v", err)
+	}
+	cancelled := withText
+	cancelled.State = ThreadBriefCancelled
+	cancelled.Current = false
+	cancelled.Revision++
+	if err := cancelled.Validate(); err != nil {
+		t.Fatalf("cancelled: %v", err)
+	}
+
+	invalid := []ThreadBrief{
+		func() ThreadBrief { value := base; value.Objective = ThreadObjectiveReach; return value }(),
+		func() ThreadBrief { value := awaitingMaterial; value.MaterialKind = ThreadMaterialText; return value }(),
+		func() ThreadBrief { value := withText; value.MaterialUpdateID = 0; return value }(),
+		func() ThreadBrief { value := withoutMaterial; value.MaterialText = "invented"; return value }(),
+		func() ThreadBrief { value := cancelled; value.Current = true; return value }(),
+	}
+	for index, value := range invalid {
+		if err := value.Validate(); err == nil {
+			t.Fatalf("invalid brief %d was accepted: %+v", index, value)
+		}
+	}
+}
+
+func TestThreadDraftRequiresCompleteMetadataWhenLinkedToBrief(t *testing.T) {
+	draft := ThreadDraft{
+		TelegramID: 42, Voice: ThreadVoiceBelcanto, Goal: "discussion",
+		BriefID: 9, Objective: ThreadObjectiveReplies, ScenarioID: "karaoke_archetype",
+		GenerationID: "generation-1", GenerationUpdateID: 101,
+		Text:     "Кто вы в караоке: тот, кто выбирает песню, или тот, кто внезапно забирает второй микрофон?",
+		Provider: "fake", Model: "deterministic", Revision: 1,
+	}
+	if err := draft.ValidateForCreate(); err != nil {
+		t.Fatalf("linked draft: %v", err)
+	}
+	for name, mutate := range map[string]func(*ThreadDraft){
+		"objective":         func(value *ThreadDraft) { value.Objective = ThreadObjectiveLegacy },
+		"scenario":          func(value *ThreadDraft) { value.ScenarioID = "" },
+		"generation":        func(value *ThreadDraft) { value.GenerationID = "" },
+		"generation update": func(value *ThreadDraft) { value.GenerationUpdateID = 0 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := draft
+			mutate(&candidate)
+			if err := candidate.ValidateForCreate(); err == nil {
+				t.Fatal("incomplete linked draft was accepted")
+			}
+		})
+	}
+}

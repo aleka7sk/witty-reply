@@ -5,12 +5,48 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/aleka7sk/witty-reply/internal/domain"
 )
 
 const maxThreadClaimTokenRunes = 128
+
+func normalizeLegacyThreadDraft(draft domain.ThreadDraft) domain.ThreadDraft {
+	if draft.Objective == "" {
+		draft.Objective = domain.ThreadObjectiveLegacy
+	}
+	if draft.ScenarioID == "" {
+		draft.ScenarioID = "legacy_unspecified"
+	}
+	return draft
+}
+
+func validateThreadMaterialChoice(updateID int64, kind domain.ThreadMaterialKind, value string) error {
+	if updateID <= 0 || !kind.Valid() || !utf8.ValidString(value) || strings.ContainsRune(value, '\x00') ||
+		utf8.RuneCountInString(value) > domain.MaxThreadMaterialRunes {
+		return ErrThreadBriefState
+	}
+	for _, character := range value {
+		if (unicode.IsControl(character) && character != '\n' && character != '\t') || unicode.In(character, unicode.Cf) {
+			return ErrThreadBriefState
+		}
+	}
+	switch kind {
+	case domain.ThreadMaterialNone:
+		if value != "" {
+			return ErrThreadBriefState
+		}
+	case domain.ThreadMaterialText:
+		if strings.TrimSpace(value) == "" {
+			return ErrThreadBriefState
+		}
+	default:
+		return ErrThreadBriefState
+	}
+	return nil
+}
 
 func validateThreadField(name, value string, maxRunes int, required bool) error {
 	if !utf8.ValidString(value) || strings.ContainsRune(value, '\x00') {

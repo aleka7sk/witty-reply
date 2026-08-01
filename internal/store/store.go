@@ -24,6 +24,14 @@ type Store interface {
 	RefundQuota(context.Context, int64, int64, domain.QuotaCategory) error
 	SaveGeneration(context.Context, domain.GenerationRecord) (int64, error)
 	GetGeneration(context.Context, int64, int64) (domain.GenerationRecord, error)
+	StartThreadBrief(context.Context, int64, int64, domain.ThreadVoice) (domain.ThreadBrief, bool, error)
+	GetThreadBrief(context.Context, int64, int64) (domain.ThreadBrief, error)
+	GetCurrentThreadBrief(context.Context, int64) (domain.ThreadBrief, error)
+	SetThreadBriefObjective(context.Context, int64, int64, uint32, domain.ThreadObjective) (domain.ThreadBrief, error)
+	SetThreadBriefMaterial(context.Context, int64, int64, uint32, int64, domain.ThreadMaterialKind, string) (domain.ThreadBrief, error)
+	CreateThreadDraftForBrief(context.Context, int64, uint32, domain.ThreadDraft, *domain.ThreadMedia) (domain.ThreadDraft, bool, error)
+	GetThreadDraftByGenerationUpdate(context.Context, int64, int64) (domain.ThreadDraft, error)
+	CancelThreadBrief(context.Context, int64, int64, uint32) error
 	CreateThreadDraft(context.Context, domain.ThreadDraft) (int64, error)
 	CreateThreadDraftWithMedia(context.Context, domain.ThreadDraft, domain.ThreadMedia) (int64, error)
 	GetThreadDraft(context.Context, int64, int64) (domain.ThreadDraft, error)

@@ -50,7 +50,19 @@ func TestAllThreadCallbacksStopBeforeAIAndMetaAfterConsentRevocation(t *testing.
 		{name: "no_sell", action: session.ActionThreadNoSell},
 		{name: "publish", action: session.ActionThreadPublish},
 		{name: "cancel", action: session.ActionThreadCancel},
+		{name: "use_image", action: session.ActionThreadUseImage},
+		{name: "use_text", action: session.ActionThreadUseText},
+		{name: "keep_image", action: session.ActionThreadKeepImage},
 		{name: "use_pexels", action: session.ActionThreadUsePexels},
+		{name: "objective_reach", action: session.ActionThreadObjectiveReach},
+		{name: "objective_replies", action: session.ActionThreadObjectiveReplies},
+		{name: "objective_trust", action: session.ActionThreadObjectiveTrust},
+		{name: "objective_trial", action: session.ActionThreadObjectiveTrial},
+		{name: "objective_community", action: session.ActionThreadObjectiveCommunity},
+		{name: "material_none", action: session.ActionThreadMaterialNone},
+		{name: "brief_change_objective", action: session.ActionThreadBriefChangeObjective},
+		{name: "brief_cancel", action: session.ActionThreadBriefCancel},
+		{name: "brief_retry", action: session.ActionThreadBriefRetry},
 	}
 
 	for _, test := range actions {
@@ -59,9 +71,7 @@ func TestAllThreadCallbacksStopBeforeAIAndMetaAfterConsentRevocation(t *testing.
 			service, telegramClient, provider := authorizedThreadsService(t, publisher)
 			ctx := context.Background()
 
-			if err := service.HandleUpdate(ctx, textUpdate(1, "/threads")); err != nil {
-				t.Fatal(err)
-			}
+			generateThreadDraftForTest(t, service, service.store, 1)
 			if provider.threadCalls.Load() != 1 {
 				t.Fatalf("initial generation calls = %d", provider.threadCalls.Load())
 			}
