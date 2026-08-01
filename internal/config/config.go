@@ -18,6 +18,7 @@ import (
 const (
 	productionTelegramAPIHost = "api.telegram.org"
 	productionThreadsAPIHost  = "graph.threads.net"
+	productionPexelsAPIHost   = "api.pexels.com"
 )
 
 type Config struct {
@@ -108,12 +109,18 @@ type Speech struct {
 // existing Witty Reply product can run without any Meta credentials.
 type Belcanto struct {
 	OperatorIDs         []int64
+	GenerationTimeout   time.Duration
+	ReviewLogMode       string
 	ThreadsProvider     string
 	ThreadsUserID       string
 	ThreadsAccessToken  string
 	ThreadsBaseURL      string
 	ThreadsMediaBaseURL string
 	ThreadsTimeout      time.Duration
+	PhotoProvider       string
+	PexelsAPIKey        string
+	PexelsBaseURL       string
+	PexelsTimeout       time.Duration
 }
 
 func Load() (Config, error) {
@@ -168,11 +175,17 @@ func Load() (Config, error) {
 			APIKey: get("SPEECH_API_KEY", ""), Model: get("SPEECH_MODEL", "whisper-1"), Timeout: duration("SPEECH_TIMEOUT", 60*time.Second),
 		},
 		Belcanto: Belcanto{
-			OperatorIDs: operatorIDs, ThreadsProvider: strings.ToLower(get("THREADS_PROVIDER", "disabled")),
-			ThreadsUserID: get("THREADS_USER_ID", ""), ThreadsAccessToken: get("THREADS_ACCESS_TOKEN", ""),
+			OperatorIDs: operatorIDs, GenerationTimeout: duration("THREADS_AI_TIMEOUT", 120*time.Second),
+			ReviewLogMode:   strings.ToLower(get("BELCANTO_REVIEW_LOG_MODE", "full")),
+			ThreadsProvider: strings.ToLower(get("THREADS_PROVIDER", "disabled")),
+			ThreadsUserID:   get("THREADS_USER_ID", ""), ThreadsAccessToken: get("THREADS_ACCESS_TOKEN", ""),
 			ThreadsBaseURL:      strings.TrimRight(get("THREADS_API_BASE_URL", "https://graph.threads.net/v1.0"), "/"),
 			ThreadsMediaBaseURL: strings.TrimRight(get("THREADS_MEDIA_BASE_URL", ""), "/"),
 			ThreadsTimeout:      duration("THREADS_TIMEOUT", 20*time.Second),
+			PhotoProvider:       strings.ToLower(get("THREADS_PHOTO_PROVIDER", "disabled")),
+			PexelsAPIKey:        get("PEXELS_API_KEY", ""),
+			PexelsBaseURL:       strings.TrimRight(get("PEXELS_API_BASE_URL", "https://api.pexels.com/v1"), "/"),
+			PexelsTimeout:       duration("PEXELS_TIMEOUT", 10*time.Second),
 		},
 	}
 	if cfg.Belcanto.ThreadsMediaBaseURL == "" && isAbsoluteHTTPSOrigin(cfg.Telegram.WebhookURL) {
@@ -270,6 +283,29 @@ func (c Config) Validate() error {
 	if c.Belcanto.ThreadsTimeout < time.Second {
 		errs = append(errs, errors.New("THREADS_TIMEOUT must be at least one second"))
 	}
+	if c.Belcanto.GenerationTimeout < 5*time.Second {
+		errs = append(errs, errors.New("THREADS_AI_TIMEOUT must be at least five seconds"))
+	}
+	switch c.Belcanto.ReviewLogMode {
+	case "off", "metadata", "full":
+	default:
+		errs = append(errs, errors.New("BELCANTO_REVIEW_LOG_MODE must be off, metadata, or full"))
+	}
+	switch c.Belcanto.PhotoProvider {
+	case "disabled":
+	case "pexels":
+		if c.Belcanto.PexelsAPIKey == "" {
+			errs = append(errs, errors.New("PEXELS_API_KEY is required when THREADS_PHOTO_PROVIDER=pexels"))
+		}
+	default:
+		errs = append(errs, errors.New("THREADS_PHOTO_PROVIDER must be disabled or pexels"))
+	}
+	if c.Belcanto.PexelsTimeout < time.Second {
+		errs = append(errs, errors.New("PEXELS_TIMEOUT must be at least one second"))
+	}
+	if !isAbsoluteHTTPSURL(c.Belcanto.PexelsBaseURL, false) {
+		errs = append(errs, errors.New("PEXELS_API_BASE_URL must be an absolute HTTPS URL without credentials, query, or fragment"))
+	}
 	if c.Belcanto.ThreadsMediaBaseURL != "" && !isAbsoluteHTTPSOrigin(c.Belcanto.ThreadsMediaBaseURL) {
 		errs = append(errs, errors.New("THREADS_MEDIA_BASE_URL must be an absolute HTTPS origin without credentials, path, query, or fragment"))
 	}
@@ -312,6 +348,9 @@ func (c Config) Validate() error {
 		}
 		if c.Belcanto.ThreadsProvider == "meta" && !isProductionThreadsAPIURL(c.Belcanto.ThreadsBaseURL) {
 			errs = append(errs, errors.New("production THREADS_API_BASE_URL must use https://graph.threads.net with a version path"))
+		}
+		if c.Belcanto.PhotoProvider == "pexels" && !isProductionPexelsAPIURL(c.Belcanto.PexelsBaseURL) {
+			errs = append(errs, errors.New("production PEXELS_API_BASE_URL must use https://api.pexels.com/v1"))
 		}
 		if c.Store.Driver == "postgres" && c.Store.DatabaseURL != "" && !databaseRequiresTLS(c.Store.DatabaseURL) {
 			errs = append(errs, errors.New("production DATABASE_URL must require TLS (sslmode=require, verify-ca, or verify-full)"))
@@ -358,6 +397,17 @@ func isProductionThreadsAPIURL(raw string) bool {
 	}
 	path := strings.Trim(parsed.Path, "/")
 	return strings.HasPrefix(path, "v") && len(path) > 1
+}
+
+func isProductionPexelsAPIURL(raw string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Hostname(), productionPexelsAPIHost) {
+		return false
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Port() != "" && parsed.Port() != "443") {
+		return false
+	}
+	return strings.Trim(parsed.Path, "/") == "v1"
 }
 
 func databaseRequiresTLS(databaseURL string) bool {

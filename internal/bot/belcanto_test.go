@@ -41,9 +41,32 @@ func (p *threadTestProvider) Generate(ctx context.Context, request domain.Genera
 }
 
 func (p *threadTestProvider) GenerateThreadPost(context.Context, ai.ThreadPostRequest) (ai.ThreadPostResult, error) {
+	return validTestThreadResult(p.text, "test", "thread-test"), nil
+}
+
+func validTestThreadResult(text, provider, model string) ai.ThreadPostResult {
+	texts := []string{
+		text,
+		"Какую песню вы узнаете раньше, чем вспоминаете её название?",
+		"Тихий голос тоже умеет держать внимание. Ему просто приходится выбирать слова и ноты точнее.",
+		"Какой знакомый звук первым выдаёт начало любимой песни?",
+		"Припев иногда помнит настроение точнее календаря.",
+	}
+	candidates := make([]ai.ThreadPostCandidateAudit, 0, len(texts))
+	for index, candidateText := range texts {
+		id := string(rune('A' + index))
+		candidates = append(candidates, ai.ThreadPostCandidateAudit{
+			Attempt: 1, SourceSlot: id, ReviewerID: id, Goal: "discussion", Text: candidateText,
+			Eligible: true, Considered: true, Selected: index == 0,
+		})
+	}
 	return ai.ThreadPostResult{
-		Goal: "discussion", Text: p.text, Provider: "test", Model: "thread-test",
-	}, nil
+		Goal: "discussion", Text: text, Provider: provider, Model: model,
+		Audit: ai.ThreadPostAudit{
+			ExplorationGoal: 10, GenerationCalls: 1, GeneratorProvider: provider, GeneratorModel: model,
+			SelectionMode: "test", DeliveredWinnerID: "A", Candidates: candidates,
+		},
+	}
 }
 
 type recordingThreadPublisher struct {

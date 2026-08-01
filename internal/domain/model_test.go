@@ -127,6 +127,38 @@ func TestThreadMediaValidateForStore(t *testing.T) {
 	}
 }
 
+func TestThreadMediaValidateForStoreAcceptsPexelsProvenance(t *testing.T) {
+	data := []byte("normalized-licensed-jpeg")
+	digest := sha256.Sum256(data)
+	valid := ThreadMedia{
+		TelegramID: 42, SourceKind: ThreadMediaSourcePexels,
+		SourceAssetID: "12345", SourcePageURL: "https://www.pexels.com/photo/microphone-12345/",
+		SourceAuthor: "Lens Author", SourceAuthorURL: "https://www.pexels.com/@lens-author",
+		SourceQuery: "vintage microphone close up",
+		Data:        data, MediaType: "image/jpeg", Width: 800, Height: 1_000,
+		Digest: hex.EncodeToString(digest[:]), DeliveryKey: "abcdef0123456789abcdef0123456789",
+	}
+	if err := valid.ValidateForStore(); err != nil {
+		t.Fatalf("valid Pexels media: %v", err)
+	}
+	for name, mutate := range map[string]func(*ThreadMedia){
+		"Telegram update": func(value *ThreadMedia) { value.SourceUpdateID = 9 },
+		"missing author":  func(value *ThreadMedia) { value.SourceAuthor = "" },
+		"author control":  func(value *ThreadMedia) { value.SourceAuthor = "Lens\nInjected" },
+		"author bidi":     func(value *ThreadMedia) { value.SourceAuthor = "Lens\u202eAuthor" },
+		"wrong host":      func(value *ThreadMedia) { value.SourcePageURL = "https://pexels.example/photo" },
+		"credentials":     func(value *ThreadMedia) { value.SourceAuthorURL = "https://user:pass@www.pexels.com/@lens" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := valid
+			mutate(&candidate)
+			if err := candidate.ValidateForStore(); err == nil {
+				t.Fatal("invalid Pexels provenance was accepted")
+			}
+		})
+	}
+}
+
 func TestThreadVoiceAndDraftStateValidity(t *testing.T) {
 	if !ThreadVoiceBelcanto.Valid() || !ThreadVoiceAlisher.Valid() || ThreadVoice("other").Valid() {
 		t.Fatal("thread voice validity contract is wrong")

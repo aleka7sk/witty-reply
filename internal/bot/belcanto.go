@@ -7,12 +7,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/aleka7sk/witty-reply/internal/ai"
 	"github.com/aleka7sk/witty-reply/internal/domain"
 	"github.com/aleka7sk/witty-reply/internal/media"
+	"github.com/aleka7sk/witty-reply/internal/observability"
+	"github.com/aleka7sk/witty-reply/internal/photos"
 	"github.com/aleka7sk/witty-reply/internal/session"
 	"github.com/aleka7sk/witty-reply/internal/store"
 	"github.com/aleka7sk/witty-reply/internal/telegram"
@@ -80,13 +83,19 @@ func (b *Service) prepareThreadDraft(
 	request := ai.ThreadPostRequest{
 		Voice: voice, Transform: transform, RecentTexts: recent,
 		Language: "ru", Date: b.now(), Seed: uint32(b.now().UnixNano()),
+		DeliveryCheck: b.threadPostDeliverySafe,
 	}
+	generationID, err := newThreadClaimToken()
+	if err != nil {
+		return fmt.Errorf("create Threads generation ID: %w", err)
+	}
+	request.GenerationID = generationID
 	revision := uint32(1)
 	if previous != nil {
 		request.PreviousText = previous.Text
 		revision = previous.Revision + 1
 	}
-	providerCtx, cancel := context.WithTimeout(ctx, b.config.ProviderTimeout)
+	providerCtx, cancel := context.WithTimeout(ctx, b.config.ThreadProviderTimeout)
 	result, err := b.threadGenerator.GenerateThreadPost(providerCtx, request)
 	cancel()
 	if err != nil {
@@ -94,26 +103,83 @@ func (b *Service) prepareThreadDraft(
 		b.logError("Belcanto post generation failed", user.TelegramID, "error", safeErrorCode(err))
 		return b.sendText(ctx, chatID, belcantoGenerationErrorText(userLanguage(user.Language)), nil)
 	}
-	decision := b.threadSafety.FilterText(result.Text)
-	if !decision.Allowed || strings.TrimSpace(decision.Text) == "" {
+	if result.FallbackReason != "" {
+		b.metrics.Inc("belcanto_curated_fallbacks")
+		b.logger.Warn(
+			"Belcanto post used curated fallback",
+			"user", observability.UserHash(b.config.CallbackSecret, user.TelegramID),
+			"reason", result.FallbackReason,
+		)
+	}
+	result, ok := b.selectLastMileThreadPost(result)
+	if !ok {
 		b.metrics.Inc("belcanto_safety_rejections")
 		return b.sendText(ctx, chatID, belcantoGenerationErrorText(userLanguage(user.Language)), nil)
 	}
 	draft := domain.ThreadDraft{
-		TelegramID: user.TelegramID, Voice: voice, Goal: result.Goal, Text: decision.Text,
+		TelegramID: user.TelegramID, Voice: voice, Goal: result.Goal, Text: result.Text,
 		Provider: result.Provider, Model: result.Model, Revision: revision,
 		MediaMode: domain.ThreadMediaText, State: domain.ThreadDraftReady, Current: true,
 	}
+	var previewMedia *domain.ThreadMedia
 	if previous != nil && transform != "different_angle" && voice == previous.Voice &&
 		(previous.MediaMode == domain.ThreadMediaImage || previous.MediaMode == domain.ThreadMediaImagePending) {
-		draft.MediaMode = previous.MediaMode
-		draft.MediaID = previous.MediaID
+		preserve := previous.MediaID == 0 && previous.MediaMode == domain.ThreadMediaImagePending
+		if previous.MediaID > 0 {
+			previousMedia, mediaErr := b.store.GetThreadMedia(ctx, previous.MediaID, user.TelegramID)
+			if mediaErr != nil {
+				return fmt.Errorf("load previous Threads media: %w", mediaErr)
+			}
+			// A photo explicitly uploaded by the operator is a human override and
+			// survives small text refinements. A topic-specific Pexels suggestion
+			// is reconsidered on every revision so it cannot drift from the text.
+			preserve = previousMedia.EffectiveSourceKind() == domain.ThreadMediaSourceTelegram
+			if preserve {
+				previewMedia = &previousMedia
+			}
+		}
+		if preserve {
+			draft.MediaMode = previous.MediaMode
+			draft.MediaID = previous.MediaID
+		}
 	}
-	draftID, err := b.store.CreateThreadDraft(ctx, draft)
+	var sourcedMedia *domain.ThreadMedia
+	if draft.MediaMode == domain.ThreadMediaText && result.Visual.Mode == "belcanto_photo" {
+		draft.MediaMode = domain.ThreadMediaImagePending
+	}
+	if draft.MediaMode == domain.ThreadMediaText && result.Visual.Mode == "licensed_photo" && b.threadPhotoSource != nil {
+		mediaValue, mediaErr := b.prepareLicensedThreadMedia(ctx, user.TelegramID, result.Visual)
+		if mediaErr != nil {
+			b.metrics.Inc("belcanto_photo_source_fallbacks")
+			b.logger.Warn(
+				"Belcanto licensed photo unavailable; using text-only post",
+				"generation_id", generationID,
+				"user", observability.UserHash(b.config.CallbackSecret, user.TelegramID),
+				"error", safeErrorCode(mediaErr),
+			)
+		} else {
+			draft.MediaMode = domain.ThreadMediaImage
+			sourcedMedia = &mediaValue
+			previewMedia = sourcedMedia
+		}
+	}
+	var draftID int64
+	if sourcedMedia != nil {
+		draftID, err = b.store.CreateThreadDraftWithMedia(ctx, draft, *sourcedMedia)
+	} else {
+		draftID, err = b.store.CreateThreadDraft(ctx, draft)
+	}
 	if err != nil {
 		return fmt.Errorf("save Threads draft: %w", err)
 	}
-	draft.ID = draftID
+	if sourcedMedia != nil {
+		draft, err = b.store.GetThreadDraft(ctx, draftID, user.TelegramID)
+		if err != nil {
+			return fmt.Errorf("load sourced Threads draft: %w", err)
+		}
+	} else {
+		draft.ID = draftID
+	}
 	keyboard, err := threadDraftKeyboard(b.callbacks, user.TelegramID, draft)
 	if err != nil {
 		return err
@@ -121,7 +187,143 @@ func (b *Service) prepareThreadDraft(
 	b.metrics.Inc("belcanto_drafts_ready")
 	b.metrics.Add("input_tokens", int64(result.Usage.InputTokens))
 	b.metrics.Add("output_tokens", int64(result.Usage.OutputTokens))
-	return b.sendThreadDraftPreview(ctx, chatID, draft, keyboard)
+	previewErr := b.sendThreadDraftPreview(ctx, chatID, draft, keyboard)
+	previewStatus := "sent_acknowledged"
+	if previewErr != nil {
+		previewStatus = "send_error_unknown"
+	}
+	b.logBelcantoEditorialAudit(user.TelegramID, draft, transform, result, previewMedia, previewStatus)
+	return previewErr
+}
+
+func (b *Service) selectLastMileThreadPost(result ai.ThreadPostResult) (ai.ThreadPostResult, bool) {
+	if !validThreadPostEditorialResult(result) {
+		return ai.ThreadPostResult{}, false
+	}
+	if b.threadPostDeliverySafe(result.Text) {
+		return result, true
+	}
+
+	indexes := make([]int, 0, len(result.Audit.Candidates))
+	for index, candidate := range result.Audit.Candidates {
+		if candidate.Eligible && candidate.Considered && !candidate.Selected {
+			indexes = append(indexes, index)
+		}
+	}
+	sort.SliceStable(indexes, func(left, right int) bool {
+		first := result.Audit.Candidates[indexes[left]]
+		second := result.Audit.Candidates[indexes[right]]
+		if first.Review.Total > 0 || second.Review.Total > 0 {
+			return belcantoAuditReviewBetter(first, second)
+		}
+		if first.Local.Score != second.Local.Score {
+			return first.Local.Score > second.Local.Score
+		}
+		if belcantoAuditLengthDistance(first.Local.RuneCount) != belcantoAuditLengthDistance(second.Local.RuneCount) {
+			return belcantoAuditLengthDistance(first.Local.RuneCount) < belcantoAuditLengthDistance(second.Local.RuneCount)
+		}
+		return first.ReviewerID < second.ReviewerID
+	})
+	for _, index := range indexes {
+		candidate := &result.Audit.Candidates[index]
+		if !b.threadPostDeliverySafe(candidate.Text) {
+			continue
+		}
+		for other := range result.Audit.Candidates {
+			result.Audit.Candidates[other].Selected = other == index
+		}
+		result.Goal = candidate.Goal
+		result.Text = candidate.Text
+		result.Visual = ai.ThreadPostVisualRecommendation{Mode: "text_only"}
+		result.Audit.DeliveredWinnerID = candidate.ReviewerID
+		result.Audit.SelectionMode = "last_mile_override"
+		result.Audit.DecisionReason = "The reviewed winner failed final delivery moderation; selected the next highest safe finalist."
+		return result, true
+	}
+	return ai.ThreadPostResult{}, false
+}
+
+func validThreadPostEditorialResult(result ai.ThreadPostResult) bool {
+	const requiredFinalists = 5
+	finalists := 0
+	selected := 0
+	selectedID := ""
+	selectedGoal := ""
+	selectedText := ""
+	ids := make(map[string]struct{}, requiredFinalists)
+	for _, candidate := range result.Audit.Candidates {
+		if !candidate.Eligible || !candidate.Considered {
+			if candidate.Selected {
+				return false
+			}
+			continue
+		}
+		finalists++
+		if strings.TrimSpace(candidate.ReviewerID) == "" || strings.TrimSpace(candidate.Goal) == "" || strings.TrimSpace(candidate.Text) == "" {
+			return false
+		}
+		if _, duplicate := ids[candidate.ReviewerID]; duplicate {
+			return false
+		}
+		ids[candidate.ReviewerID] = struct{}{}
+		if candidate.Selected {
+			selected++
+			selectedID = candidate.ReviewerID
+			selectedGoal = candidate.Goal
+			selectedText = candidate.Text
+		}
+	}
+	return finalists == requiredFinalists && selected == 1 &&
+		result.Audit.DeliveredWinnerID == selectedID && result.Goal == selectedGoal && result.Text == selectedText
+}
+
+func (b *Service) threadPostDeliverySafe(text string) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	decision := b.threadSafety.FilterText(text)
+	// Formatting-only normalization (for example paragraph breaks) has no
+	// reason code and is intentionally not applied. PII redaction, profanity
+	// masking, truncation, controls, and hard moderation would change what the
+	// reviewer scored, so those candidates are rejected instead.
+	return decision.Allowed && len(decision.Reasons) == 0
+}
+
+func (b *Service) prepareLicensedThreadMedia(
+	ctx context.Context,
+	telegramID int64,
+	recommendation ai.ThreadPostVisualRecommendation,
+) (domain.ThreadMedia, error) {
+	asset, err := b.threadPhotoSource.Find(ctx, recommendation.Query)
+	if err != nil {
+		return domain.ThreadMedia{}, err
+	}
+	if asset.Provider != "pexels" {
+		return domain.ThreadMedia{}, photos.ErrInvalidResult
+	}
+	maxOutputBytes := min(b.config.Limits.MaxImageBytes, domain.MaxThreadMediaBytes)
+	normalized, err := media.NormalizeImage(asset.Data, media.ImageConfig{
+		MaxInputBytes: b.config.Limits.MaxImageBytes, MaxOutputBytes: maxOutputBytes, LongSide: 1_440,
+	})
+	if err != nil {
+		return domain.ThreadMedia{}, err
+	}
+	digest := sha256.Sum256(normalized.Data)
+	deliveryKey, err := newThreadClaimToken()
+	if err != nil {
+		return domain.ThreadMedia{}, err
+	}
+	mediaValue := domain.ThreadMedia{
+		TelegramID: telegramID, SourceKind: domain.ThreadMediaSourcePexels,
+		SourceAssetID: asset.AssetID, SourcePageURL: asset.PageURL,
+		SourceAuthor: asset.Author, SourceAuthorURL: asset.AuthorURL, SourceQuery: asset.Query,
+		Data: normalized.Data, MediaType: normalized.MediaType, Width: normalized.Width, Height: normalized.Height,
+		Digest: hex.EncodeToString(digest[:]), DeliveryKey: deliveryKey,
+	}
+	if err := mediaValue.ValidateForStore(); err != nil {
+		return domain.ThreadMedia{}, err
+	}
+	return mediaValue, nil
 }
 
 func (b *Service) sendThreadDraftPreview(
@@ -137,11 +339,24 @@ func (b *Service) sendThreadDraftPreview(
 	if err != nil {
 		return fmt.Errorf("load Threads preview media: %w", err)
 	}
+	keyboard = threadDraftKeyboardWithMediaSource(keyboard, mediaValue)
 	_, err = b.telegram.SendPhoto(ctx, telegram.SendPhotoParams{
 		ChatID: chatID, Photo: telegram.FileUpload("belcanto-threads.jpg", mediaValue.Data),
-		Caption: threadDraftText(draft), ReplyMarkup: keyboard, ProtectContent: true,
+		Caption: threadDraftTextWithMedia(draft, mediaValue), ReplyMarkup: keyboard, ProtectContent: true,
 	})
 	return err
+}
+
+func threadDraftKeyboardWithMediaSource(
+	keyboard *telegram.InlineKeyboardMarkup,
+	mediaValue domain.ThreadMedia,
+) *telegram.InlineKeyboardMarkup {
+	if keyboard == nil || mediaValue.EffectiveSourceKind() != domain.ThreadMediaSourcePexels || mediaValue.SourcePageURL == "" {
+		return keyboard
+	}
+	rows := append([][]telegram.InlineKeyboardButton(nil), keyboard.InlineKeyboard...)
+	rows = append(rows, []telegram.InlineKeyboardButton{{Text: "📷 Источник фото · Pexels", URL: mediaValue.SourcePageURL}})
+	return &telegram.InlineKeyboardMarkup{InlineKeyboard: rows}
 }
 
 func (b *Service) refineThreadDraft(
@@ -300,7 +515,7 @@ func (b *Service) tryHandleThreadMediaUpload(
 		return true, fmt.Errorf("create Threads media delivery key: %w", err)
 	}
 	mediaValue := domain.ThreadMedia{
-		TelegramID: user.TelegramID, SourceUpdateID: updateID,
+		TelegramID: user.TelegramID, SourceKind: domain.ThreadMediaSourceTelegram, SourceUpdateID: updateID,
 		Data: normalized.Data, MediaType: normalized.MediaType,
 		Width: normalized.Width, Height: normalized.Height,
 		Digest: hex.EncodeToString(digest[:]), DeliveryKey: deliveryKey,

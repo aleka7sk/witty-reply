@@ -24,6 +24,9 @@ func TestLoadMinimalFakeConfig(t *testing.T) {
 	if cfg.Belcanto.ThreadsProvider != "disabled" {
 		t.Fatalf("Threads provider = %q, want disabled", cfg.Belcanto.ThreadsProvider)
 	}
+	if cfg.Belcanto.ReviewLogMode != "full" {
+		t.Fatalf("review log mode = %q, want full finalist audit default", cfg.Belcanto.ReviewLogMode)
+	}
 }
 
 func TestLoadBelcantoOperatorsAndFakeThreads(t *testing.T) {
@@ -40,6 +43,32 @@ func TestLoadBelcantoOperatorsAndFakeThreads(t *testing.T) {
 	}
 	if len(cfg.Belcanto.OperatorIDs) != 2 || cfg.Belcanto.OperatorIDs[0] != 42 || cfg.Belcanto.OperatorIDs[1] != 77 {
 		t.Fatalf("OperatorIDs = %#v", cfg.Belcanto.OperatorIDs)
+	}
+}
+
+func TestBelcantoEditorialReviewAndPexelsConfiguration(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", strings.Repeat("x", 32))
+	t.Setenv("TELEGRAM_CALLBACK_SECRET", strings.Repeat("y", 32))
+	t.Setenv("AI_PROVIDER", "fake")
+	t.Setenv("STORE_DRIVER", "memory")
+	t.Setenv("BELCANTO_REVIEW_LOG_MODE", "metadata")
+	t.Setenv("THREADS_AI_TIMEOUT", "95s")
+	t.Setenv("THREADS_PHOTO_PROVIDER", "pexels")
+	t.Setenv("PEXELS_API_KEY", "pexels-secret")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Belcanto.ReviewLogMode != "metadata" || cfg.Belcanto.GenerationTimeout.String() != "1m35s" || cfg.Belcanto.PhotoProvider != "pexels" {
+		t.Fatalf("Belcanto config = %+v", cfg.Belcanto)
+	}
+
+	t.Setenv("BELCANTO_REVIEW_LOG_MODE", "pretty")
+	t.Setenv("PEXELS_API_KEY", "")
+	_, err = Load()
+	if err == nil || !strings.Contains(err.Error(), "BELCANTO_REVIEW_LOG_MODE") || !strings.Contains(err.Error(), "PEXELS_API_KEY") {
+		t.Fatalf("invalid editorial config error = %v", err)
 	}
 }
 

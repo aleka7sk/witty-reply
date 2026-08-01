@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -480,6 +481,40 @@ func TestPostgresIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("licensed media and draft are created atomically with provenance", func(t *testing.T) {
+		const mediaOwner = int64(71016)
+		if _, err := postgres.UpsertUser(ctx, domain.User{TelegramID: mediaOwner, Language: "ru"}); err != nil {
+			t.Fatal(err)
+		}
+		draft := testThreadDraft(mediaOwner, 1, "Какую песню вы узнаете по одному вдоху?")
+		draft.MediaMode = domain.ThreadMediaImage
+		draftID, err := postgres.CreateThreadDraftWithMedia(ctx, draft, testPexelsThreadMedia(mediaOwner))
+		if err != nil {
+			t.Fatal(err)
+		}
+		storedDraft, err := postgres.GetThreadDraft(ctx, draftID, mediaOwner)
+		if err != nil || storedDraft.MediaID <= 0 || storedDraft.MediaMode != domain.ThreadMediaImage {
+			t.Fatalf("draft = %+v, %v", storedDraft, err)
+		}
+		storedMedia, err := postgres.GetThreadMedia(ctx, storedDraft.MediaID, mediaOwner)
+		if err != nil || storedMedia.SourceKind != domain.ThreadMediaSourcePexels || storedMedia.SourceAuthor != "Lens Author" || storedMedia.SourceUpdateID != 0 {
+			t.Fatalf("media = %+v, %v", storedMedia, err)
+		}
+		bad := testThreadDraft(mediaOwner, 2, "Невалидный черновик")
+		bad.MediaMode = domain.ThreadMediaImage
+		bad.Provider = ""
+		if _, err := postgres.CreateThreadDraftWithMedia(ctx, bad, testPexelsThreadMedia(mediaOwner)); err == nil {
+			t.Fatal("invalid draft transaction succeeded")
+		}
+		var mediaRows int
+		if err := postgres.pool.QueryRow(ctx, `SELECT count(*) FROM thread_media WHERE telegram_id = $1`, mediaOwner).Scan(&mediaRows); err != nil {
+			t.Fatal(err)
+		}
+		if mediaRows != 1 {
+			t.Fatalf("orphan media rows = %d", mediaRows)
+		}
+	})
+
 	t.Run("thread media stale fallbacks use one connection and never cross drafts", func(t *testing.T) {
 		const mediaOwner = int64(71007)
 		if _, err := postgres.UpsertUser(ctx, domain.User{TelegramID: mediaOwner}); err != nil {
@@ -858,10 +893,15 @@ func TestPostgresMediaMigrationUpgradesLegacyThreadDrafts(t *testing.T) {
 	defer cancel()
 	postgres := newIsolatedPostgresWithoutMigration(t, ctx, databaseURL)
 
-	// This is the deployed pre-media shape at the parent commit. Keeping a
-	// representative row proves that the additive migration backfills existing
-	// drafts instead of validating only a freshly created schema.
+	// This is the deployed pre-media version-1 shape. The migration marker is
+	// essential: it proves version 2 bootstraps media instead of accidentally
+	// relying on the mutable version-1 bootstrap being rerun.
 	if _, err := postgres.pool.Exec(ctx, `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+		INSERT INTO schema_migrations (version) VALUES (1);
 		CREATE TABLE users (
 			telegram_id BIGINT PRIMARY KEY,
 			language_code TEXT NOT NULL DEFAULT 'ru',
@@ -924,6 +964,142 @@ func TestPostgresMediaMigrationUpgradesLegacyThreadDrafts(t *testing.T) {
 	)
 	if err != nil || !claimed || claimedDraft.MediaRightsConfirmedAt == nil {
 		t.Fatalf("upgraded image claim = %+v, %v, %v", claimedDraft, claimed, err)
+	}
+}
+
+func TestPostgresMigrationUpgradesPreBelcantoVersionOne(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	postgres := newIsolatedPostgresWithoutMigration(t, ctx, databaseURL)
+
+	// The earliest deployed version 1 recorded its marker before any Belcanto
+	// draft or media table existed. This exact state must run the compatibility
+	// bootstrap once, then become a normal immutable version-2 installation.
+	if _, err := postgres.pool.Exec(ctx, `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+		INSERT INTO schema_migrations (version) VALUES (1);
+		CREATE TABLE users (
+			telegram_id BIGINT PRIMARY KEY,
+			language_code TEXT NOT NULL DEFAULT 'ru',
+			default_tone TEXT NOT NULL DEFAULT 'mix',
+			consented_at TIMESTAMPTZ,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		);`); err != nil {
+		t.Fatalf("create pre-Belcanto version-1 schema: %v", err)
+	}
+	if err := postgres.Migrate(ctx); err != nil {
+		t.Fatalf("upgrade pre-Belcanto version 1: %v", err)
+	}
+	if err := postgres.Migrate(ctx); err != nil {
+		t.Fatalf("rerun upgraded migration: %v", err)
+	}
+	if err := postgres.Ping(ctx); err != nil {
+		t.Fatalf("upgraded schema is not ready: %v", err)
+	}
+	if _, err := postgres.UpsertUser(ctx, domain.User{TelegramID: 72003, Language: "ru"}); err != nil {
+		t.Fatal(err)
+	}
+	draftID, err := postgres.CreateThreadDraft(ctx, testThreadDraft(72003, 1, "Какую песню вы узнаете по первому вдоху?"))
+	if err != nil || draftID <= 0 {
+		t.Fatalf("create draft after legacy upgrade: id=%d err=%v", draftID, err)
+	}
+}
+
+func TestPostgresLicensedMediaMigrationUpgradesLegacyThreadMedia(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	postgres := newIsolatedPostgresWithoutMigration(t, ctx, databaseURL)
+
+	// This is the version-1 thread_media shape deployed immediately before
+	// licensed photos were introduced. The migration must preserve every upload
+	// and its global unique arbiter for rolling compatibility with old pods.
+	if _, err := postgres.pool.Exec(ctx, `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+		INSERT INTO schema_migrations (version) VALUES (1);
+		CREATE TABLE users (
+			telegram_id BIGINT PRIMARY KEY,
+			language_code TEXT NOT NULL DEFAULT 'ru',
+			default_tone TEXT NOT NULL DEFAULT 'mix',
+			consented_at TIMESTAMPTZ,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+		CREATE TABLE thread_media (
+			id BIGSERIAL PRIMARY KEY,
+			telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+			source_update_id BIGINT NOT NULL CHECK (source_update_id > 0),
+			content BYTEA NOT NULL CHECK (octet_length(content) BETWEEN 1 AND 8388608),
+			media_type TEXT NOT NULL CHECK (media_type = 'image/jpeg'),
+			width INTEGER NOT NULL CHECK (width BETWEEN 1 AND 8000),
+			height INTEGER NOT NULL CHECK (height BETWEEN 1 AND 8000),
+			digest TEXT NOT NULL CHECK (digest ~ '^[0-9a-f]{64}$'),
+			delivery_key TEXT NOT NULL UNIQUE CHECK (delivery_key ~ '^[0-9a-f]{32}$'),
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			CHECK ((width::bigint * height::bigint) <= 12000000),
+			CHECK (width BETWEEN 320 AND 1440),
+			CHECK (GREATEST(width, height) <= LEAST(width, height) * 10)
+		);
+		CREATE UNIQUE INDEX idx_thread_media_source_update
+			ON thread_media (telegram_id, source_update_id);
+		INSERT INTO users (telegram_id) VALUES (72002);
+		INSERT INTO thread_media (
+			telegram_id, source_update_id, content, media_type, width, height, digest, delivery_key
+		) VALUES (
+			72002, 88001, decode('ffd8ffd9', 'hex'), 'image/jpeg', 320, 320,
+			'32461d5bd1773012acef0ba15636752949bd7c2ce50f9172159d9f56cf0dd9af',
+			repeat('b', 32)
+		);`); err != nil {
+		t.Fatalf("create legacy media schema: %v", err)
+	}
+	if err := postgres.Migrate(ctx); err != nil {
+		t.Fatalf("upgrade legacy media schema: %v", err)
+	}
+	if err := postgres.Migrate(ctx); err != nil {
+		t.Fatalf("rerun licensed media migration: %v", err)
+	}
+	legacy, err := postgres.GetThreadMedia(ctx, 1, 72002)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.SourceKind != domain.ThreadMediaSourceTelegram || legacy.SourceUpdateID != 88001 ||
+		legacy.SourceAssetID != "" || legacy.SourcePageURL != "" {
+		t.Fatalf("legacy provenance = %+v", legacy)
+	}
+	var indexDefinition string
+	if err := postgres.pool.QueryRow(ctx, `
+		SELECT indexdef FROM pg_indexes
+		WHERE schemaname = current_schema() AND indexname = 'idx_thread_media_source_update'`,
+	).Scan(&indexDefinition); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(indexDefinition, " WHERE ") {
+		t.Fatalf("source update index lost rolling-compatible global scope: %s", indexDefinition)
+	}
+
+	draft := testThreadDraft(72002, 1, "Какую песню вы узнаете по первому вдоху?")
+	draft.MediaMode = domain.ThreadMediaImage
+	draftID, err := postgres.CreateThreadDraftWithMedia(ctx, draft, testPexelsThreadMedia(72002))
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedDraft, err := postgres.GetThreadDraft(ctx, draftID, 72002)
+	if err != nil || storedDraft.MediaID == legacy.ID {
+		t.Fatalf("licensed draft after upgrade = %+v, %v", storedDraft, err)
 	}
 }
 

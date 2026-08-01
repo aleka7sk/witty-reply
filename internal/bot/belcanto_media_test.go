@@ -43,9 +43,7 @@ func (p *mediaRouteProvider) Generate(ctx context.Context, request domain.Genera
 
 func (p *mediaRouteProvider) GenerateThreadPost(context.Context, ai.ThreadPostRequest) (ai.ThreadPostResult, error) {
 	p.threadCalls.Add(1)
-	return ai.ThreadPostResult{
-		Goal: "discussion", Text: p.threadText, Provider: "media-test", Model: "media-test",
-	}, nil
+	return validTestThreadResult(p.threadText, "media-test", "media-test"), nil
 }
 
 type quotaObservingStore struct {
@@ -354,7 +352,7 @@ func TestThreadTextPreviewOffersSignedImageChoiceAndPersistsPendingState(t *test
 	}
 	messages = telegramClient.snapshotMessages()
 	last := messages[len(messages)-1]
-	if !strings.Contains(last.Text, "Пришли одно реальное фото Belcanto") || last.ReplyMarkup == nil {
+	if !strings.Contains(last.Text, "Пришли одно своё реальное фото Belcanto") || last.ReplyMarkup == nil {
 		t.Fatalf("image prompt = %+v", last)
 	}
 	if got := observedStore.consumeCalls.Load(); got != 0 {
@@ -840,7 +838,7 @@ func TestThreadMediaModeCallbackRetryRedeliversCommittedTransition(t *testing.T)
 			t.Fatalf("callback retry advanced committed transition again: before=%+v after=%+v", committed, after)
 		}
 		messages = telegramClient.snapshotMessages()
-		if len(messages) != 2 || !strings.Contains(messages[len(messages)-1].Text, "Пришли одно реальное фото Belcanto") {
+		if len(messages) != 2 || !strings.Contains(messages[len(messages)-1].Text, "Пришли одно своё реальное фото Belcanto") {
 			t.Fatalf("retried image prompt = %+v", messages)
 		}
 	})

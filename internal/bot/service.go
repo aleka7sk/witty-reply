@@ -19,6 +19,7 @@ import (
 	"github.com/aleka7sk/witty-reply/internal/media"
 	"github.com/aleka7sk/witty-reply/internal/meme"
 	"github.com/aleka7sk/witty-reply/internal/observability"
+	"github.com/aleka7sk/witty-reply/internal/photos"
 	"github.com/aleka7sk/witty-reply/internal/safety"
 	"github.com/aleka7sk/witty-reply/internal/session"
 	"github.com/aleka7sk/witty-reply/internal/store"
@@ -49,15 +50,18 @@ type Limits struct {
 }
 
 type Config struct {
-	ProviderTimeout     time.Duration
-	UsageLocation       *time.Location
-	CallbackSecret      string
-	PrivacyURL          string
-	SpeechProvider      string
-	BelcantoOperatorIDs []int64
-	ThreadsPublisher    threadspub.Publisher
-	ThreadMediaURL      func(string) (string, error)
-	Limits              Limits
+	ProviderTimeout       time.Duration
+	ThreadProviderTimeout time.Duration
+	UsageLocation         *time.Location
+	CallbackSecret        string
+	PrivacyURL            string
+	SpeechProvider        string
+	BelcantoOperatorIDs   []int64
+	ThreadsPublisher      threadspub.Publisher
+	ThreadMediaURL        func(string) (string, error)
+	ThreadPhotoSource     photos.Source
+	BelcantoReviewLogMode string
+	Limits                Limits
 }
 
 type Interaction struct {
@@ -126,6 +130,7 @@ type Service struct {
 	threadGenerator   ai.ThreadPostGenerator
 	threadPublisher   threadspub.Publisher
 	threadMediaURL    func(string) (string, error)
+	threadPhotoSource photos.Source
 	transcriber       transcribe.Transcriber
 	store             store.Store
 	sessions          *session.Cache[interaction]
@@ -166,6 +171,15 @@ func NewService(
 	if config.ProviderTimeout <= 0 {
 		config.ProviderTimeout = 45 * time.Second
 	}
+	if config.ThreadProviderTimeout <= 0 {
+		config.ThreadProviderTimeout = 120 * time.Second
+	}
+	if config.BelcantoReviewLogMode == "" {
+		config.BelcantoReviewLogMode = "full"
+	}
+	if config.BelcantoReviewLogMode != "off" && config.BelcantoReviewLogMode != "metadata" && config.BelcantoReviewLogMode != "full" {
+		return nil, errors.New("belcanto review log mode must be off, metadata, or full")
+	}
 	if config.UsageLocation == nil {
 		config.UsageLocation = time.UTC
 	}
@@ -181,8 +195,8 @@ func NewService(
 	}
 	return &Service{
 		telegram: telegramClient, provider: provider, threadGenerator: threadGenerator, threadPublisher: config.ThreadsPublisher,
-		threadMediaURL: config.ThreadMediaURL,
-		transcriber:    transcriber, store: dataStore, sessions: sessions,
+		threadMediaURL: config.ThreadMediaURL, threadPhotoSource: config.ThreadPhotoSource,
+		transcriber: transcriber, store: dataStore, sessions: sessions,
 		callbacks: callbacks, safety: safetyFilter, threadSafety: safety.New(safety.Config{MaxRunes: 500, CandidateCount: 1}),
 		renderer: renderer, metrics: metrics, logger: logger, config: config, belcantoOperators: operators,
 	}, nil

@@ -540,6 +540,45 @@ func TestMemoryThreadMediaReplayCannotAttachToAnotherDraft(t *testing.T) {
 	}
 }
 
+func TestMemoryCreatesLicensedMediaAndDraftAtomically(t *testing.T) {
+	ctx := context.Background()
+	memory := NewMemory()
+	if _, err := memory.UpsertUser(ctx, domain.User{TelegramID: 42}); err != nil {
+		t.Fatal(err)
+	}
+	draft := testThreadDraft(42, 1, "Какую песню вы узнаете по одному вдоху?")
+	draft.MediaMode = domain.ThreadMediaImage
+	mediaValue := testPexelsThreadMedia(42)
+	draftID, err := memory.CreateThreadDraftWithMedia(ctx, draft, mediaValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedDraft, err := memory.GetThreadDraft(ctx, draftID, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedDraft.MediaMode != domain.ThreadMediaImage || storedDraft.MediaID <= 0 {
+		t.Fatalf("draft = %+v", storedDraft)
+	}
+	storedMedia, err := memory.GetThreadMedia(ctx, storedDraft.MediaID, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedMedia.SourceKind != domain.ThreadMediaSourcePexels || storedMedia.SourceAuthor != "Lens Author" || storedMedia.SourceUpdateID != 0 {
+		t.Fatalf("media = %+v", storedMedia)
+	}
+
+	badDraft := testThreadDraft(42, 2, "Невалидный черновик")
+	badDraft.MediaMode = domain.ThreadMediaImage
+	badDraft.Provider = ""
+	if _, err := memory.CreateThreadDraftWithMedia(ctx, badDraft, testPexelsThreadMedia(42)); err == nil {
+		t.Fatal("invalid draft and media transaction succeeded")
+	}
+	if len(memory.threadMedia) != 1 {
+		t.Fatalf("orphan media count = %d", len(memory.threadMedia))
+	}
+}
+
 func TestMemoryThreadDraftLeaseFencesStaleWorkersAndRecoversByPhase(t *testing.T) {
 	ctx := context.Background()
 	memory := NewMemory()
@@ -656,5 +695,18 @@ func testThreadMedia(owner, updateID int64) domain.ThreadMedia {
 		TelegramID: owner, SourceUpdateID: updateID, Data: data, MediaType: "image/jpeg",
 		Width: 1_000, Height: 800, Digest: hex.EncodeToString(digest[:]),
 		DeliveryKey: fmt.Sprintf("%032x", updateID),
+	}
+}
+
+func testPexelsThreadMedia(owner int64) domain.ThreadMedia {
+	data := []byte("normalized-pexels-jpeg")
+	digest := sha256.Sum256(data)
+	return domain.ThreadMedia{
+		TelegramID: owner, SourceKind: domain.ThreadMediaSourcePexels,
+		SourceAssetID: "123", SourcePageURL: "https://www.pexels.com/photo/microphone-123/",
+		SourceAuthor: "Lens Author", SourceAuthorURL: "https://www.pexels.com/@lens-author",
+		SourceQuery: "vintage microphone close up",
+		Data:        data, MediaType: "image/jpeg", Width: 800, Height: 1_000,
+		Digest: hex.EncodeToString(digest[:]), DeliveryKey: "fedcba9876543210fedcba9876543210",
 	}
 }

@@ -50,6 +50,40 @@ func (provider *FakeProvider) GenerateThreadPost(ctx context.Context, request Th
 	if err != nil {
 		return ThreadPostResult{}, err
 	}
+	results := curatedThreadPosts(normalized, threadPostFinalistCount, nil)
+	if len(results) != threadPostFinalistCount {
+		return ThreadPostResult{}, fmt.Errorf("fake Threads finalist invariant: %w", ErrInvalidResponse)
+	}
+	audit := ThreadPostAudit{
+		GenerationID: normalized.GenerationID, RecipeID: selectThreadPostRecipe(normalized).ID,
+		ExplorationGoal: threadPostFinalistCount, GenerationCalls: 1, GeneratorProvider: providerFake,
+		GeneratorModel: "deterministic-threads-v2", SelectionMode: "deterministic_fake",
+		DecisionReason: "Deterministic local preview provider selected the strongest of five validated editorial examples.",
+		Candidates:     make([]ThreadPostCandidateAudit, 0, threadPostFinalistCount),
+	}
+	candidates := make([]threadPostCandidate, 0, threadPostFinalistCount)
+	for index, finalist := range results {
+		audit.Candidates = append(audit.Candidates, ThreadPostCandidateAudit{
+			Attempt: 1, SourceSlot: fmt.Sprintf("fake_%d", index+1), Goal: finalist.Goal,
+			Text: finalist.Text, Eligible: true, Considered: true, Local: scoreThreadPostQuality(finalist.Text),
+		})
+		candidates = append(candidates, threadPostCandidate{Result: finalist, AuditIndex: index})
+	}
+	assignBlindReviewerIDs(candidates, audit.Candidates, normalized.Seed, 1)
+	winner := bestLocalThreadPostCandidate(candidates, audit.Candidates)
+	markThreadPostAuditWinner(&audit, winner)
+	result := winner.Result
+	result.Provider = providerFake
+	result.Model = audit.GeneratorModel
+	result.Visual = ThreadPostVisualRecommendation{Mode: "text_only"}
+	result.Audit = audit
+	return result, nil
+}
+
+func curatedThreadPosts(normalized normalizedThreadPostRequest, limit int, excluded map[string]struct{}) []ThreadPostResult {
+	if limit <= 0 {
+		return nil
+	}
 	bank := fakeThreadPostBank(normalized.Voice)
 	offset := int(normalized.Seed % uint32(len(bank)))
 	switch normalized.Transform {
@@ -62,17 +96,31 @@ func (provider *FakeProvider) GenerateThreadPost(ctx context.Context, request Th
 	case "different_angle":
 		offset = (offset + 8) % len(bank)
 	}
-	for attempt := 0; attempt < len(bank); attempt++ {
+	results := make([]ThreadPostResult, 0, limit)
+	seen := make(map[string]struct{}, len(excluded)+limit)
+	for key := range excluded {
+		seen[key] = struct{}{}
+	}
+	for attempt := 0; attempt < len(bank) && len(results) < limit; attempt++ {
 		candidate := bank[(offset+attempt)%len(bank)]
 		result := ThreadPostResult{Goal: candidate.goal, Text: candidate.text}
 		if err := validateThreadPostResult(&result, normalized); err != nil {
 			continue
 		}
-		result.Provider = providerFake
-		result.Model = "deterministic-threads-v1"
-		return result, nil
+		if err := validateThreadPostEditorialQuality(result, normalized, scoreThreadPostQuality(result.Text)); err != nil {
+			continue
+		}
+		if normalized.DeliveryCheck != nil && !normalized.DeliveryCheck(result.Text) {
+			continue
+		}
+		key := canonicalThreadPost(result.Text)
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		results = append(results, result)
 	}
-	return ThreadPostResult{}, fmt.Errorf("fake provider Threads freshness invariant: %w", ErrInvalidResponse)
+	return results
 }
 
 type fakeThreadPost struct {
@@ -93,6 +141,40 @@ func fakeThreadPostBank(voice string) []fakeThreadPost {
 			{goal: "recognition", text: "Перед первой нотой внутренний критик обычно просит слово вне очереди."},
 			{goal: "discussion", text: "Есть песни, которые человек выбирает сам. И есть песни, которые внезапно знают о нём больше."},
 			{goal: "warmth", text: "Уверенность редко приходит до голоса. Обычно она догоняет его где-то между вдохом и первой фразой."},
+			{goal: "recognition", text: "Фраза «я пою только для себя» обычно произносится так, будто у себя очень строгий продюсер."},
+			{goal: "recognition", text: "Внутренний критик удивительно музыкален: вступает без приглашения и всегда уверен, что он солист."},
+			{goal: "discussion", text: "Люди боятся взять не ту ноту, будто правильные ноты потом подают на них в суд."},
+			{goal: "recognition", text: "У каждого есть песня, на которой уверенность внезапно заканчивает испытательный срок."},
+			{goal: "discussion", text: "Когда говорят «медведь на ухо наступил», медведя почему-то никто не просит подтвердить версию."},
+			{goal: "recognition", text: "Микрофон не пугает. Пугает внезапная перспектива услышать себя без внутреннего пресс-секретаря."},
+			{goal: "recognition", text: "Взрослый человек может провести сложные переговоры, но перед микрофоном всё равно ждёт согласования у подростка внутри."},
+			{goal: "recognition", text: "Песня занимает несколько минут. Подготовительный стыд иногда выходит режиссёрской версией."},
+			{goal: "recognition", text: "Нота может быть мимо. Лицо после неё обычно делает ошибку заметнее."},
+			{goal: "discussion", text: "Самый верный способ не сфальшивить — не петь. У него почему-то очень скучный репертуар."},
+			{goal: "recognition", text: "Высокую ноту проще взять, чем спокойно принять запись собственного голоса."},
+			{goal: "recognition", text: "Человек слышит запись своего голоса и сразу понимает: внутренний диктор всё это время работал удалённо."},
+			{goal: "warmth", text: "Если голос дрожит, возможно, он просто первым понял важность момента."},
+			{goal: "discussion", text: "Караоке — место, где друзья искренне поддерживают тебя и совершенно не поддерживают выбранную тональность."},
+			{goal: "discussion", text: "Какой знакомый припев превращает ваше «я только послушаю» в полноценное выступление?"},
+			{goal: "recognition", text: "Микрофон не делает человека громче. Он просто увольняет внутреннего пресс-секретаря."},
+			{goal: "discussion", text: "Какую песню вы знаете наизусть, хотя никогда не садились учить её слова?"},
+			{goal: "recognition", text: "Фальшивую ноту слышат не все. Попытку сделать вид, что так и задумано, замечают почему-то сразу."},
+			{goal: "discussion", text: "Какой исполнитель заставляет вас подпевать даже в магазине, где приходится делать вид, что это кашель?"},
+			{goal: "recognition", text: "Наушники создают редкое государство: один гражданин, полный суверенитет и очень спорный вокал."},
+			{goal: "discussion", text: "Какая строчка из песни выросла вместе с вами и теперь означает совсем не то, что раньше?"},
+			{goal: "recognition", text: "Запись собственного голоса — короткая встреча внутреннего диктора с человеком, на которого он всё это время работал."},
+			{goal: "discussion", text: "Какой припев вы бы доверили человеку вместо длинного объяснения своего настроения?"},
+			{goal: "recognition", text: "Ритм сбивается реже, чем уверенность. Просто у ритма нет привычки читать воображаемые комментарии."},
+			{goal: "discussion", text: "Какую песню нельзя ставить фоном, потому что она немедленно забирает всё внимание?"},
+			{goal: "warmth", text: "Любимый голос не обязательно самый ровный. Обычно это тот, в котором слышно живого человека между нотами."},
+			{goal: "recognition", text: "Слово «подпевать» звучит скромно. Соседи иногда располагают другой терминологией."},
+			{goal: "discussion", text: "Какую мелодию вы узнаете раньше, чем успеваете вспомнить, откуда она?"},
+			{goal: "recognition", text: "Человек может забыть слова куплета, но тело почему-то прекрасно помнит, где должен начаться припев."},
+			{goal: "warmth", text: "Некоторые песни возвращают не прошлое, а способность на минуту отнестись к нему мягче."},
+			{goal: "discussion", text: "Какой трек вы включаете ради одной-единственной секунды, где всё встаёт на место?"},
+			{goal: "recognition", text: "Домашний вокал особенно смел, пока чайник, душ и пылесос официально входят в состав группы."},
+			{goal: "warmth", text: "Тихий голос тоже умеет держать внимание. Ему просто приходится выбирать слова и ноты точнее."},
+			{goal: "discussion", text: "Если бы ваш характер был музыкальным инструментом, что звучало бы первым: барабаны, клавиши или что-то другое?"},
 		}
 	}
 	return []fakeThreadPost{
@@ -106,6 +188,40 @@ func fakeThreadPostBank(voice string) []fakeThreadPost {
 		{goal: "recognition", text: "Голос — это единственный инструмент, который невозможно забыть дома."},
 		{goal: "discussion", text: "Какая песня первой вспоминается, когда никому ничего не нужно доказывать?"},
 		{goal: "warmth", text: "Иногда одна честная нота возвращает к себе быстрее, чем длинный внутренний разговор."},
+		{goal: "recognition", text: "Когда человек говорит «у меня нет голоса», голос уже произнёс эту фразу довольно убедительно."},
+		{goal: "warmth", text: "Тишина перед первой нотой — не пустота. Это смелость набирает воздух."},
+		{goal: "recognition", text: "Фальшивая нота заканчивается быстро. Страх перед ней иногда репетирует дольше самой песни."},
+		{goal: "warmth", text: "Есть песни, которые не хочется исполнять идеально. Их хочется прожить точно."},
+		{goal: "recognition", text: "Красивый голос впечатляет. Узнаваемый — остаётся."},
+		{goal: "warmth", text: "Пение — редкий разговор, где дыхание успевает сказать правду раньше слов."},
+		{goal: "recognition", text: "Не каждая нота обязана быть громкой. Некоторые попадают точно потому, что не спорят с тишиной."},
+		{goal: "recognition", text: "Самая узнаваемая часть песни начинается там, где человек перестаёт стараться звучать «правильно»."},
+		{goal: "warmth", text: "Песня меняется, когда перестаёшь изображать исполнителя и становишься рассказчиком."},
+		{goal: "recognition", text: "Диапазон измеряют нотами. Свободу голоса — тем, сколько себя в них осталось."},
+		{goal: "warmth", text: "Микрофон усиливает звук, но не подменяет присутствие. И это хорошая новость."},
+		{goal: "recognition", text: "Иногда дыхание сбивается не от сложной фразы, а от мысли, что тебя действительно услышат."},
+		{goal: "warmth", text: "Музыкальный слух замечает ноту. Человеческий — честность."},
+		{goal: "discussion", text: "Какую песню вы бы спели, если бы никто не оценивал исполнение?"},
+		{goal: "discussion", text: "Какую песню вы узнаете по одному вдоху ещё до первой ноты?"},
+		{goal: "recognition", text: "Голос — единственный инструмент, который невозможно забыть дома. Зато можно долго делать вид, что он там остался."},
+		{goal: "warmth", text: "Тишина перед первой нотой не пустая. В ней дыхание, внимание и маленькое решение всё-таки начать."},
+		{goal: "discussion", text: "Какая строчка из песни говорит о вашем настроении точнее любого статуса?"},
+		{goal: "discussion", text: "Какую мелодию вы узнаете раньше, чем успеваете вспомнить её название?"},
+		{goal: "recognition", text: "Красивый голос привлекает внимание. Узнаваемый остаётся в памяти после последней ноты."},
+		{goal: "discussion", text: "Какой музыкальный звук для вас уютнее: шорох пластинки, клавиши, гитара или чей-то тихий голос?"},
+		{goal: "warmth", text: "Микрофон усиливает звук, но не подменяет присутствие. Поэтому тихая фраза иногда держит внимание лучше громкой."},
+		{goal: "discussion", text: "Какую песню вы бы оставили себе, если бы из всего плейлиста можно было сохранить только одну?"},
+		{goal: "warmth", text: "Любимая песня не всегда утешает. Иногда она просто садится рядом и не торопит менять настроение."},
+		{goal: "discussion", text: "Какой припев объединяет людей, которые до него были уверены, что у них совершенно разные вкусы?"},
+		{goal: "recognition", text: "Первые слова песни иногда забываются. Тело всё равно точно знает, где начинается знакомый ритм."},
+		{goal: "discussion", text: "Какую песню невозможно включить фоном, потому что она сразу требует всего внимания?"},
+		{goal: "recognition", text: "Одна и та же мелодия в наушниках, машине и пустой комнате звучит как три разных разговора."},
+		{goal: "discussion", text: "Какой голос вы узнали бы даже через старый телефон и шум улицы?"},
+		{goal: "warmth", text: "Песня не меняет прошлое. Но иногда меняет интонацию, с которой человек его вспоминает."},
+		{goal: "discussion", text: "Какой трек вы включаете ради одной секунды, в которой всё неожиданно становится на место?"},
+		{goal: "recognition", text: "На записи собственный голос кажется чужим ровно до момента, когда в нём узнаётся знакомая улыбка."},
+		{goal: "discussion", text: "Какую песню вы любите не целиком, а за одну строчку, один аккорд или один вдох?"},
+		{goal: "discussion", text: "Если бы Астана звучала музыкальным инструментом, что это было бы и почему?"},
 	}
 }
 

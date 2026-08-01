@@ -4,8 +4,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"net/url"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -202,28 +204,68 @@ func (m ThreadMediaMode) Valid() bool {
 	return m == ThreadMediaText || m == ThreadMediaImagePending || m == ThreadMediaImage
 }
 
+type ThreadMediaSource string
+
+const (
+	ThreadMediaSourceTelegram ThreadMediaSource = "telegram_upload"
+	ThreadMediaSourcePexels   ThreadMediaSource = "pexels"
+)
+
+func (s ThreadMediaSource) Valid() bool {
+	return s == ThreadMediaSourceTelegram || s == ThreadMediaSourcePexels
+}
+
 // ThreadMedia is a normalized, metadata-free image attached to one or more
 // retained draft revisions. Data is never logged and is removed with the
 // owning user or by normal content-retention cleanup.
 type ThreadMedia struct {
-	ID             int64
-	TelegramID     int64
-	SourceUpdateID int64
-	Data           []byte
-	MediaType      string
-	Width          int
-	Height         int
-	Digest         string
-	DeliveryKey    string
-	CreatedAt      time.Time
+	ID              int64
+	TelegramID      int64
+	SourceKind      ThreadMediaSource
+	SourceUpdateID  int64
+	SourceAssetID   string
+	SourcePageURL   string
+	SourceAuthor    string
+	SourceAuthorURL string
+	SourceQuery     string
+	Data            []byte
+	MediaType       string
+	Width           int
+	Height          int
+	Digest          string
+	DeliveryKey     string
+	CreatedAt       time.Time
 }
 
 func (m ThreadMedia) ValidateForStore() error {
 	if m.TelegramID <= 0 {
 		return errors.New("thread media owner is required")
 	}
-	if m.SourceUpdateID <= 0 {
-		return errors.New("thread media source update is required")
+	sourceKind := m.SourceKind
+	if sourceKind == "" && m.SourceUpdateID > 0 {
+		sourceKind = ThreadMediaSourceTelegram
+	}
+	if !sourceKind.Valid() {
+		return errors.New("thread media source kind is invalid")
+	}
+	switch sourceKind {
+	case ThreadMediaSourceTelegram:
+		if m.SourceUpdateID <= 0 {
+			return errors.New("thread media source update is required")
+		}
+		if m.SourceAssetID != "" || m.SourcePageURL != "" || m.SourceAuthor != "" || m.SourceAuthorURL != "" || m.SourceQuery != "" {
+			return errors.New("telegram media cannot contain licensed source provenance")
+		}
+	case ThreadMediaSourcePexels:
+		if m.SourceUpdateID != 0 {
+			return errors.New("licensed media cannot contain a Telegram update")
+		}
+		if !validThreadMediaField(m.SourceAssetID, 80) || !validThreadMediaField(m.SourceAuthor, 160) || !validThreadMediaField(m.SourceQuery, 120) {
+			return errors.New("licensed media provenance is incomplete")
+		}
+		if !validThreadMediaHTTPSURL(m.SourcePageURL, "www.pexels.com") || !validThreadMediaHTTPSURL(m.SourceAuthorURL, "www.pexels.com") {
+			return errors.New("licensed media provenance URL is invalid")
+		}
 	}
 	if len(m.Data) == 0 || len(m.Data) > MaxThreadMediaBytes {
 		return errors.New("thread media must contain 1 byte to 8 MiB")
@@ -259,6 +301,36 @@ func (m ThreadMedia) ValidateForStore() error {
 		}
 	}
 	return nil
+}
+
+func (m ThreadMedia) EffectiveSourceKind() ThreadMediaSource {
+	if m.SourceKind == "" && m.SourceUpdateID > 0 {
+		return ThreadMediaSourceTelegram
+	}
+	return m.SourceKind
+}
+
+func validThreadMediaField(value string, maxRunes int) bool {
+	if !utf8.ValidString(value) || strings.TrimSpace(value) == "" || utf8.RuneCountInString(value) > maxRunes {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) || unicode.In(character, unicode.Cf) {
+			return false
+		}
+	}
+	return true
+}
+
+func validThreadMediaHTTPSURL(value, expectedHost string) bool {
+	if !utf8.ValidString(value) || utf8.RuneCountInString(value) > 2048 {
+		return false
+	}
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Hostname(), expectedHost) || parsed.User != nil || parsed.Fragment != "" {
+		return false
+	}
+	return parsed.Port() == "" || parsed.Port() == "443"
 }
 
 type ThreadDraftState string

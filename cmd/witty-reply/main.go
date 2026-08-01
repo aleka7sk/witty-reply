@@ -17,6 +17,7 @@ import (
 	"github.com/aleka7sk/witty-reply/internal/httpserver"
 	"github.com/aleka7sk/witty-reply/internal/meme"
 	"github.com/aleka7sk/witty-reply/internal/observability"
+	"github.com/aleka7sk/witty-reply/internal/photos"
 	"github.com/aleka7sk/witty-reply/internal/safety"
 	"github.com/aleka7sk/witty-reply/internal/session"
 	"github.com/aleka7sk/witty-reply/internal/store"
@@ -80,6 +81,10 @@ func runContext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	threadPhotoSource, err := buildThreadPhotoSource(cfg)
+	if err != nil {
+		return err
+	}
 	transcriber, err := buildTranscriber(cfg)
 	if err != nil {
 		return err
@@ -118,10 +123,12 @@ func runContext(ctx context.Context) error {
 	service, err := bot.NewService(
 		telegramClient, provider, transcriber, dataStore, sessions, callbacks, safetyFilter, renderer, metrics, logger,
 		bot.Config{
-			ProviderTimeout: cfg.AI.Timeout, UsageLocation: usageLocation, CallbackSecret: cfg.Telegram.CallbackSecret,
+			ProviderTimeout: cfg.AI.Timeout, ThreadProviderTimeout: cfg.Belcanto.GenerationTimeout,
+			UsageLocation: usageLocation, CallbackSecret: cfg.Telegram.CallbackSecret,
 			PrivacyURL: cfg.PrivacyURL, SpeechProvider: cfg.Speech.Provider,
 			BelcantoOperatorIDs: cfg.Belcanto.OperatorIDs, ThreadsPublisher: threadsPublisher,
-			ThreadMediaURL: threadsMedia.PublicURL,
+			ThreadMediaURL: threadsMedia.PublicURL, ThreadPhotoSource: threadPhotoSource,
+			BelcantoReviewLogMode: cfg.Belcanto.ReviewLogMode,
 			Limits: bot.Limits{
 				TextDaily: cfg.Limits.TextDaily, MediaDaily: cfg.Limits.MediaDaily, MemeDaily: cfg.Limits.MemeDaily,
 				RefinementDaily: cfg.Limits.RefinementDaily, StyleExamples: cfg.Limits.StyleExamples,
@@ -265,6 +272,24 @@ func buildThreadsPublisher(cfg config.Config) (threadspub.Publisher, error) {
 		return publisher, nil
 	default:
 		return nil, fmt.Errorf("unknown Threads provider %q", cfg.Belcanto.ThreadsProvider)
+	}
+}
+
+func buildThreadPhotoSource(cfg config.Config) (photos.Source, error) {
+	switch cfg.Belcanto.PhotoProvider {
+	case "disabled":
+		return nil, nil
+	case "pexels":
+		provider, err := photos.NewPexels(photos.PexelsConfig{
+			APIKey: cfg.Belcanto.PexelsAPIKey, BaseURL: cfg.Belcanto.PexelsBaseURL,
+			Timeout: cfg.Belcanto.PexelsTimeout,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create Pexels photo source: %w", err)
+		}
+		return provider, nil
+	default:
+		return nil, fmt.Errorf("unknown Threads photo provider %q", cfg.Belcanto.PhotoProvider)
 	}
 }
 

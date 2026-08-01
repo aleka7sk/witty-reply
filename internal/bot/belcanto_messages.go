@@ -35,29 +35,47 @@ func belcantoGenerationErrorText(lang language) string {
 }
 
 func threadDraftText(draft domain.ThreadDraft) string {
+	return threadDraftTextWithOptionalMedia(draft, nil)
+}
+
+func threadDraftTextWithMedia(draft domain.ThreadDraft, mediaValue domain.ThreadMedia) string {
+	return threadDraftTextWithOptionalMedia(draft, &mediaValue)
+}
+
+func threadDraftTextWithOptionalMedia(draft domain.ThreadDraft, mediaValue *domain.ThreadMedia) string {
 	voice := "Belcanto"
 	if draft.Voice == domain.ThreadVoiceAlisher {
 		voice = "Алишер"
 	}
 	goal := threadGoalLabel(draft.Goal)
+	status := "Пост готов — его можно публиковать без правок."
 	format := "📝 только текст"
 	rights := ""
-	if draft.MediaMode == domain.ThreadMediaImage {
+	if draft.MediaMode == domain.ThreadMediaImagePending {
+		status = "Текст готов. Для этого замысла редактор рекомендует реальное фото Belcanto."
+		format = "🖼 требуется реальное фото"
+		rights = "\n\nПришли один проверенный реальный кадр школы, пространства или музыкальной детали — либо выбери «Оставить только текст»."
+	} else if draft.MediaMode == domain.ThreadMediaImage {
 		format = "🖼 фото + текст"
 		rights = "\n\nНажимая «Права есть — опубликовать», ты подтверждаешь право Belcanto использовать фото и согласие всех узнаваемых людей; для детей — согласие законного представителя."
+		if mediaValue != nil && mediaValue.EffectiveSourceKind() == domain.ThreadMediaSourcePexels {
+			format = "🖼 лицензированное фото + текст"
+			rights = "\n\nФото: " + mediaValue.SourceAuthor + " · Pexels" +
+				"\n\nНажимая «Права есть — опубликовать», ты подтверждаешь нейтральный уместный контекст без впечатления, будто изображённые люди или бренды поддерживают Belcanto."
+		}
 	}
 	return fmt.Sprintf(
-		"🎼 Belcanto Threads\n\nПост готов — его можно публиковать без правок.\n\nАвтор: %s\nЦель: %s\nФормат: %s\nТон: тёплый и остроумный · без прямой продажи\n\n%s\n\n%d/500%s",
-		voice, goal, format, draft.Text, utf8.RuneCountInString(draft.Text), rights,
+		"🎼 Belcanto Threads\n\n%s\n\nАвтор: %s\nЦель: %s\nФормат: %s\nТон: тёплый и остроумный · без прямой продажи\n\n%s\n\n%d/500%s",
+		status, voice, goal, format, draft.Text, utf8.RuneCountInString(draft.Text), rights,
 	)
 }
 
 func threadImagePromptText(hasPrevious bool) string {
-	lead := "Пришли одно реальное фото Belcanto."
+	lead := "Пришли одно своё реальное фото Belcanto."
 	if hasPrevious {
 		lead = "Пришли новое реальное фото Belcanto. Прежнее останется сохранено, пока замена не будет принята."
 	}
-	return "🖼 " + lead + "\n\nПодойдёт живой кадр школы, занятия, пространства или музыкальная деталь. Стоковые и AI-изображения не используем. Подпись к фото не нужна — готовый текст уже сохранён.\n\nЕсли в кадре есть люди, убедись, что они согласны на публичную публикацию. Отправь фото не альбомом."
+	return "🖼 " + lead + "\n\nПодойдёт живой кадр школы, занятия, пространства или музыкальная деталь. Он заменит предложенную лицензированную иллюстрацию, если она была. Загружай только проверенный реальный кадр, а не AI-изображение. Подпись к фото не нужна — готовый текст уже сохранён.\n\nЕсли в кадре есть люди, убедись, что они согласны на публичную публикацию. Отправь фото не альбомом."
 }
 
 func threadImageInvalidText() string {

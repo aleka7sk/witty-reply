@@ -28,6 +28,7 @@ const (
 	providerAnthropic     = "anthropic"
 	providerClaudeCLI     = "claude_cli"
 	providerFake          = "fake"
+	providerCurated       = "curated_fallback"
 )
 
 var (
@@ -93,12 +94,34 @@ func invalidOutputCode(err error) string {
 		return "invalid_output_thread_digits"
 	case strings.Contains(message, "threads text does not match requested language"):
 		return "invalid_output_thread_language"
+	case strings.Contains(message, "threads text fails delivery moderation"):
+		return "invalid_output_thread_delivery_safety"
 	case strings.Contains(message, "repeated previous threads post"):
 		return "invalid_output_thread_repeated_post"
+	case strings.Contains(message, "repeated threads finalist"):
+		return "invalid_output_thread_repeated_finalist"
 	case strings.Contains(message, "unsupported threads goal"):
 		return "invalid_output_thread_goal"
+	case strings.Contains(message, "editorial quality gate: too long"):
+		return "invalid_output_thread_quality_too_long"
+	case strings.Contains(message, "editorial quality gate: ai_cliche"):
+		return "invalid_output_thread_quality_cliche"
+	case strings.Contains(message, "editorial quality gate: generic_question"):
+		return "invalid_output_thread_quality_generic_question"
+	case strings.Contains(message, "editorial quality gate"):
+		return "invalid_output_thread_quality"
+	case strings.Contains(message, "threads text") && strings.Contains(message, "exceeds"):
+		return "invalid_output_thread_text_too_long"
+	case strings.Contains(message, "threads text") && strings.Contains(message, "is empty"):
+		return "invalid_output_thread_text_empty"
+	case strings.Contains(message, "threads text") && strings.Contains(message, "invalid utf-8"):
+		return "invalid_output_thread_text_encoding"
 	case strings.Contains(message, "threads text"):
 		return "invalid_output_thread_text"
+	case strings.Contains(message, "decode threads structured output"), strings.Contains(message, "trailing threads"):
+		return "invalid_output_thread_json"
+	case strings.Contains(message, "threads reviewer"):
+		return "invalid_output_thread_review"
 	case strings.Contains(message, "expected exactly 3 replies"):
 		return "invalid_output_reply_count"
 	case strings.Contains(message, "duplicate reply"), strings.Contains(message, "repeated previous reply"):

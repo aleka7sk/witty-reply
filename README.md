@@ -21,7 +21,7 @@ The product supports witty teasing and firm boundaries. It is not an automated h
 - Consent gate, user-owned signed callbacks, atomic daily quotas, feedback, saved style examples, reset, and complete profile deletion.
 - AES-256-GCM encrypted durable Telegram inbox with per-user ordering, at-least-once processing, retries, lease recovery, dead-lettering, and payload scrubbing at a terminal state.
 - PostgreSQL production persistence and an in-memory development store.
-- Raw source text, screenshots, voice bytes, transcripts, Telegram file URLs, usernames, and generated text excluded from application logs. The encrypted update envelope can temporarily contain Telegram-supplied names/usernames, but they are not copied into profile or generation tables and disappear when the terminal queue payload is scrubbed.
+- Raw source text, screenshots, voice bytes, transcripts, Telegram file URLs, and usernames are excluded from application logs. Belcanto's separate operator-only editorial audit logs only locally safe AI-generated finalists so the winner can be compared; it can be reduced to hashes/scores with `metadata` or disabled with `off`. The encrypted update envelope can temporarily contain Telegram-supplied names/usernames, but they are not copied into profile or generation tables and disappear when the terminal queue payload is scrubbed.
 - Health, readiness, Prometheus-format metrics, retention cleanup, Docker, Compose, GitHub Actions, race tests, and human-readable architecture/operations docs.
 
 ## Quick start
@@ -144,9 +144,29 @@ help - Помощь
 
 This is a separate, operator-only workspace inside the same Telegram bot. It does not change the ordinary reply/comment flow or consume its quotas.
 
-Send `/threads`. The bot chooses an evergreen editorial premise itself and returns one WYSIWYG Russian post. Text-only is the default: review the exact text and press `✅ Опубликовать`. To use a visual, press `🖼 Добавить реальное фото`, send one photo, review the combined preview, and press `✅ Права есть — опубликовать`. The photo can be replaced or removed before publication. Optional buttons can also make the text shorter, warmer, wittier, remove sales cues, choose a different premise, or switch between the Belcanto and Alisher voices.
+Send `/threads`. The first Anthropic request uses high effort, privately explores at least ten substantially different approaches, discards predictable drafts, and returns five publication-ready finalists. It does not expose chain-of-thought or rejected scratch work. Every finalist passes the local fact, sales, language, repetition, length, and editorial-quality gates. A second, separate Anthropic request receives the safe finalists in shuffled order, scores hook, human voice, recognition, reply desire, brevity, and voice fit, and chooses the winner. Only that WYSIWYG winner is stored and shown in Telegram.
 
-The media path deliberately uses only an operator-supplied real Belcanto photo—there is no automatic stock or AI-generated image. The upload is resized to the Threads limit, re-encoded as JPEG to remove EXIF/GPS metadata, stored with the owned draft, and never sent to the AI provider. The confirmation label records that Belcanto may use the image and has consent from identifiable people (and a legal representative for children).
+The complete checkable editorial decision is emitted as one structured JSON log event: finalist texts, deterministic and reviewer scores, concise notes, rejection codes, selected winner, preview delivery status, and a shared `generation_id`. `BELCANTO_REVIEW_LOG_MODE=full` is the default for this allowlisted workspace; use `metadata` to retain only hashes/scores or `off` to disable the event. Hidden Anthropic reasoning and discarded internal ideas are never requested or logged. The default end-to-end budget is `THREADS_AI_TIMEOUT=120s`, separate from the per-call `AI_TIMEOUT`; internal stage deadlines reserve time for a curated generation fallback or local review fallback before that outer deadline.
+
+Pretty-print only these reviews from Compose logs:
+
+```bash
+docker compose logs --no-color --no-log-prefix app \
+  | jq 'select(.event == "belcanto_threads_editorial_review") | .audit |
+    {generation_id, selection_mode, preview_status,
+     winner: {id: .selected_winner_id, reason: .decision_reason},
+     visual: {mode: .visual_mode, attached: .photo_attached,
+       source: .photo_source, asset_id: .photo_asset_id,
+       source_page: .photo_source_page, author: .photo_author},
+     finalists: [.finalists[] | select(.considered) |
+       {rank, id, selected, delivery_safe,
+        local: {score: .local_score, flags: .quality_flags},
+        review, text}]}'
+```
+
+Text-only remains available whenever a photo would be decorative. If the independent editor decides a photographic object or atmosphere adds meaning and `THREADS_PHOTO_PROVIDER=pexels` is configured, it supplies only the visual strategy and a short anonymous English query. The app then takes the first result that passes its host, metadata, people-hint, size, and decode checks; Anthropic does not inspect or certify that concrete file. The app downloads it from the allowlisted Pexels CDN, re-encodes it as JPEG to remove EXIF/GPS, and stores source/author attribution. A failed search never blocks the winning text. The operator sees the exact combined preview and remains the final editor: the suggested photo can be removed or replaced with a real Belcanto photo. No image is generated by AI, but a public stock API cannot provide a cryptographic guarantee about how every uploaded file was created, so the strictest non-AI option is the school's own verified media library.
+
+An operator-supplied image is resized to the Threads limit, re-encoded as JPEG to remove EXIF/GPS metadata, stored with the owned draft, and never sent to Anthropic. The confirmation label records that Belcanto may use the image and has consent from identifiable people (and a legal representative for children). For a Pexels illustration it additionally asks the operator to confirm that the context does not imply endorsement by a depicted person.
 
 The first slice is deliberately fact-closed. It knows only that Belcanto is a vocal school in Astana. The model and application validator reject invented prices, discounts, trial terms, students, teachers, testimonials, results, events, schedules, availability, and current happenings.
 
@@ -155,6 +175,8 @@ The first slice is deliberately fact-closed. It knows only that Belcanto is a vo
 ```dotenv
 BELCANTO_OPERATOR_IDS=123456789
 THREADS_PROVIDER=fake
+THREADS_PHOTO_PROVIDER=disabled
+BELCANTO_REVIEW_LOG_MODE=full
 ```
 
 Restart the app, accept the normal consent gate, and send `/threads`. The fake publisher exercises the complete confirmation and durable idempotency flow without contacting Meta.
@@ -171,7 +193,12 @@ THREADS_ACCESS_TOKEN=TH...
 THREADS_API_BASE_URL=https://graph.threads.net/v1.0
 # Needed for image posts when TELEGRAM_WEBHOOK_URL is not this public origin:
 THREADS_MEDIA_BASE_URL=https://bot.example.com
+# Optional licensed illustrations:
+THREADS_PHOTO_PROVIDER=pexels
+PEXELS_API_KEY=...
 ```
+
+During a multi-process rolling deployment, enable `THREADS_PHOTO_PROVIDER=pexels` only after every process runs this version. The documented single-replica deployment is unaffected.
 
 For an image post, Meta must be able to fetch the normalized JPEG from this deployment. `THREADS_MEDIA_BASE_URL` is an HTTPS origin only (no path); it defaults to `TELEGRAM_WEBHOOK_URL`. It is optional for text-only operation: if neither origin is configured, image publication fails closed without affecting text publication.
 
