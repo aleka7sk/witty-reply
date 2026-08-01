@@ -106,6 +106,46 @@ type belcantoReviewerScoreLog struct {
 	Note         string `json:"note,omitempty"`
 }
 
+type belcantoMediaChangeAuditLog struct {
+	DraftID      int64  `json:"draft_id"`
+	Revision     uint32 `json:"revision"`
+	User         string `json:"user"`
+	Action       string `json:"action"`
+	PhotoSource  string `json:"photo_source,omitempty"`
+	PhotoAssetID string `json:"photo_asset_id,omitempty"`
+	PhotoQuery   string `json:"photo_query,omitempty"`
+}
+
+func (b *Service) logBelcantoMediaChanged(
+	telegramID int64,
+	draft domain.ThreadDraft,
+	mediaValue *domain.ThreadMedia,
+	action string,
+) {
+	mode := b.config.BelcantoReviewLogMode
+	if mode == "off" {
+		return
+	}
+	entry := belcantoMediaChangeAuditLog{
+		DraftID: draft.ID, Revision: draft.Revision,
+		User:   observability.UserHash(b.config.CallbackSecret, telegramID),
+		Action: boundedBelcantoAuditMetadata(action, maxBelcantoAuditIdentifierRunes),
+	}
+	if mediaValue != nil {
+		entry.PhotoSource = boundedBelcantoAuditMetadata(string(mediaValue.EffectiveSourceKind()), maxBelcantoAuditIdentifierRunes)
+	}
+	if mode == "full" && mediaValue != nil {
+		entry.PhotoAssetID = boundedBelcantoAuditMetadata(mediaValue.SourceAssetID, maxBelcantoAuditPhotoAssetRunes)
+		entry.PhotoQuery = boundedBelcantoAuditMetadata(mediaValue.SourceQuery, maxBelcantoAuditPhotoQueryRunes)
+	}
+	b.logger.Info(
+		"Belcanto Threads media changed",
+		"event", "belcanto_threads_media_changed",
+		"schema_version", 1,
+		slog.Any("audit", entry),
+	)
+}
+
 func (b *Service) logBelcantoEditorialAudit(
 	telegramID int64,
 	draft domain.ThreadDraft,

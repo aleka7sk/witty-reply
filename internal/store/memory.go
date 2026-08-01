@@ -29,19 +29,30 @@ type memoryQuotaReservation struct {
 	updatedAt time.Time
 }
 
+type memoryThreadMediaAttachKey struct {
+	UserID   int64
+	UpdateID int64
+}
+
+type memoryThreadMediaAttachOperation struct {
+	DraftID int64
+	MediaID int64
+}
+
 type Memory struct {
-	mu           sync.RWMutex
-	users        map[int64]domain.User
-	updates      map[int64]domain.UpdateJob
-	usage        map[memoryUsageKey]int
-	reservations map[memoryQuotaReservationKey]memoryQuotaReservation
-	generations  map[int64]domain.GenerationRecord
-	threadDrafts map[int64]domain.ThreadDraft
-	threadMedia  map[int64]domain.ThreadMedia
-	feedback     []domain.Feedback
-	examples     map[int64][]string
-	nextID       int64
-	now          func() time.Time
+	mu                          sync.RWMutex
+	users                       map[int64]domain.User
+	updates                     map[int64]domain.UpdateJob
+	usage                       map[memoryUsageKey]int
+	reservations                map[memoryQuotaReservationKey]memoryQuotaReservation
+	generations                 map[int64]domain.GenerationRecord
+	threadDrafts                map[int64]domain.ThreadDraft
+	threadMedia                 map[int64]domain.ThreadMedia
+	threadMediaAttachOperations map[memoryThreadMediaAttachKey]memoryThreadMediaAttachOperation
+	feedback                    []domain.Feedback
+	examples                    map[int64][]string
+	nextID                      int64
+	now                         func() time.Time
 }
 
 func NewMemory() *Memory {
@@ -49,8 +60,9 @@ func NewMemory() *Memory {
 		users: make(map[int64]domain.User), updates: make(map[int64]domain.UpdateJob), usage: make(map[memoryUsageKey]int),
 		reservations: make(map[memoryQuotaReservationKey]memoryQuotaReservation),
 		generations:  make(map[int64]domain.GenerationRecord), threadDrafts: make(map[int64]domain.ThreadDraft),
-		threadMedia: make(map[int64]domain.ThreadMedia),
-		examples:    make(map[int64][]string), nextID: 1, now: time.Now,
+		threadMedia:                 make(map[int64]domain.ThreadMedia),
+		threadMediaAttachOperations: make(map[memoryThreadMediaAttachKey]memoryThreadMediaAttachOperation),
+		examples:                    make(map[int64][]string), nextID: 1, now: time.Now,
 	}
 }
 
@@ -424,7 +436,8 @@ func (m *Memory) CreateThreadDraft(_ context.Context, draft domain.ThreadDraft) 
 }
 
 func (m *Memory) CreateThreadDraftWithMedia(_ context.Context, draft domain.ThreadDraft, mediaValue domain.ThreadMedia) (int64, error) {
-	if draft.MediaMode != domain.ThreadMediaImage || draft.MediaID != 0 || mediaValue.TelegramID != draft.TelegramID {
+	if draft.MediaMode != domain.ThreadMediaImage || draft.MediaID != 0 || mediaValue.TelegramID != draft.TelegramID ||
+		mediaValue.AttachUpdateID != 0 {
 		return 0, ErrThreadDraftState
 	}
 	if err := mediaValue.ValidateForStore(); err != nil {
@@ -605,6 +618,77 @@ func (m *Memory) AttachThreadDraftMedia(
 	return draft, nil
 }
 
+func (m *Memory) AttachLicensedThreadDraftMedia(
+	_ context.Context,
+	id, telegramID int64,
+	revision uint32,
+	mediaValue domain.ThreadMedia,
+) (domain.ThreadDraft, error) {
+	if mediaValue.TelegramID != telegramID {
+		return domain.ThreadDraft{}, ErrNotFound
+	}
+	if mediaValue.EffectiveSourceKind() != domain.ThreadMediaSourcePexels || mediaValue.AttachUpdateID <= 0 {
+		return domain.ThreadDraft{}, ErrThreadDraftState
+	}
+	if err := mediaValue.ValidateForStore(); err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	operationKey := memoryThreadMediaAttachKey{UserID: telegramID, UpdateID: mediaValue.AttachUpdateID}
+	if operation, exists := m.threadMediaAttachOperations[operationKey]; exists {
+		if operation.DraftID == id {
+			existingDraft, draftExists := m.threadDrafts[id]
+			if draftExists && existingDraft.TelegramID == telegramID && existingDraft.MediaID == operation.MediaID {
+				return existingDraft, nil
+			}
+		}
+		return domain.ThreadDraft{}, ErrThreadDraftState
+	}
+	draft, ok := m.threadDrafts[id]
+	if !ok || draft.TelegramID != telegramID {
+		return domain.ThreadDraft{}, ErrNotFound
+	}
+	if !draft.Current || draft.Revision != revision ||
+		(draft.State != domain.ThreadDraftReady && draft.State != domain.ThreadDraftFailed) ||
+		draft.Revision == ^uint32(0) {
+		return domain.ThreadDraft{}, ErrThreadDraftState
+	}
+	if draft.MediaID > 0 {
+		current, exists := m.threadMedia[draft.MediaID]
+		if !exists || current.TelegramID != telegramID {
+			return domain.ThreadDraft{}, ErrNotFound
+		}
+		if current.SourceAssetID == mediaValue.SourceAssetID || current.Digest == mediaValue.Digest {
+			return domain.ThreadDraft{}, ErrThreadDraftState
+		}
+	}
+	for _, existing := range m.threadMedia {
+		if existing.DeliveryKey == mediaValue.DeliveryKey {
+			return domain.ThreadDraft{}, errors.New("thread media delivery key already exists")
+		}
+	}
+	oldMediaID := draft.MediaID
+	now := m.now().UTC()
+	mediaValue.ID = m.nextID
+	m.nextID++
+	mediaValue.SourceKind = domain.ThreadMediaSourcePexels
+	mediaValue.Data = append([]byte(nil), mediaValue.Data...)
+	mediaValue.CreatedAt = now
+	m.threadMedia[mediaValue.ID] = mediaValue
+
+	draft.Revision++
+	draft.PhotoQuery = mediaValue.SourceQuery
+	draft.MediaMode = domain.ThreadMediaImage
+	draft.MediaID = mediaValue.ID
+	resetThreadDraftForPreview(&draft)
+	draft.UpdatedAt = now
+	m.threadDrafts[id] = draft
+	m.threadMediaAttachOperations[operationKey] = memoryThreadMediaAttachOperation{DraftID: id, MediaID: mediaValue.ID}
+	m.deleteOrphanThreadMediaLocked(oldMediaID)
+	return draft, nil
+}
+
 func (m *Memory) GetThreadMedia(_ context.Context, id, telegramID int64) (domain.ThreadMedia, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -648,6 +732,23 @@ func (m *Memory) GetThreadDraftByMediaUpdate(_ context.Context, telegramID, sour
 		}
 	}
 	return domain.ThreadDraft{}, ErrNotFound
+}
+
+func (m *Memory) GetThreadDraftByMediaAttachUpdate(_ context.Context, telegramID, attachUpdateID int64) (domain.ThreadDraft, error) {
+	if attachUpdateID <= 0 {
+		return domain.ThreadDraft{}, ErrNotFound
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	operation, exists := m.threadMediaAttachOperations[memoryThreadMediaAttachKey{UserID: telegramID, UpdateID: attachUpdateID}]
+	if !exists {
+		return domain.ThreadDraft{}, ErrNotFound
+	}
+	draft, exists := m.threadDrafts[operation.DraftID]
+	if !exists || draft.TelegramID != telegramID || draft.MediaID != operation.MediaID {
+		return domain.ThreadDraft{}, ErrThreadDraftState
+	}
+	return draft, nil
 }
 
 func resetThreadDraftForPreview(draft *domain.ThreadDraft) {
@@ -1045,6 +1146,11 @@ func (m *Memory) DeleteUser(_ context.Context, telegramID int64) error {
 			delete(m.threadMedia, id)
 		}
 	}
+	for key := range m.threadMediaAttachOperations {
+		if key.UserID == telegramID {
+			delete(m.threadMediaAttachOperations, key)
+		}
+	}
 	filtered := m.feedback[:0]
 	for _, item := range m.feedback {
 		if item.TelegramID != telegramID {
@@ -1087,6 +1193,11 @@ func (m *Memory) Cleanup(_ context.Context, before time.Time) (int64, error) {
 	}
 	for id := range m.threadMedia {
 		m.deleteOrphanThreadMediaLocked(id)
+	}
+	for key, operation := range m.threadMediaAttachOperations {
+		if _, exists := m.threadDrafts[operation.DraftID]; !exists {
+			delete(m.threadMediaAttachOperations, key)
+		}
 	}
 	for id, job := range m.updates {
 		if (job.Status == domain.UpdateJobCompleted || job.Status == domain.UpdateJobDead || job.Status == domain.UpdateJobSuperseded) && job.AvailableAt.Before(before) {

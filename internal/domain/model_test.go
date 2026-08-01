@@ -73,6 +73,8 @@ func TestThreadDraftValidateForCreate(t *testing.T) {
 		{name: "owner", mutate: func(d *ThreadDraft) { d.TelegramID = 0 }},
 		{name: "voice", mutate: func(d *ThreadDraft) { d.Voice = "invented" }},
 		{name: "goal", mutate: func(d *ThreadDraft) { d.Goal = "  " }},
+		{name: "photo query punctuation", mutate: func(d *ThreadDraft) { d.PhotoQuery = "piano, room" }},
+		{name: "photo query non ASCII", mutate: func(d *ThreadDraft) { d.PhotoQuery = "пустая студия" }},
 		{name: "text", mutate: func(d *ThreadDraft) { d.Text = strings.Repeat("я", MaxThreadPostRunes+1) }},
 		{name: "provider", mutate: func(d *ThreadDraft) { d.Provider = "" }},
 		{name: "model", mutate: func(d *ThreadDraft) { d.Model = "" }},
@@ -140,6 +142,20 @@ func TestThreadMediaValidateForStoreAcceptsPexelsProvenance(t *testing.T) {
 	}
 	if err := valid.ValidateForStore(); err != nil {
 		t.Fatalf("valid Pexels media: %v", err)
+	}
+	legacy := valid
+	legacy.SourceQuery = strings.Repeat("a", 110)
+	if err := legacy.ValidateForStore(); err != nil {
+		t.Fatalf("legacy automatic Pexels query must remain readable after upgrade: %v", err)
+	}
+	manual := valid
+	manual.AttachUpdateID = 77
+	if err := manual.ValidateForStore(); err != nil {
+		t.Fatalf("valid manual Pexels media: %v", err)
+	}
+	manual.SourceQuery = strings.Repeat("a", 101)
+	if err := manual.ValidateForStore(); err == nil {
+		t.Fatal("oversized manual Pexels query was accepted")
 	}
 	for name, mutate := range map[string]func(*ThreadMedia){
 		"Telegram update": func(value *ThreadMedia) { value.SourceUpdateID = 9 },

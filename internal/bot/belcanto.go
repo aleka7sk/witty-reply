@@ -32,6 +32,7 @@ const (
 	threadContainerReadyTimeout = 5 * time.Minute
 	threadContainerPollInterval = time.Minute
 	threadFinalizationTimeout   = 5 * time.Second
+	fallbackLicensedPhotoQuery  = "vintage microphone close up"
 )
 
 var (
@@ -117,9 +118,12 @@ func (b *Service) prepareThreadDraft(
 		return b.sendText(ctx, chatID, belcantoGenerationErrorText(userLanguage(user.Language)), nil)
 	}
 	draft := domain.ThreadDraft{
-		TelegramID: user.TelegramID, Voice: voice, Goal: result.Goal, Text: result.Text,
+		TelegramID: user.TelegramID, Voice: voice, Goal: result.Goal, PhotoQuery: result.Visual.Query, Text: result.Text,
 		Provider: result.Provider, Model: result.Model, Revision: revision,
 		MediaMode: domain.ThreadMediaText, State: domain.ThreadDraftReady, Current: true,
+	}
+	if strings.TrimSpace(draft.PhotoQuery) == "" {
+		draft.PhotoQuery = fallbackLicensedPhotoQuery
 	}
 	var previewMedia *domain.ThreadMedia
 	if previous != nil && transform != "different_angle" && voice == previous.Voice &&
@@ -130,10 +134,11 @@ func (b *Service) prepareThreadDraft(
 			if mediaErr != nil {
 				return fmt.Errorf("load previous Threads media: %w", mediaErr)
 			}
-			// A photo explicitly uploaded by the operator is a human override and
-			// survives small text refinements. A topic-specific Pexels suggestion
-			// is reconsidered on every revision so it cannot drift from the text.
-			preserve = previousMedia.EffectiveSourceKind() == domain.ThreadMediaSourceTelegram
+			// An explicit operator choice survives small text refinements. An
+			// automatic Pexels suggestion is reconsidered on every revision so it
+			// cannot silently drift from the new text.
+			preserve = previousMedia.EffectiveSourceKind() == domain.ThreadMediaSourceTelegram ||
+				(previousMedia.EffectiveSourceKind() == domain.ThreadMediaSourcePexels && previousMedia.AttachUpdateID > 0)
 			if preserve {
 				previewMedia = &previousMedia
 			}
@@ -180,7 +185,7 @@ func (b *Service) prepareThreadDraft(
 	} else {
 		draft.ID = draftID
 	}
-	keyboard, err := threadDraftKeyboard(b.callbacks, user.TelegramID, draft)
+	keyboard, err := b.threadDraftKeyboard(ctx, user.TelegramID, draft)
 	if err != nil {
 		return err
 	}
@@ -234,7 +239,7 @@ func (b *Service) selectLastMileThreadPost(result ai.ThreadPostResult) (ai.Threa
 		}
 		result.Goal = candidate.Goal
 		result.Text = candidate.Text
-		result.Visual = ai.ThreadPostVisualRecommendation{Mode: "text_only"}
+		result.Visual = ai.ThreadPostVisualRecommendation{Mode: "text_only", Query: fallbackLicensedPhotoQuery}
 		result.Audit.DeliveredWinnerID = candidate.ReviewerID
 		result.Audit.SelectionMode = "last_mile_override"
 		result.Audit.DecisionReason = "The reviewed winner failed final delivery moderation; selected the next highest safe finalist."
@@ -293,8 +298,21 @@ func (b *Service) prepareLicensedThreadMedia(
 	ctx context.Context,
 	telegramID int64,
 	recommendation ai.ThreadPostVisualRecommendation,
+	excludedAssetIDs ...string,
 ) (domain.ThreadMedia, error) {
-	asset, err := b.threadPhotoSource.Find(ctx, recommendation.Query)
+	var (
+		asset photos.Asset
+		err   error
+	)
+	if len(excludedAssetIDs) > 0 {
+		if alternative, ok := b.threadPhotoSource.(photos.AlternativeSource); ok {
+			asset, err = alternative.FindAlternative(ctx, recommendation.Query, excludedAssetIDs...)
+		} else {
+			asset, err = b.threadPhotoSource.Find(ctx, recommendation.Query)
+		}
+	} else {
+		asset, err = b.threadPhotoSource.Find(ctx, recommendation.Query)
+	}
 	if err != nil {
 		return domain.ThreadMedia{}, err
 	}
@@ -326,6 +344,121 @@ func (b *Service) prepareLicensedThreadMedia(
 	return mediaValue, nil
 }
 
+func (b *Service) selectThreadDraftLicensedPhoto(
+	ctx context.Context,
+	updateID, chatID int64,
+	user domain.User,
+	payload session.CallbackPayload,
+) error {
+	if !b.isBelcantoOperator(user.TelegramID) {
+		return b.sendText(ctx, chatID, belcantoOwnerOnlyText(userLanguage(user.Language)), nil)
+	}
+	// A durable callback can be retried after the licensed-media transaction
+	// committed but before Telegram acknowledged the exact photo preview.
+	committed, err := b.store.GetThreadDraftByMediaAttachUpdate(ctx, user.TelegramID, updateID)
+	if err == nil {
+		if committed.ID != payload.InteractionID || !committed.Current {
+			return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+		}
+		keyboard, keyboardErr := b.threadDraftKeyboard(ctx, user.TelegramID, committed)
+		if keyboardErr != nil {
+			return keyboardErr
+		}
+		return b.sendThreadDraftPreview(ctx, chatID, committed, keyboard)
+	}
+	if errors.Is(err, store.ErrThreadDraftState) {
+		return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	if b.threadPhotoSource == nil {
+		return b.sendText(ctx, chatID, threadLicensedPhotoDisabledText(), nil)
+	}
+	draft, err := b.store.GetThreadDraft(ctx, payload.InteractionID, user.TelegramID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+		}
+		return err
+	}
+	if !draft.Current || draft.Revision != payload.Revision ||
+		(draft.State != domain.ThreadDraftReady && draft.State != domain.ThreadDraftFailed) {
+		return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+	}
+	query := strings.TrimSpace(draft.PhotoQuery)
+	if query == "" {
+		query = fallbackLicensedPhotoQuery
+	}
+	var excludedAssetIDs []string
+	var currentAssetID, currentDigest string
+	if draft.MediaID > 0 {
+		currentMedia, mediaErr := b.store.GetThreadMedia(ctx, draft.MediaID, user.TelegramID)
+		if mediaErr != nil {
+			return fmt.Errorf("load current Threads media for Pexels replacement: %w", mediaErr)
+		}
+		currentDigest = currentMedia.Digest
+		if currentMedia.EffectiveSourceKind() == domain.ThreadMediaSourcePexels {
+			currentAssetID = currentMedia.SourceAssetID
+			if strings.TrimSpace(currentMedia.SourceQuery) != "" {
+				query = currentMedia.SourceQuery
+			}
+			excludedAssetIDs = append(excludedAssetIDs, currentMedia.SourceAssetID)
+		}
+	}
+	stopAction := b.startChatAction(ctx, chatID, telegram.ChatActionUploadPhoto)
+	defer stopAction()
+	mediaValue, err := b.prepareLicensedThreadMedia(
+		ctx, user.TelegramID,
+		ai.ThreadPostVisualRecommendation{Mode: "licensed_photo", Query: query},
+		excludedAssetIDs...,
+	)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		b.metrics.Inc("belcanto_photo_source_fallbacks")
+		b.logger.Warn(
+			"Belcanto manual licensed photo unavailable; draft unchanged",
+			"user", observability.UserHash(b.config.CallbackSecret, user.TelegramID),
+			"error", safeErrorCode(err),
+		)
+		return b.sendText(ctx, chatID, threadLicensedPhotoErrorText(err, draft.MediaID > 0), nil)
+	}
+	mediaValue.AttachUpdateID = updateID
+	if err := mediaValue.ValidateForStore(); err != nil {
+		return fmt.Errorf("validate manual licensed Threads media: %w", err)
+	}
+	if (currentAssetID != "" && mediaValue.SourceAssetID == currentAssetID) ||
+		(currentDigest != "" && mediaValue.Digest == currentDigest) {
+		b.metrics.Inc("belcanto_photo_source_fallbacks")
+		return b.sendText(ctx, chatID, threadLicensedPhotoUnavailableText(true), nil)
+	}
+	if err := validateUpdateLease(ctx); err != nil {
+		return err
+	}
+	updated, err := b.store.AttachLicensedThreadDraftMedia(
+		ctx, draft.ID, user.TelegramID, draft.Revision, mediaValue,
+	)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrThreadDraftState) {
+			return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+		}
+		return fmt.Errorf("attach licensed Threads media: %w", err)
+	}
+	keyboard, err := b.threadDraftKeyboard(ctx, user.TelegramID, updated)
+	if err != nil {
+		return err
+	}
+	attachedMedia, err := b.store.GetThreadMedia(ctx, updated.MediaID, user.TelegramID)
+	if err != nil {
+		return fmt.Errorf("load attached licensed Threads media: %w", err)
+	}
+	b.metrics.Inc("belcanto_licensed_media_selected")
+	b.logBelcantoMediaChanged(user.TelegramID, updated, &attachedMedia, "pexels_selected")
+	return b.sendThreadDraftPreview(ctx, chatID, updated, keyboard)
+}
+
 func (b *Service) sendThreadDraftPreview(
 	ctx context.Context,
 	chatID int64,
@@ -345,6 +478,24 @@ func (b *Service) sendThreadDraftPreview(
 		Caption: threadDraftTextWithMedia(draft, mediaValue), ReplyMarkup: keyboard, ProtectContent: true,
 	})
 	return err
+}
+
+func (b *Service) threadDraftKeyboard(
+	ctx context.Context,
+	telegramID int64,
+	draft domain.ThreadDraft,
+) (*telegram.InlineKeyboardMarkup, error) {
+	pexelsSelected := false
+	if draft.MediaID > 0 {
+		mediaValue, err := b.store.GetThreadMedia(ctx, draft.MediaID, telegramID)
+		if err != nil {
+			return nil, fmt.Errorf("load Threads media for keyboard: %w", err)
+		}
+		pexelsSelected = mediaValue.EffectiveSourceKind() == domain.ThreadMediaSourcePexels
+	}
+	return threadDraftKeyboard(
+		b.callbacks, telegramID, draft, b.threadPhotoSource != nil, pexelsSelected,
+	)
 }
 
 func threadDraftKeyboardWithMediaSource(
@@ -429,18 +580,21 @@ func (b *Service) deliverThreadDraftMediaMode(
 	draft domain.ThreadDraft,
 	mode domain.ThreadMediaMode,
 ) error {
-	keyboard, err := threadDraftKeyboard(b.callbacks, telegramID, draft)
+	keyboard, err := b.threadDraftKeyboard(ctx, telegramID, draft)
 	if err != nil {
 		return err
 	}
 	if mode == domain.ThreadMediaImagePending {
 		b.metrics.Inc("belcanto_media_requested")
+		b.logBelcantoMediaChanged(telegramID, draft, b.threadDraftMediaForAudit(ctx, telegramID, draft), "own_photo_requested")
 		return b.sendText(ctx, chatID, threadImagePromptText(draft.MediaID > 0), keyboard)
 	}
 	if mode == domain.ThreadMediaImage {
 		b.metrics.Inc("belcanto_media_replacement_cancelled")
+		b.logBelcantoMediaChanged(telegramID, draft, b.threadDraftMediaForAudit(ctx, telegramID, draft), "previous_photo_kept")
 	} else {
 		b.metrics.Inc("belcanto_text_format_selected")
+		b.logBelcantoMediaChanged(telegramID, draft, nil, "text_selected")
 	}
 	return b.sendThreadDraftPreview(ctx, chatID, draft, keyboard)
 }
@@ -466,7 +620,7 @@ func (b *Service) tryHandleThreadMediaUpload(
 		if !existing.Current {
 			return true, b.sendText(ctx, message.Chat.ID, threadDraftStaleText(), nil)
 		}
-		keyboard, keyboardErr := threadDraftKeyboard(b.callbacks, user.TelegramID, existing)
+		keyboard, keyboardErr := b.threadDraftKeyboard(ctx, user.TelegramID, existing)
 		if keyboardErr != nil {
 			return true, keyboardErr
 		}
@@ -535,12 +689,28 @@ func (b *Service) tryHandleThreadMediaUpload(
 		// infrastructure failures. Do not acknowledge a valid photo as rejected.
 		return true, fmt.Errorf("attach Threads media: %w", err)
 	}
-	keyboard, err := threadDraftKeyboard(b.callbacks, user.TelegramID, draft)
+	keyboard, err := b.threadDraftKeyboard(ctx, user.TelegramID, draft)
 	if err != nil {
 		return true, err
 	}
 	b.metrics.Inc("belcanto_media_attached")
+	b.logBelcantoMediaChanged(user.TelegramID, draft, &mediaValue, "own_photo_uploaded")
 	return true, b.sendThreadDraftPreview(ctx, message.Chat.ID, draft, keyboard)
+}
+
+func (b *Service) threadDraftMediaForAudit(
+	ctx context.Context,
+	telegramID int64,
+	draft domain.ThreadDraft,
+) *domain.ThreadMedia {
+	if draft.MediaID <= 0 {
+		return nil
+	}
+	mediaValue, err := b.store.GetThreadMedia(ctx, draft.MediaID, telegramID)
+	if err != nil {
+		return nil
+	}
+	return &mediaValue
 }
 
 func (b *Service) publishThreadDraft(

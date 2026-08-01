@@ -21,7 +21,7 @@ Never place the bot token in a webhook URL, log, issue, screenshot, or committed
    - send `коммент: <публичный пост>` to see `🔥 Залететь в комменты`;
    - use the scenario-switch button and confirm that the original source is reused.
 6. In fake mode the scenarios, refinements, and revisions intentionally produce different deterministic demo text.
-7. Set `BELCANTO_OPERATOR_IDS` to your numeric Telegram ID and `THREADS_PROVIDER=fake`. Send `/threads`; verify text-only publication, then create another draft, attach/replace/remove one photo, inspect the exact photo-plus-caption preview, and press its rights/publication button twice. Only the first confirmation may publish.
+7. Set `BELCANTO_OPERATOR_IDS` to your numeric Telegram ID and `THREADS_PROVIDER=fake`. Send `/threads`; verify text-only publication, then create another draft, use `Подобрать фото в Pexels` and `Другое фото из Pexels`, attach/replace/remove one own photo, inspect every exact photo-plus-caption preview, and press its rights/publication button twice. Only the first confirmation may publish. A manual Pexels change appears as `belcanto_threads_media_changed`; it does not rewrite the immutable editorial-review event.
 8. Switch to `AI_PROVIDER=anthropic`, add an Anthropic API key, and restart for a real-provider test.
 
 ## Connect Threads

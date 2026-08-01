@@ -75,7 +75,7 @@ func (provider *FakeProvider) GenerateThreadPost(ctx context.Context, request Th
 	result := winner.Result
 	result.Provider = providerFake
 	result.Model = audit.GeneratorModel
-	result.Visual = ThreadPostVisualRecommendation{Mode: "text_only"}
+	result.Visual = ThreadPostVisualRecommendation{Mode: "text_only", Query: defaultThreadPhotoQuery}
 	result.Audit = audit
 	return result, nil
 }

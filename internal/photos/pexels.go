@@ -3,6 +3,7 @@ package photos
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -84,6 +85,21 @@ func safePhotoAPIScheme(parsed *url.URL) bool {
 }
 
 func (provider *Pexels) Find(ctx context.Context, query string) (Asset, error) {
+	return provider.find(ctx, query, nil)
+}
+
+func (provider *Pexels) FindAlternative(ctx context.Context, query string, excludedAssetIDs ...string) (Asset, error) {
+	excluded := make(map[string]struct{}, len(excludedAssetIDs))
+	for _, assetID := range excludedAssetIDs {
+		assetID = strings.TrimSpace(assetID)
+		if assetID != "" {
+			excluded[assetID] = struct{}{}
+		}
+	}
+	return provider.find(ctx, query, excluded)
+}
+
+func (provider *Pexels) find(ctx context.Context, query string, excluded map[string]struct{}) (Asset, error) {
 	query = strings.TrimSpace(query)
 	if !validPhotoQuery(query) {
 		return Asset{}, fmt.Errorf("%w: invalid Pexels search query", ErrInvalidResult)
@@ -112,12 +128,27 @@ func (provider *Pexels) Find(ctx context.Context, query string) (Asset, error) {
 	request.Header.Set("User-Agent", "witty-reply/1")
 	response, err := provider.client.Do(request)
 	if err != nil {
-		return Asset{}, fmt.Errorf("Pexels search: %w", err)
+		if ctx.Err() != nil {
+			return Asset{}, ctx.Err()
+		}
+		if operationCtx.Err() != nil {
+			return Asset{}, fmt.Errorf("%w: Pexels search transport: %w", ErrUnavailable, operationCtx.Err())
+		}
+		return Asset{}, fmt.Errorf("%w: Pexels search transport", ErrUnavailable)
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-		return Asset{}, fmt.Errorf("Pexels search status %d", response.StatusCode)
+		switch response.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return Asset{}, fmt.Errorf("%w: Pexels search status %d", ErrAuthentication, response.StatusCode)
+		case http.StatusTooManyRequests:
+			return Asset{}, fmt.Errorf("%w: Pexels search status %d", ErrRateLimited, response.StatusCode)
+		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return Asset{}, fmt.Errorf("%w: Pexels search status %d", ErrUnavailable, response.StatusCode)
+		default:
+			return Asset{}, fmt.Errorf("%w: Pexels search status %d", ErrInvalidResult, response.StatusCode)
+		}
 	}
 	raw, err := readBounded(response.Body, maxPexelsJSONBytes)
 	if err != nil {
@@ -151,9 +182,13 @@ func (provider *Pexels) Find(ctx context.Context, query string) (Asset, error) {
 	downloads := 0
 	seenImageURLs := make(map[string]struct{})
 	searching := true
+	var retryableDownloadErr error
 	for _, photo := range photos {
 		if !searching {
 			break
+		}
+		if _, skip := excluded[strconv.FormatInt(photo.ID, 10)]; skip {
+			continue
 		}
 		if altSuggestsRecognizablePeople(photo.Alt) {
 			continue
@@ -179,13 +214,19 @@ func (provider *Pexels) Find(ctx context.Context, query string) (Asset, error) {
 			data, downloadErr := provider.download(operationCtx, imageURL)
 			if downloadErr != nil {
 				if err := operationCtx.Err(); err != nil {
-					return Asset{}, err
+					return Asset{}, fmt.Errorf("%w: Pexels image download: %w", ErrUnavailable, err)
+				}
+				if errors.Is(downloadErr, ErrRateLimited) || errors.Is(downloadErr, ErrUnavailable) {
+					retryableDownloadErr = downloadErr
 				}
 				continue
 			}
 			asset.Data = data
 			return asset, nil
 		}
+	}
+	if retryableDownloadErr != nil {
+		return Asset{}, retryableDownloadErr
 	}
 	return Asset{}, ErrNotFound
 }
@@ -232,11 +273,21 @@ func (provider *Pexels) download(ctx context.Context, rawURL string) ([]byte, er
 	request.Header.Set("User-Agent", "witty-reply/1")
 	response, err := provider.client.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("download Pexels image: %w", err)
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("%w: Pexels image transport: %w", ErrUnavailable, ctx.Err())
+		}
+		return nil, fmt.Errorf("%w: Pexels image transport", ErrUnavailable)
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return nil, fmt.Errorf("Pexels image status %d", response.StatusCode)
+		switch response.StatusCode {
+		case http.StatusTooManyRequests:
+			return nil, fmt.Errorf("%w: Pexels image status %d", ErrRateLimited, response.StatusCode)
+		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return nil, fmt.Errorf("%w: Pexels image status %d", ErrUnavailable, response.StatusCode)
+		default:
+			return nil, fmt.Errorf("%w: Pexels image status %d", ErrInvalidResult, response.StatusCode)
+		}
 	}
 	if response.ContentLength > maxPexelsImageBytes {
 		return nil, ErrTooLarge

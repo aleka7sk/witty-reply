@@ -276,7 +276,7 @@ func preparePendingThreadImage(
 		t.Fatalf("Threads text preview messages = %+v", messages)
 	}
 	initialPublish = threadPublishCallback(t, messages)
-	useImage := threadButtonCallback(t, messages[0].ReplyMarkup, "🖼 Добавить реальное фото")
+	useImage := threadButtonCallback(t, messages[0].ReplyMarkup, "🖼 Загрузить своё фото")
 	if err := service.HandleUpdate(ctx, threadCallbackUpdate(callbackUpdateID, "use-image", useImage)); err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +322,7 @@ func TestThreadTextPreviewOffersSignedImageChoiceAndPersistsPendingState(t *test
 	if len(messages) != 1 || !strings.Contains(messages[0].Text, "Формат: 📝 только текст") {
 		t.Fatalf("text preview = %+v", messages)
 	}
-	useImage := threadButtonCallback(t, messages[0].ReplyMarkup, "🖼 Добавить реальное фото")
+	useImage := threadButtonCallback(t, messages[0].ReplyMarkup, "🖼 Загрузить своё фото")
 	payload, err := codec.DecodeForUser(useImage, 42)
 	if err != nil {
 		t.Fatalf("add-image callback is not valid and owner-bound: %v", err)
@@ -528,7 +528,7 @@ func TestThreadImageReplacementKeepsOldUntilNewUploadThenRemovesIt(t *testing.T)
 		t.Fatal(err)
 	}
 	photos := snapshotThreadPhotos(telegramClient)
-	replaceData := threadButtonCallback(t, photos[len(photos)-1].ReplyMarkup, "🖼 Заменить фото")
+	replaceData := threadButtonCallback(t, photos[len(photos)-1].ReplyMarkup, "🖼 Загрузить своё фото")
 
 	if err := service.HandleUpdate(context.Background(), threadCallbackUpdate(53, "replace-photo", replaceData)); err != nil {
 		t.Fatal(err)
@@ -806,7 +806,7 @@ func TestThreadMediaModeCallbackRetryRedeliversCommittedTransition(t *testing.T)
 			t.Fatal(err)
 		}
 		messages := telegramClient.snapshotMessages()
-		useImage := threadButtonCallback(t, messages[0].ReplyMarkup, "🖼 Добавить реальное фото")
+		useImage := threadButtonCallback(t, messages[0].ReplyMarkup, "🖼 Загрузить своё фото")
 		payload, err := service.callbacks.DecodeForUser(useImage, 42)
 		if err != nil {
 			t.Fatal(err)
@@ -850,7 +850,7 @@ func TestThreadMediaModeCallbackRetryRedeliversCommittedTransition(t *testing.T)
 		_, _ = preparePendingThreadImage(t, service, telegramClient, 82, 83)
 		imageDraft := attachThreadImage(t, service, telegramClient, 84, "retry-preview-photo", threadTestImage(t, 900, 450, color.RGBA{R: 90, G: 40, B: 180, A: 255}))
 		photos := snapshotThreadPhotos(telegramClient)
-		replaceImage := threadButtonCallback(t, photos[len(photos)-1].ReplyMarkup, "🖼 Заменить фото")
+		replaceImage := threadButtonCallback(t, photos[len(photos)-1].ReplyMarkup, "🖼 Загрузить своё фото")
 		if err := service.HandleUpdate(context.Background(), threadCallbackUpdate(85, "replace-image", replaceImage)); err != nil {
 			t.Fatal(err)
 		}

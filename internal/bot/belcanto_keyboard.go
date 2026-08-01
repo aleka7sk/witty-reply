@@ -6,7 +6,13 @@ import (
 	"github.com/aleka7sk/witty-reply/internal/telegram"
 )
 
-func threadDraftKeyboard(codec *session.CallbackCodec, userID int64, draft domain.ThreadDraft) (*telegram.InlineKeyboardMarkup, error) {
+func threadDraftKeyboard(
+	codec *session.CallbackCodec,
+	userID int64,
+	draft domain.ThreadDraft,
+	pexelsEnabled bool,
+	pexelsSelected bool,
+) (*telegram.InlineKeyboardMarkup, error) {
 	button := func(label string, action session.Action) (telegram.InlineKeyboardButton, error) {
 		data, err := encodeCallback(codec, action, userID, draft.ID, draft.Revision, -1)
 		if err != nil {
@@ -14,7 +20,7 @@ func threadDraftKeyboard(codec *session.CallbackCodec, userID int64, draft domai
 		}
 		return telegram.CallbackButton(label, data), nil
 	}
-	rows := make([][]telegram.InlineKeyboardButton, 0, 6)
+	rows := make([][]telegram.InlineKeyboardButton, 0, 8)
 	appendRow := func(items ...struct {
 		label  string
 		action session.Action
@@ -31,6 +37,18 @@ func threadDraftKeyboard(codec *session.CallbackCodec, userID int64, draft domai
 		return nil
 	}
 	if draft.MediaMode == domain.ThreadMediaImagePending {
+		if pexelsEnabled {
+			label := "📷 Подобрать фото в Pexels"
+			if pexelsSelected {
+				label = "🔄 Другое фото из Pexels"
+			}
+			if err := appendRow(struct {
+				label  string
+				action session.Action
+			}{label, session.ActionThreadUsePexels}); err != nil {
+				return nil, err
+			}
+		}
 		if draft.MediaID > 0 {
 			if err := appendRow(struct {
 				label  string
@@ -64,11 +82,23 @@ func threadDraftKeyboard(codec *session.CallbackCodec, userID int64, draft domai
 		return nil, err
 	}
 	if draft.MediaMode == domain.ThreadMediaImage {
+		if pexelsEnabled {
+			label := "📷 Подобрать фото в Pexels"
+			if pexelsSelected {
+				label = "🔄 Другое фото из Pexels"
+			}
+			if err := appendRow(struct {
+				label  string
+				action session.Action
+			}{label, session.ActionThreadUsePexels}); err != nil {
+				return nil, err
+			}
+		}
 		if err := appendRow(
 			struct {
 				label  string
 				action session.Action
-			}{"🖼 Заменить фото", session.ActionThreadUseImage},
+			}{"🖼 Загрузить своё фото", session.ActionThreadUseImage},
 			struct {
 				label  string
 				action session.Action
@@ -77,10 +107,18 @@ func threadDraftKeyboard(codec *session.CallbackCodec, userID int64, draft domai
 			return nil, err
 		}
 	} else {
+		if pexelsEnabled {
+			if err := appendRow(struct {
+				label  string
+				action session.Action
+			}{"📷 Подобрать фото в Pexels", session.ActionThreadUsePexels}); err != nil {
+				return nil, err
+			}
+		}
 		if err := appendRow(struct {
 			label  string
 			action session.Action
-		}{"🖼 Добавить реальное фото", session.ActionThreadUseImage}); err != nil {
+		}{"🖼 Загрузить своё фото", session.ActionThreadUseImage}); err != nil {
 			return nil, err
 		}
 	}

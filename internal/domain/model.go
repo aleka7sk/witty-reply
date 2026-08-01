@@ -219,10 +219,14 @@ func (s ThreadMediaSource) Valid() bool {
 // retained draft revisions. Data is never logged and is removed with the
 // owning user or by normal content-retention cleanup.
 type ThreadMedia struct {
-	ID              int64
-	TelegramID      int64
-	SourceKind      ThreadMediaSource
-	SourceUpdateID  int64
+	ID             int64
+	TelegramID     int64
+	SourceKind     ThreadMediaSource
+	SourceUpdateID int64
+	// AttachUpdateID is the durable Telegram callback operation that manually
+	// selected a licensed asset. It is separate from SourceUpdateID, which is
+	// reserved for the original bytes of an operator-uploaded Telegram photo.
+	AttachUpdateID  int64
 	SourceAssetID   string
 	SourcePageURL   string
 	SourceAuthor    string
@@ -253,6 +257,9 @@ func (m ThreadMedia) ValidateForStore() error {
 		if m.SourceUpdateID <= 0 {
 			return errors.New("thread media source update is required")
 		}
+		if m.AttachUpdateID != 0 {
+			return errors.New("telegram media cannot contain a licensed attach operation")
+		}
 		if m.SourceAssetID != "" || m.SourcePageURL != "" || m.SourceAuthor != "" || m.SourceAuthorURL != "" || m.SourceQuery != "" {
 			return errors.New("telegram media cannot contain licensed source provenance")
 		}
@@ -260,8 +267,14 @@ func (m ThreadMedia) ValidateForStore() error {
 		if m.SourceUpdateID != 0 {
 			return errors.New("licensed media cannot contain a Telegram update")
 		}
+		if m.AttachUpdateID < 0 {
+			return errors.New("licensed media attach operation is invalid")
+		}
 		if !validThreadMediaField(m.SourceAssetID, 80) || !validThreadMediaField(m.SourceAuthor, 160) || !validThreadMediaField(m.SourceQuery, 120) {
 			return errors.New("licensed media provenance is incomplete")
+		}
+		if m.AttachUpdateID > 0 && !validThreadPhotoSearchQuery(m.SourceQuery) {
+			return errors.New("manual licensed media search query is invalid")
 		}
 		if !validThreadMediaHTTPSURL(m.SourcePageURL, "www.pexels.com") || !validThreadMediaHTTPSURL(m.SourceAuthorURL, "www.pexels.com") {
 			return errors.New("licensed media provenance URL is invalid")
@@ -359,10 +372,14 @@ func (s ThreadDraftState) Valid() bool {
 // creating a replacement makes every older signed keyboard stale without
 // deleting its audit and idempotency record.
 type ThreadDraft struct {
-	ID          int64
-	TelegramID  int64
-	Voice       ThreadVoice
-	Goal        string
+	ID         int64
+	TelegramID int64
+	Voice      ThreadVoice
+	Goal       string
+	// PhotoQuery is the editor's anonymous, safe Pexels fallback for this exact
+	// text. It is retained even when text-only is the recommended format so the
+	// operator can override that recommendation without regenerating the post.
+	PhotoQuery  string
 	Text        string
 	Provider    string
 	Model       string
@@ -402,6 +419,9 @@ func (d ThreadDraft) ValidateForCreate() error {
 	if !utf8.ValidString(d.Goal) || strings.ContainsRune(d.Goal, '\x00') || strings.TrimSpace(d.Goal) == "" || utf8.RuneCountInString(d.Goal) > 120 {
 		return errors.New("thread draft goal must contain 1 to 120 characters")
 	}
+	if d.PhotoQuery != "" && !validThreadPhotoSearchQuery(d.PhotoQuery) {
+		return errors.New("thread draft photo query is invalid")
+	}
 	if !utf8.ValidString(d.Text) || strings.ContainsRune(d.Text, '\x00') || strings.TrimSpace(d.Text) == "" || utf8.RuneCountInString(d.Text) > MaxThreadPostRunes {
 		return errors.New("thread draft text must contain 1 to 500 characters")
 	}
@@ -437,6 +457,23 @@ func (d ThreadDraft) ValidateForCreate() error {
 		return errors.New("new thread draft state must be draft")
 	}
 	return nil
+}
+
+func validThreadPhotoSearchQuery(value string) bool {
+	if !utf8.ValidString(value) || utf8.RuneCountInString(value) < 3 || utf8.RuneCountInString(value) > 100 {
+		return false
+	}
+	letters := 0
+	for _, character := range value {
+		switch {
+		case character >= 'a' && character <= 'z', character >= 'A' && character <= 'Z':
+			letters++
+		case character == ' ', character == '-':
+		default:
+			return false
+		}
+	}
+	return letters >= 3 && strings.TrimSpace(value) == value
 }
 
 type UserStats struct {

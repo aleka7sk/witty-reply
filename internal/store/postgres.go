@@ -78,7 +78,7 @@ func (p *Postgres) Migrate(ctx context.Context) error {
 			// Version 1 was historically an idempotent mutable bootstrap. Early
 			// installations marked it applied before Belcanto draft/media tables
 			// existed. Run the final compatibility bootstrap exactly once on the
-			// transition to version 2; after v2 is recorded, startup runs no DDL.
+			// transition to version 2; later immutable migrations then run once.
 			script, err := migrationFS.ReadFile("migrations/001_init.sql")
 			if err != nil {
 				return fmt.Errorf("read legacy compatibility bootstrap: %w", err)
@@ -94,6 +94,7 @@ func (p *Postgres) Migrate(ctx context.Context) error {
 	}{
 		{version: 1, path: "migrations/001_init.sql"},
 		{version: 2, path: "migrations/002_licensed_thread_media.sql"},
+		{version: 3, path: "migrations/003_manual_licensed_media.sql"},
 	} {
 		applied := false
 		if hasMigrationTable {
@@ -130,8 +131,9 @@ func (p *Postgres) Ping(ctx context.Context) error {
 		   AND to_regclass('quota_reservations') IS NOT NULL
 		   AND to_regclass('generations') IS NOT NULL
 		   AND to_regclass('thread_media') IS NOT NULL
+		   AND to_regclass('thread_media_attach_operations') IS NOT NULL
 		   AND to_regclass('thread_drafts') IS NOT NULL
-		   AND EXISTS (SELECT 1 FROM schema_migrations WHERE version = 2)`).Scan(&ready); err != nil {
+		   AND EXISTS (SELECT 1 FROM schema_migrations WHERE version = 3)`).Scan(&ready); err != nil {
 		return fmt.Errorf("check database schema: %w", err)
 	}
 	if !ready {
@@ -586,11 +588,11 @@ func (p *Postgres) CreateThreadDraft(ctx context.Context, draft domain.ThreadDra
 	var id int64
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO thread_drafts (
-			telegram_id, voice, goal, preview_text, provider, model,
+			telegram_id, voice, goal, photo_query, preview_text, provider, model,
 			revision, media_mode, media_id, state, is_current
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'draft', TRUE)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft', TRUE)
 		RETURNING id`,
-		draft.TelegramID, draft.Voice, draft.Goal, draft.Text, draft.Provider, draft.Model, draft.Revision,
+		draft.TelegramID, draft.Voice, draft.Goal, draft.PhotoQuery, draft.Text, draft.Provider, draft.Model, draft.Revision,
 		draft.MediaMode, nullablePositiveInt64(draft.MediaID),
 	).Scan(&id); err != nil {
 		return 0, err
@@ -602,7 +604,8 @@ func (p *Postgres) CreateThreadDraft(ctx context.Context, draft domain.ThreadDra
 }
 
 func (p *Postgres) CreateThreadDraftWithMedia(ctx context.Context, draft domain.ThreadDraft, mediaValue domain.ThreadMedia) (int64, error) {
-	if draft.MediaMode != domain.ThreadMediaImage || draft.MediaID != 0 || mediaValue.TelegramID != draft.TelegramID {
+	if draft.MediaMode != domain.ThreadMediaImage || draft.MediaID != 0 || mediaValue.TelegramID != draft.TelegramID ||
+		mediaValue.AttachUpdateID != 0 {
 		return 0, ErrThreadDraftState
 	}
 	if err := mediaValue.ValidateForStore(); err != nil {
@@ -627,12 +630,12 @@ func (p *Postgres) CreateThreadDraftWithMedia(ctx context.Context, draft domain.
 	var mediaID int64
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO thread_media (
-			telegram_id, source_kind, source_update_id, source_asset_id,
+			telegram_id, source_kind, source_update_id, attach_update_id, source_asset_id,
 			source_page_url, source_author, source_author_url, source_query,
 			content, media_type, width, height, digest, delivery_key
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		RETURNING id`,
-		mediaValue.TelegramID, mediaValue.SourceKind, nullablePositiveInt64(mediaValue.SourceUpdateID), mediaValue.SourceAssetID,
+		mediaValue.TelegramID, mediaValue.SourceKind, nullablePositiveInt64(mediaValue.SourceUpdateID), nullablePositiveInt64(mediaValue.AttachUpdateID), mediaValue.SourceAssetID,
 		mediaValue.SourcePageURL, mediaValue.SourceAuthor, mediaValue.SourceAuthorURL, mediaValue.SourceQuery,
 		mediaValue.Data, mediaValue.MediaType, mediaValue.Width, mediaValue.Height, mediaValue.Digest, mediaValue.DeliveryKey,
 	).Scan(&mediaID); err != nil {
@@ -646,11 +649,11 @@ func (p *Postgres) CreateThreadDraftWithMedia(ctx context.Context, draft domain.
 	var draftID int64
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO thread_drafts (
-			telegram_id, voice, goal, preview_text, provider, model,
+			telegram_id, voice, goal, photo_query, preview_text, provider, model,
 			revision, media_mode, media_id, state, is_current
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'image', $8, 'draft', TRUE)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'image', $9, 'draft', TRUE)
 		RETURNING id`,
-		draft.TelegramID, draft.Voice, draft.Goal, draft.Text, draft.Provider, draft.Model,
+		draft.TelegramID, draft.Voice, draft.Goal, draft.PhotoQuery, draft.Text, draft.Provider, draft.Model,
 		draft.Revision, mediaID,
 	).Scan(&draftID); err != nil {
 		return 0, err
@@ -824,6 +827,138 @@ func (p *Postgres) AttachThreadDraftMedia(
 	return draft, nil
 }
 
+func (p *Postgres) AttachLicensedThreadDraftMedia(
+	ctx context.Context,
+	id, telegramID int64,
+	revision uint32,
+	mediaValue domain.ThreadMedia,
+) (domain.ThreadDraft, error) {
+	if mediaValue.TelegramID != telegramID {
+		return domain.ThreadDraft{}, ErrNotFound
+	}
+	if mediaValue.EffectiveSourceKind() != domain.ThreadMediaSourcePexels || mediaValue.AttachUpdateID <= 0 {
+		return domain.ThreadDraft{}, ErrThreadDraftState
+	}
+	if err := mediaValue.ValidateForStore(); err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	defer rollback(tx)
+	var existingDraftID int64
+	var existingMediaID sql.NullInt64
+	operationErr := tx.QueryRow(ctx, `
+		SELECT draft_id, media_id
+		FROM thread_media_attach_operations
+		WHERE telegram_id = $1 AND attach_update_id = $2
+		FOR SHARE`, telegramID, mediaValue.AttachUpdateID,
+	).Scan(&existingDraftID, &existingMediaID)
+	if operationErr == nil {
+		if existingDraftID != id || !existingMediaID.Valid {
+			return domain.ThreadDraft{}, ErrThreadDraftState
+		}
+		draft, lookupErr := scanThreadDraft(tx.QueryRow(ctx, threadDraftSelect+`
+			WHERE id = $1 AND telegram_id = $2 AND media_id = $3`, id, telegramID, existingMediaID.Int64))
+		if lookupErr == nil {
+			return draft, nil
+		}
+		if errors.Is(lookupErr, pgx.ErrNoRows) {
+			return domain.ThreadDraft{}, ErrThreadDraftState
+		}
+		return domain.ThreadDraft{}, lookupErr
+	}
+	if !errors.Is(operationErr, pgx.ErrNoRows) {
+		return domain.ThreadDraft{}, operationErr
+	}
+	var mediaID int64
+	insertErr := tx.QueryRow(ctx, `
+		INSERT INTO thread_media (
+			telegram_id, source_kind, source_update_id, attach_update_id,
+			source_asset_id, source_page_url, source_author, source_author_url, source_query,
+			content, media_type, width, height, digest, delivery_key
+		) VALUES ($1, 'pexels', NULL, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		ON CONFLICT (telegram_id, attach_update_id) WHERE attach_update_id IS NOT NULL DO NOTHING
+		RETURNING id`,
+		mediaValue.TelegramID, mediaValue.AttachUpdateID, mediaValue.SourceAssetID,
+		mediaValue.SourcePageURL, mediaValue.SourceAuthor, mediaValue.SourceAuthorURL, mediaValue.SourceQuery,
+		mediaValue.Data, mediaValue.MediaType, mediaValue.Width, mediaValue.Height, mediaValue.Digest, mediaValue.DeliveryKey,
+	).Scan(&mediaID)
+	if errors.Is(insertErr, pgx.ErrNoRows) {
+		if err := tx.QueryRow(ctx, `
+			SELECT id FROM thread_media
+			WHERE telegram_id = $1 AND source_kind = 'pexels' AND attach_update_id = $2
+			FOR SHARE`, telegramID, mediaValue.AttachUpdateID).Scan(&mediaID); err != nil {
+			return domain.ThreadDraft{}, mapNotFound(err)
+		}
+		draft, err := scanThreadDraft(tx.QueryRow(ctx, threadDraftSelect+`
+			WHERE id = $1 AND telegram_id = $2 AND media_id = $3`, id, telegramID, mediaID))
+		if err == nil {
+			return draft, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return domain.ThreadDraft{}, err
+		}
+		if _, lookupErr := scanThreadDraft(tx.QueryRow(
+			ctx, threadDraftSelect+` WHERE id = $1 AND telegram_id = $2`, id, telegramID,
+		)); lookupErr != nil {
+			return domain.ThreadDraft{}, mapNotFound(lookupErr)
+		}
+		return domain.ThreadDraft{}, ErrThreadDraftState
+	}
+	if insertErr != nil {
+		return domain.ThreadDraft{}, insertErr
+	}
+	draft, err := scanThreadDraft(tx.QueryRow(ctx, `
+		UPDATE thread_drafts
+		SET revision = revision + 1, photo_query = $6, media_mode = 'image', media_id = $5,
+			media_rights_confirmed_at = NULL,
+			state = 'draft', container_id = '', post_id = '', permalink = '',
+			error_code = '', claim_token = '', claim_expires_at = NULL,
+			publish_started_at = NULL, published_at = NULL, updated_at = now()
+		WHERE id = $1 AND telegram_id = $2 AND revision = $3
+		  AND is_current AND revision < $4 AND state IN ('draft', 'failed')
+		  AND NOT EXISTS (
+			SELECT 1 FROM thread_media AS current_media
+			WHERE current_media.id = thread_drafts.media_id
+			  AND (current_media.source_asset_id = $7 OR current_media.digest = $8)
+		  )
+		RETURNING `+threadDraftColumns,
+		id, telegramID, revision, int64(^uint32(0)), mediaID, mediaValue.SourceQuery,
+		mediaValue.SourceAssetID, mediaValue.Digest,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		if _, lookupErr := scanThreadDraft(tx.QueryRow(
+			ctx, threadDraftSelect+` WHERE id = $1 AND telegram_id = $2`, id, telegramID,
+		)); lookupErr != nil {
+			return domain.ThreadDraft{}, mapNotFound(lookupErr)
+		}
+		return domain.ThreadDraft{}, ErrThreadDraftState
+	}
+	if err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO thread_media_attach_operations (
+			telegram_id, attach_update_id, draft_id, media_id
+		) VALUES ($1, $2, $3, $4)`,
+		telegramID, mediaValue.AttachUpdateID, id, mediaID,
+	); err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM thread_media AS media
+		WHERE media.telegram_id = $1
+		  AND NOT EXISTS (SELECT 1 FROM thread_drafts AS current_draft WHERE current_draft.media_id = media.id)`, telegramID); err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	return draft, nil
+}
+
 func (p *Postgres) GetThreadMedia(ctx context.Context, id, telegramID int64) (domain.ThreadMedia, error) {
 	mediaValue, err := scanThreadMedia(p.pool.QueryRow(ctx, threadMediaSelect+` WHERE id = $1 AND telegram_id = $2`, id, telegramID))
 	if err != nil {
@@ -853,6 +988,42 @@ func (p *Postgres) GetThreadDraftByMediaUpdate(ctx context.Context, telegramID, 
 		ORDER BY is_current DESC, updated_at DESC, id DESC LIMIT 1`, telegramID, sourceUpdateID))
 	if err != nil {
 		return domain.ThreadDraft{}, mapNotFound(err)
+	}
+	return draft, nil
+}
+
+func (p *Postgres) GetThreadDraftByMediaAttachUpdate(ctx context.Context, telegramID, attachUpdateID int64) (domain.ThreadDraft, error) {
+	if attachUpdateID <= 0 {
+		return domain.ThreadDraft{}, ErrNotFound
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	defer rollback(tx)
+	var draftID int64
+	var mediaID sql.NullInt64
+	if err := tx.QueryRow(ctx, `
+		SELECT draft_id, media_id
+		FROM thread_media_attach_operations
+		WHERE telegram_id = $1 AND attach_update_id = $2
+		FOR SHARE`, telegramID, attachUpdateID,
+	).Scan(&draftID, &mediaID); err != nil {
+		return domain.ThreadDraft{}, mapNotFound(err)
+	}
+	if !mediaID.Valid {
+		return domain.ThreadDraft{}, ErrThreadDraftState
+	}
+	draft, err := scanThreadDraft(tx.QueryRow(ctx, threadDraftSelect+`
+		WHERE id = $1 AND telegram_id = $2 AND media_id = $3`, draftID, telegramID, mediaID.Int64))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ThreadDraft{}, ErrThreadDraftState
+	}
+	if err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.ThreadDraft{}, err
 	}
 	return draft, nil
 }
@@ -1340,7 +1511,7 @@ func rollback(tx pgx.Tx) {
 }
 
 const threadDraftColumns = `
-	id, telegram_id, voice, goal, preview_text, provider, model, revision,
+	id, telegram_id, voice, goal, photo_query, preview_text, provider, model, revision,
 	media_mode, media_id, media_rights_confirmed_at,
 	state, is_current, container_id, post_id, permalink, error_code,
 	claim_token, claim_expires_at, publish_started_at,
@@ -1357,7 +1528,7 @@ func scanThreadDraft(row threadDraftScanner) (domain.ThreadDraft, error) {
 	var revision int64
 	var mediaID sql.NullInt64
 	err := row.Scan(
-		&draft.ID, &draft.TelegramID, &draft.Voice, &draft.Goal, &draft.Text,
+		&draft.ID, &draft.TelegramID, &draft.Voice, &draft.Goal, &draft.PhotoQuery, &draft.Text,
 		&draft.Provider, &draft.Model, &revision, &draft.MediaMode, &mediaID,
 		&draft.MediaRightsConfirmedAt, &draft.State, &draft.Current,
 		&draft.ContainerID, &draft.PostID, &draft.Permalink, &draft.ErrorCode,
@@ -1377,7 +1548,7 @@ func scanThreadDraft(row threadDraftScanner) (domain.ThreadDraft, error) {
 }
 
 const threadMediaColumns = `
-	id, telegram_id, source_kind, source_update_id, source_asset_id,
+	id, telegram_id, source_kind, source_update_id, attach_update_id, source_asset_id,
 	source_page_url, source_author, source_author_url, source_query,
 	content, media_type, width, height, digest, delivery_key, created_at`
 
@@ -1386,8 +1557,9 @@ const threadMediaSelect = `SELECT ` + threadMediaColumns + ` FROM thread_media`
 func scanThreadMedia(row threadDraftScanner) (domain.ThreadMedia, error) {
 	var mediaValue domain.ThreadMedia
 	var sourceUpdateID sql.NullInt64
+	var attachUpdateID sql.NullInt64
 	err := row.Scan(
-		&mediaValue.ID, &mediaValue.TelegramID, &mediaValue.SourceKind, &sourceUpdateID,
+		&mediaValue.ID, &mediaValue.TelegramID, &mediaValue.SourceKind, &sourceUpdateID, &attachUpdateID,
 		&mediaValue.SourceAssetID, &mediaValue.SourcePageURL, &mediaValue.SourceAuthor,
 		&mediaValue.SourceAuthorURL, &mediaValue.SourceQuery,
 		&mediaValue.Data, &mediaValue.MediaType, &mediaValue.Width, &mediaValue.Height,
@@ -1396,6 +1568,9 @@ func scanThreadMedia(row threadDraftScanner) (domain.ThreadMedia, error) {
 	if err == nil {
 		if sourceUpdateID.Valid {
 			mediaValue.SourceUpdateID = sourceUpdateID.Int64
+		}
+		if attachUpdateID.Valid {
+			mediaValue.AttachUpdateID = attachUpdateID.Int64
 		}
 		err = mediaValue.ValidateForStore()
 	}

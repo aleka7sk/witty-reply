@@ -69,10 +69,11 @@ const (
 	ActionThreadUseImage
 	ActionThreadUseText
 	ActionThreadKeepImage
+	ActionThreadUsePexels
 )
 
 func (a Action) Valid() bool {
-	return a >= ActionFeedbackUp && a <= ActionThreadKeepImage
+	return a >= ActionFeedbackUp && a <= ActionThreadUsePexels
 }
 
 type CallbackPayload struct {

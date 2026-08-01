@@ -50,6 +50,7 @@ func TestAllThreadCallbacksStopBeforeAIAndMetaAfterConsentRevocation(t *testing.
 		{name: "no_sell", action: session.ActionThreadNoSell},
 		{name: "publish", action: session.ActionThreadPublish},
 		{name: "cancel", action: session.ActionThreadCancel},
+		{name: "use_pexels", action: session.ActionThreadUsePexels},
 	}
 
 	for _, test := range actions {

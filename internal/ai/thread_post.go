@@ -22,6 +22,7 @@ const (
 	maxThreadRecentTexts      = 24
 	threadPostFinalistCount   = 5
 	threadPostExplorationGoal = 10
+	defaultThreadPhotoQuery   = "vintage microphone close up"
 )
 
 const threadPostSystemPrompt = `You are the editorial co-author for Belcanto's Threads presence.

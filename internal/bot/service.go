@@ -575,6 +575,8 @@ func (b *Service) handleCallback(ctx context.Context, updateID int64, callback t
 		return b.setThreadDraftMediaMode(ctx, chatID, user, payload, domain.ThreadMediaText)
 	case session.ActionThreadKeepImage:
 		return b.setThreadDraftMediaMode(ctx, chatID, user, payload, domain.ThreadMediaImage)
+	case session.ActionThreadUsePexels:
+		return b.selectThreadDraftLicensedPhoto(ctx, updateID, chatID, user, payload)
 	case session.ActionThreadPublish:
 		return b.publishThreadDraft(ctx, chatID, user, payload)
 	case session.ActionThreadCancel:
@@ -600,7 +602,8 @@ func threadActionRequiresConsent(action session.Action) bool {
 		session.ActionThreadCancel,
 		session.ActionThreadUseImage,
 		session.ActionThreadUseText,
-		session.ActionThreadKeepImage:
+		session.ActionThreadKeepImage,
+		session.ActionThreadUsePexels:
 		return true
 	default:
 		return false
@@ -1192,6 +1195,22 @@ func safeErrorCode(err error) string {
 	var providerErr *ai.ProviderError
 	if errors.As(err, &providerErr) && providerErr.Code != "" {
 		return providerErr.Code
+	}
+	for _, photoError := range []struct {
+		target error
+		code   string
+	}{
+		{photos.ErrAuthentication, "pexels_authentication"},
+		{photos.ErrRateLimited, "pexels_rate_limited"},
+		{photos.ErrUnavailable, "pexels_unavailable"},
+		{photos.ErrNotFound, "pexels_not_found"},
+		{photos.ErrInvalidResult, "pexels_invalid_result"},
+		{photos.ErrTooLarge, "pexels_response_too_large"},
+		{photos.ErrConfiguration, "pexels_configuration"},
+	} {
+		if errors.Is(err, photoError.target) {
+			return photoError.code
+		}
 	}
 	return fmt.Sprintf("%T", err)
 }

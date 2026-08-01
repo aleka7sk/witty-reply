@@ -111,7 +111,7 @@ func (provider *AnthropicProvider) GenerateThreadPost(ctx context.Context, reque
 				if decision.ScoreOverride {
 					audit.SelectionMode = "review_score_override"
 					audit.DecisionReason = "The reviewer's declared winner did not match its scorecards; selected the highest weighted score."
-					winner.Result.Visual = ThreadPostVisualRecommendation{Mode: "text_only"}
+					winner.Result.Visual = ThreadPostVisualRecommendation{Mode: "text_only", Query: defaultThreadPhotoQuery}
 				} else {
 					audit.SelectionMode = "anthropic_blind_review"
 					audit.DecisionReason = decision.Reason
@@ -132,7 +132,7 @@ func (provider *AnthropicProvider) GenerateThreadPost(ctx context.Context, reque
 		audit.SelectionMode = "local_review_fallback"
 		audit.DecisionReason = "Independent reviewer was unavailable; selected the highest deterministic local quality score."
 		audit.ReviewerError = safeThreadPostFallbackReason(reviewErr)
-		winner.Result.Visual = ThreadPostVisualRecommendation{Mode: "text_only"}
+		winner.Result.Visual = ThreadPostVisualRecommendation{Mode: "text_only", Query: defaultThreadPhotoQuery}
 	}
 
 	markThreadPostAuditWinner(&audit, winner)
@@ -384,7 +384,7 @@ func curatedThreadPostFallback(normalized normalizedThreadPostRequest, reason st
 	result.Provider = providerCurated
 	result.Model = "belcanto-editorial-v2"
 	result.FallbackReason = reason
-	result.Visual = ThreadPostVisualRecommendation{Mode: "text_only"}
+	result.Visual = ThreadPostVisualRecommendation{Mode: "text_only", Query: defaultThreadPhotoQuery}
 	result.Usage = sumUsage(audit.GenerationUsage, audit.ReviewUsage)
 	result.Audit = audit
 	return result, nil

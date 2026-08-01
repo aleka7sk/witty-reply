@@ -1,11 +1,13 @@
 package bot
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/aleka7sk/witty-reply/internal/domain"
+	"github.com/aleka7sk/witty-reply/internal/photos"
 	threadspub "github.com/aleka7sk/witty-reply/internal/threads"
 )
 
@@ -84,6 +86,30 @@ func threadImageInvalidText() string {
 
 func threadImageAlbumText() string {
 	return "Для этой версии нужен один кадр, не альбом. Отправь одно фото отдельным сообщением."
+}
+
+func threadLicensedPhotoDisabledText() string {
+	return "Pexels сейчас не подключён. Текстовый черновик и прежнее фото не изменены. Проверь THREADS_PHOTO_PROVIDER и PEXELS_API_KEY, затем перезапусти приложение."
+}
+
+func threadLicensedPhotoUnavailableText(hasPrevious bool) string {
+	if hasPrevious {
+		return "Не удалось найти другое подходящее фото в Pexels. Прежнее фото и текст сохранены без изменений — можно попробовать ещё раз."
+	}
+	return "Не удалось найти подходящее фото в Pexels. Текстовый черновик сохранён без изменений — можно попробовать ещё раз или загрузить своё фото."
+}
+
+func threadLicensedPhotoErrorText(err error, hasPrevious bool) string {
+	switch {
+	case errors.Is(err, photos.ErrAuthentication):
+		return "Pexels не принял API-ключ. Черновик не изменён. Проверь PEXELS_API_KEY и перезапусти приложение."
+	case errors.Is(err, photos.ErrRateLimited):
+		return "Лимит Pexels временно исчерпан. Черновик не изменён — попробуй ещё раз позже или загрузи своё фото."
+	case errors.Is(err, photos.ErrUnavailable):
+		return "Pexels временно недоступен. Черновик не изменён — попробуй ещё раз позже или загрузи своё фото."
+	default:
+		return threadLicensedPhotoUnavailableText(hasPrevious)
+	}
 }
 
 func threadImageRequiredText() string {

@@ -81,7 +81,7 @@ func TestCallbackSupportsConsentStyleAndScenarioActions(t *testing.T) {
 		ActionThreadNewBelcanto, ActionThreadNewAlisher, ActionThreadWittier,
 		ActionThreadWarmer, ActionThreadShorter, ActionThreadDifferentAngle,
 		ActionThreadNoSell, ActionThreadPublish, ActionThreadCancel,
-		ActionThreadUseImage, ActionThreadUseText, ActionThreadKeepImage,
+		ActionThreadUseImage, ActionThreadUseText, ActionThreadKeepImage, ActionThreadUsePexels,
 	} {
 		encoded, err := codec.Encode(CallbackPayload{
 			Action: action, UserID: 101, InteractionID: 101, Candidate: -1,
@@ -111,7 +111,7 @@ func TestActionNumericStability(t *testing.T) {
 		ActionThreadNewAlisher, ActionThreadWittier, ActionThreadWarmer,
 		ActionThreadShorter, ActionThreadDifferentAngle, ActionThreadNoSell,
 		ActionThreadPublish, ActionThreadCancel, ActionThreadUseImage,
-		ActionThreadUseText, ActionThreadKeepImage,
+		ActionThreadUseText, ActionThreadKeepImage, ActionThreadUsePexels,
 	}
 	for index, action := range actions {
 		if want := Action(index + 1); action != want {

@@ -406,6 +406,30 @@ func TestThreadPostReviewerUsesWeightedScoresOverDeclaredWinner(t *testing.T) {
 	}
 }
 
+func TestThreadPostVisualAlwaysKeepsSafeManualPexelsQuery(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		mode string
+	}{
+		{name: "text only", mode: "text_only"},
+		{name: "authentic Belcanto", mode: "belcanto_photo"},
+		{name: "licensed", mode: "licensed_photo"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			visual := normalizeThreadPostVisual(threadPostReviewerVisual{
+				Mode: test.mode, Query: "empty music studio warm light", Brief: "Кадр поддерживает тему.",
+			})
+			if visual.Mode != test.mode || visual.Query != "empty music studio warm light" {
+				t.Fatalf("visual = %+v", visual)
+			}
+		})
+	}
+	fallback := normalizeThreadPostVisual(threadPostReviewerVisual{Mode: "text_only"})
+	if fallback.Query != defaultThreadPhotoQuery {
+		t.Fatalf("fallback visual = %+v", fallback)
+	}
+}
+
 func TestAnthropicThreadPostExploresFiveAndUsesBlindReviewer(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -607,7 +631,8 @@ func TestAnthropicThreadPostUsesCuratedFallbackAfterOneRepair(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls.Load() != 2 || result.Provider != providerCurated || result.FallbackReason == "" || result.Audit.SelectionMode != "curated_fallback" {
+	if calls.Load() != 2 || result.Provider != providerCurated || result.FallbackReason == "" ||
+		result.Audit.SelectionMode != "curated_fallback" || result.Visual.Query != defaultThreadPhotoQuery {
 		t.Fatalf("calls=%d result=%+v", calls.Load(), result)
 	}
 	considered, selected := 0, 0
@@ -661,7 +686,8 @@ func TestAnthropicThreadPostReviewerFailureUsesLocalWinner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Provider != providerAnthropic || result.Audit.SelectionMode != "local_review_fallback" || result.Audit.ReviewerError != "invalid_output_thread_review" {
+	if result.Provider != providerAnthropic || result.Audit.SelectionMode != "local_review_fallback" ||
+		result.Audit.ReviewerError != "invalid_output_thread_review" || result.Visual.Query != defaultThreadPhotoQuery {
 		t.Fatalf("result = %+v", result)
 	}
 	if result.Usage.InputTokens != 6 || result.Usage.OutputTokens != 8 {

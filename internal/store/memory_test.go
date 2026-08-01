@@ -574,8 +574,63 @@ func TestMemoryCreatesLicensedMediaAndDraftAtomically(t *testing.T) {
 	if _, err := memory.CreateThreadDraftWithMedia(ctx, badDraft, testPexelsThreadMedia(42)); err == nil {
 		t.Fatal("invalid draft and media transaction succeeded")
 	}
+	manual := testPexelsThreadMediaWithOperation(42, 9090, "909", "manual bytes")
+	if _, err := memory.CreateThreadDraftWithMedia(ctx, draft, manual); !errors.Is(err, ErrThreadDraftState) {
+		t.Fatalf("manual media bypassed dedicated attach operation: %v", err)
+	}
 	if len(memory.threadMedia) != 1 {
 		t.Fatalf("orphan media count = %d", len(memory.threadMedia))
+	}
+}
+
+func TestMemoryManualLicensedMediaIsAtomicReplaySafeAndReplaceable(t *testing.T) {
+	ctx := context.Background()
+	memory := NewMemory()
+	if _, err := memory.UpsertUser(ctx, domain.User{TelegramID: 42}); err != nil {
+		t.Fatal(err)
+	}
+	draft := testThreadDraft(42, 1, "Песня иногда вспоминается раньше названия.")
+	draft.PhotoQuery = "vintage microphone close up"
+	draftID, err := memory.CreateThreadDraft(ctx, draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstMedia := testPexelsThreadMediaWithOperation(42, 5001, "501", "first licensed bytes")
+	first, err := memory.AttachLicensedThreadDraftMedia(ctx, draftID, 42, 1, firstMedia)
+	if err != nil || first.MediaMode != domain.ThreadMediaImage || first.Revision != 2 || first.MediaID <= 0 {
+		t.Fatalf("first licensed attach = %+v, %v", first, err)
+	}
+	replayed, err := memory.AttachLicensedThreadDraftMedia(ctx, draftID, 42, 1, firstMedia)
+	if err != nil || replayed.MediaID != first.MediaID || replayed.Revision != first.Revision {
+		t.Fatalf("licensed replay = %+v, %v", replayed, err)
+	}
+	byOperation, err := memory.GetThreadDraftByMediaAttachUpdate(ctx, 42, 5001)
+	if err != nil || byOperation.MediaID != first.MediaID {
+		t.Fatalf("licensed operation lookup = %+v, %v", byOperation, err)
+	}
+
+	secondMedia := testPexelsThreadMediaWithOperation(42, 5002, "502", "second licensed bytes")
+	second, err := memory.AttachLicensedThreadDraftMedia(ctx, draftID, 42, first.Revision, secondMedia)
+	if err != nil || second.Revision != first.Revision+1 || second.MediaID == first.MediaID {
+		t.Fatalf("licensed replacement = %+v, %v", second, err)
+	}
+	if _, err := memory.GetThreadMedia(ctx, first.MediaID, 42); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old licensed bytes survived replacement: %v", err)
+	}
+	if _, err := memory.GetThreadDraftByMediaAttachUpdate(ctx, 42, 5001); !errors.Is(err, ErrThreadDraftState) {
+		t.Fatalf("replaced operation lookup = %v, want ErrThreadDraftState", err)
+	}
+
+	thirdID, err := memory.CreateThreadDraft(ctx, testThreadDraft(42, 4, "Другой пост"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := memory.AttachLicensedThreadDraftMedia(ctx, thirdID, 42, 4, firstMedia); !errors.Is(err, ErrThreadDraftState) {
+		t.Fatalf("cross-draft licensed replay = %v", err)
+	}
+	third, err := memory.GetThreadDraft(ctx, thirdID, 42)
+	if err != nil || third.MediaMode != domain.ThreadMediaText || third.MediaID != 0 || third.Revision != 4 {
+		t.Fatalf("cross-draft replay mutated target = %+v, %v", third, err)
 	}
 }
 
@@ -709,4 +764,16 @@ func testPexelsThreadMedia(owner int64) domain.ThreadMedia {
 		Data:        data, MediaType: "image/jpeg", Width: 800, Height: 1_000,
 		Digest: hex.EncodeToString(digest[:]), DeliveryKey: "fedcba9876543210fedcba9876543210",
 	}
+}
+
+func testPexelsThreadMediaWithOperation(owner, operationID int64, assetID, content string) domain.ThreadMedia {
+	mediaValue := testPexelsThreadMedia(owner)
+	mediaValue.AttachUpdateID = operationID
+	mediaValue.SourceAssetID = assetID
+	mediaValue.SourcePageURL = "https://www.pexels.com/photo/object-" + assetID + "/"
+	mediaValue.Data = []byte(content)
+	digest := sha256.Sum256(mediaValue.Data)
+	mediaValue.Digest = hex.EncodeToString(digest[:])
+	mediaValue.DeliveryKey = fmt.Sprintf("%032x", operationID)
+	return mediaValue
 }

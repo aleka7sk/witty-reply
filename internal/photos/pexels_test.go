@@ -70,6 +70,120 @@ func TestPexelsFindUsesBoundedSearchAndSkipsPeople(t *testing.T) {
 	}
 }
 
+func TestPexelsFindAlternativeExcludesCurrentAsset(t *testing.T) {
+	imageData := testJPEG(t)
+	api := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/search" {
+			t.Fatalf("path = %q", request.URL.Path)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"photos":[
+			{"id":11,"url":"https://www.pexels.com/photo/first-11/","photographer":"First","photographer_url":"https://www.pexels.com/@first","alt":"microphone","src":{"large":"https://images.pexels.com/photos/11.jpg"}},
+			{"id":22,"url":"https://www.pexels.com/photo/second-22/","photographer":"Second","photographer_url":"https://www.pexels.com/@second","alt":"empty studio","src":{"large":"https://images.pexels.com/photos/22.jpg"}}
+		]}`)
+	}))
+	defer api.Close()
+
+	baseTransport := http.DefaultTransport
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Hostname() == pexelsImageHost {
+			return &http.Response{
+				StatusCode: http.StatusOK, Header: make(http.Header),
+				Body: io.NopCloser(bytes.NewReader(imageData)), ContentLength: int64(len(imageData)), Request: request,
+			}, nil
+		}
+		return baseTransport.RoundTrip(request)
+	})}
+	provider, err := NewPexels(PexelsConfig{APIKey: "key", BaseURL: api.URL, Timeout: time.Second, HTTPClient: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	asset, err := provider.FindAlternative(context.Background(), "empty music studio", "11")
+	if err != nil || asset.AssetID != "22" {
+		t.Fatalf("FindAlternative() = %+v, %v", asset, err)
+	}
+}
+
+func TestPexelsFindAlternativeReturnsNotFoundWhenEveryAssetIsExcluded(t *testing.T) {
+	var downloads atomic.Int32
+	api := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(writer, `{"photos":[
+			{"id":11,"url":"https://www.pexels.com/photo/first-11/","photographer":"First","photographer_url":"https://www.pexels.com/@first","alt":"microphone","src":{"large":"https://images.pexels.com/photos/11.jpg"}},
+			{"id":22,"url":"https://www.pexels.com/photo/second-22/","photographer":"Second","photographer_url":"https://www.pexels.com/@second","alt":"empty studio","src":{"large":"https://images.pexels.com/photos/22.jpg"}}
+		]}`)
+	}))
+	defer api.Close()
+	baseTransport := http.DefaultTransport
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Hostname() == pexelsImageHost {
+			downloads.Add(1)
+		}
+		return baseTransport.RoundTrip(request)
+	})}
+	provider, err := NewPexels(PexelsConfig{APIKey: "key", BaseURL: api.URL, Timeout: time.Second, HTTPClient: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = provider.FindAlternative(context.Background(), "empty music studio", "11", "22")
+	if !errors.Is(err, ErrNotFound) || downloads.Load() != 0 {
+		t.Fatalf("FindAlternative() error=%v downloads=%d", err, downloads.Load())
+	}
+}
+
+func TestPexelsFindClassifiesSearchStatus(t *testing.T) {
+	for _, test := range []struct {
+		status int
+		want   error
+	}{
+		{status: http.StatusUnauthorized, want: ErrAuthentication},
+		{status: http.StatusTooManyRequests, want: ErrRateLimited},
+		{status: http.StatusServiceUnavailable, want: ErrUnavailable},
+		{status: http.StatusBadRequest, want: ErrInvalidResult},
+	} {
+		t.Run(fmt.Sprintf("status_%d", test.status), func(t *testing.T) {
+			api := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.WriteHeader(test.status)
+			}))
+			defer api.Close()
+			provider, err := NewPexels(PexelsConfig{APIKey: "key", BaseURL: api.URL, Timeout: time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = provider.Find(context.Background(), "empty music studio")
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Find() error=%v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestPexelsFindReturnsUnavailableWhenEveryImageDownloadFails(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(writer, `{"photos":[
+			{"id":33,"url":"https://www.pexels.com/photo/studio-33/","photographer":"Lens","photographer_url":"https://www.pexels.com/@lens","alt":"empty studio","src":{"large":"https://images.pexels.com/photos/33.jpg"}}
+		]}`)
+	}))
+	defer api.Close()
+	baseTransport := http.DefaultTransport
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Hostname() == pexelsImageHost {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable, Header: make(http.Header),
+				Body: io.NopCloser(strings.NewReader("unavailable")), Request: request,
+			}, nil
+		}
+		return baseTransport.RoundTrip(request)
+	})}
+	provider, err := NewPexels(PexelsConfig{APIKey: "key", BaseURL: api.URL, Timeout: time.Second, HTTPClient: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = provider.Find(context.Background(), "empty music studio")
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Find() error=%v, want ErrUnavailable", err)
+	}
+}
+
 func TestPexelsFindRejectsUntrustedImageHostAndFallsBackToNotFound(t *testing.T) {
 	api := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(writer, `{"photos":[{"id":22,"url":"https://www.pexels.com/photo/microphone-22/","photographer":"Lens","photographer_url":"https://www.pexels.com/@lens","alt":"Empty music room","src":{"large2x":"https://evil.example/photo.jpg"}}]}`)
@@ -134,7 +248,7 @@ func TestPexelsFindCapsCandidatesDownloadsAndTotalTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.Find(context.Background(), "empty microphone stand"); err != ErrNotFound {
+	if _, err := provider.Find(context.Background(), "empty microphone stand"); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("error = %v", err)
 	}
 	if downloads.Load() != maxPexelsDownloads {

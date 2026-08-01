@@ -506,12 +506,204 @@ func TestPostgresIntegration(t *testing.T) {
 		if _, err := postgres.CreateThreadDraftWithMedia(ctx, bad, testPexelsThreadMedia(mediaOwner)); err == nil {
 			t.Fatal("invalid draft transaction succeeded")
 		}
+		manual := testPexelsThreadMediaWithOperation(mediaOwner, 88499, "849", "manual bypass bytes")
+		if _, err := postgres.CreateThreadDraftWithMedia(ctx, draft, manual); !errors.Is(err, ErrThreadDraftState) {
+			t.Fatalf("manual media bypassed dedicated attach operation: %v", err)
+		}
 		var mediaRows int
 		if err := postgres.pool.QueryRow(ctx, `SELECT count(*) FROM thread_media WHERE telegram_id = $1`, mediaOwner).Scan(&mediaRows); err != nil {
 			t.Fatal(err)
 		}
 		if mediaRows != 1 {
 			t.Fatalf("orphan media rows = %d", mediaRows)
+		}
+	})
+
+	t.Run("manual licensed media is atomic replay safe and replaceable", func(t *testing.T) {
+		const mediaOwner = int64(71017)
+		if _, err := postgres.UpsertUser(ctx, domain.User{TelegramID: mediaOwner, Language: "ru"}); err != nil {
+			t.Fatal(err)
+		}
+		draft := testThreadDraft(mediaOwner, 1, "Песня иногда вспоминается раньше названия.")
+		draft.PhotoQuery = "vintage microphone close up"
+		draftID, err := postgres.CreateThreadDraft(ctx, draft)
+		if err != nil {
+			t.Fatal(err)
+		}
+		firstMedia := testPexelsThreadMediaWithOperation(mediaOwner, 88501, "851", "postgres first licensed bytes")
+		first, err := postgres.AttachLicensedThreadDraftMedia(ctx, draftID, mediaOwner, 1, firstMedia)
+		if err != nil || first.MediaMode != domain.ThreadMediaImage || first.Revision != 2 || first.MediaID <= 0 {
+			t.Fatalf("first licensed attach = %+v, %v", first, err)
+		}
+		replayed, err := postgres.AttachLicensedThreadDraftMedia(ctx, draftID, mediaOwner, 1, firstMedia)
+		if err != nil || replayed.MediaID != first.MediaID || replayed.Revision != first.Revision {
+			t.Fatalf("licensed replay = %+v, %v", replayed, err)
+		}
+		byOperation, err := postgres.GetThreadDraftByMediaAttachUpdate(ctx, mediaOwner, firstMedia.AttachUpdateID)
+		if err != nil || byOperation.MediaID != first.MediaID {
+			t.Fatalf("licensed operation lookup = %+v, %v", byOperation, err)
+		}
+
+		secondMedia := testPexelsThreadMediaWithOperation(mediaOwner, 88502, "852", "postgres second licensed bytes")
+		second, err := postgres.AttachLicensedThreadDraftMedia(ctx, draftID, mediaOwner, first.Revision, secondMedia)
+		if err != nil || second.Revision != first.Revision+1 || second.MediaID == first.MediaID {
+			t.Fatalf("licensed replacement = %+v, %v", second, err)
+		}
+		if _, err := postgres.GetThreadMedia(ctx, first.MediaID, mediaOwner); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("old licensed bytes survived replacement: %v", err)
+		}
+		if _, err := postgres.GetThreadDraftByMediaAttachUpdate(ctx, mediaOwner, firstMedia.AttachUpdateID); !errors.Is(err, ErrThreadDraftState) {
+			t.Fatalf("replaced operation lookup = %v, want ErrThreadDraftState", err)
+		}
+
+		otherID, err := postgres.CreateThreadDraft(ctx, testThreadDraft(mediaOwner, 4, "Совсем другой пост"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := postgres.AttachLicensedThreadDraftMedia(ctx, otherID, mediaOwner, 4, firstMedia); !errors.Is(err, ErrThreadDraftState) {
+			t.Fatalf("cross-draft licensed replay = %v", err)
+		}
+		other, err := postgres.GetThreadDraft(ctx, otherID, mediaOwner)
+		if err != nil || other.MediaMode != domain.ThreadMediaText || other.MediaID != 0 || other.Revision != 4 {
+			t.Fatalf("cross-draft replay mutated target = %+v, %v", other, err)
+		}
+	})
+
+	t.Run("manual licensed media concurrent operations stay atomic", func(t *testing.T) {
+		const sameOwner = int64(71018)
+		if _, err := postgres.UpsertUser(ctx, domain.User{TelegramID: sameOwner}); err != nil {
+			t.Fatal(err)
+		}
+		draft := testThreadDraft(sameOwner, 1, "Один callback не должен выбрать два фото.")
+		draft.PhotoQuery = "vintage microphone close up"
+		draftID, err := postgres.CreateThreadDraft(ctx, draft)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mediaValues := []domain.ThreadMedia{
+			testPexelsThreadMediaWithOperation(sameOwner, 88601, "861", "same operation first bytes"),
+			testPexelsThreadMediaWithOperation(sameOwner, 88601, "862", "same operation second bytes"),
+		}
+		var results [2]domain.ThreadDraft
+		var attachErrs [2]error
+		start := make(chan struct{})
+		var wait sync.WaitGroup
+		for index := range mediaValues {
+			wait.Add(1)
+			go func(index int) {
+				defer wait.Done()
+				<-start
+				results[index], attachErrs[index] = postgres.AttachLicensedThreadDraftMedia(
+					ctx, draftID, sameOwner, 1, mediaValues[index],
+				)
+			}(index)
+		}
+		close(start)
+		wait.Wait()
+		if attachErrs[0] != nil || attachErrs[1] != nil || results[0].MediaID != results[1].MediaID ||
+			results[0].Revision != 2 || results[1].Revision != 2 {
+			t.Fatalf("same-operation results=%+v errors=%v", results, attachErrs)
+		}
+		var mediaRows, operationRows int
+		if err := postgres.pool.QueryRow(ctx, `SELECT count(*) FROM thread_media WHERE telegram_id = $1`, sameOwner).Scan(&mediaRows); err != nil {
+			t.Fatal(err)
+		}
+		if err := postgres.pool.QueryRow(ctx, `SELECT count(*) FROM thread_media_attach_operations WHERE telegram_id = $1`, sameOwner).Scan(&operationRows); err != nil {
+			t.Fatal(err)
+		}
+		if mediaRows != 1 || operationRows != 1 {
+			t.Fatalf("same-operation rows media=%d operations=%d", mediaRows, operationRows)
+		}
+
+		const competingOwner = int64(71019)
+		if _, err := postgres.UpsertUser(ctx, domain.User{TelegramID: competingOwner}); err != nil {
+			t.Fatal(err)
+		}
+		competingDraft := testThreadDraft(competingOwner, 1, "Одна ревизия принимает только один callback.")
+		competingDraft.PhotoQuery = "empty music studio warm light"
+		competingID, err := postgres.CreateThreadDraft(ctx, competingDraft)
+		if err != nil {
+			t.Fatal(err)
+		}
+		competingMedia := []domain.ThreadMedia{
+			testPexelsThreadMediaWithOperation(competingOwner, 88701, "871", "competing first bytes"),
+			testPexelsThreadMediaWithOperation(competingOwner, 88702, "872", "competing second bytes"),
+		}
+		results = [2]domain.ThreadDraft{}
+		attachErrs = [2]error{}
+		start = make(chan struct{})
+		wait = sync.WaitGroup{}
+		for index := range competingMedia {
+			wait.Add(1)
+			go func(index int) {
+				defer wait.Done()
+				<-start
+				results[index], attachErrs[index] = postgres.AttachLicensedThreadDraftMedia(
+					ctx, competingID, competingOwner, 1, competingMedia[index],
+				)
+			}(index)
+		}
+		close(start)
+		wait.Wait()
+		successes, stale := 0, 0
+		for _, attachErr := range attachErrs {
+			switch {
+			case attachErr == nil:
+				successes++
+			case errors.Is(attachErr, ErrThreadDraftState):
+				stale++
+			default:
+				t.Fatalf("unexpected competing attach error: %v", attachErr)
+			}
+		}
+		if successes != 1 || stale != 1 {
+			t.Fatalf("competing outcomes successes=%d stale=%d errors=%v", successes, stale, attachErrs)
+		}
+		if err := postgres.pool.QueryRow(ctx, `SELECT count(*) FROM thread_media WHERE telegram_id = $1`, competingOwner).Scan(&mediaRows); err != nil {
+			t.Fatal(err)
+		}
+		if err := postgres.pool.QueryRow(ctx, `SELECT count(*) FROM thread_media_attach_operations WHERE telegram_id = $1`, competingOwner).Scan(&operationRows); err != nil {
+			t.Fatal(err)
+		}
+		if mediaRows != 1 || operationRows != 1 {
+			t.Fatalf("competing rows media=%d operations=%d", mediaRows, operationRows)
+		}
+	})
+
+	t.Run("manual licensed replay works with one connection", func(t *testing.T) {
+		const mediaOwner = int64(71020)
+		if _, err := postgres.UpsertUser(ctx, domain.User{TelegramID: mediaOwner}); err != nil {
+			t.Fatal(err)
+		}
+		draft := testThreadDraft(mediaOwner, 1, "Replay не должен требовать второе соединение.")
+		draft.PhotoQuery = "empty music studio warm light"
+		draftID, err := postgres.CreateThreadDraft(ctx, draft)
+		if err != nil {
+			t.Fatal(err)
+		}
+		singleConfig := postgres.pool.Config()
+		singleConfig.MinConns = 0
+		singleConfig.MaxConns = 1
+		singlePool, err := pgxpool.NewWithConfig(ctx, singleConfig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer singlePool.Close()
+		single := &Postgres{pool: singlePool}
+		operationCtx, operationCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer operationCancel()
+		mediaValue := testPexelsThreadMediaWithOperation(mediaOwner, 88801, "881", "single connection bytes")
+		attached, err := single.AttachLicensedThreadDraftMedia(operationCtx, draftID, mediaOwner, 1, mediaValue)
+		if err != nil {
+			t.Fatal(err)
+		}
+		replayed, err := single.AttachLicensedThreadDraftMedia(operationCtx, draftID, mediaOwner, 1, mediaValue)
+		if err != nil || replayed.MediaID != attached.MediaID || replayed.Revision != attached.Revision {
+			t.Fatalf("single-connection attach replay=%+v err=%v", replayed, err)
+		}
+		lookedUp, err := single.GetThreadDraftByMediaAttachUpdate(operationCtx, mediaOwner, mediaValue.AttachUpdateID)
+		if err != nil || lookedUp.MediaID != attached.MediaID {
+			t.Fatalf("single-connection operation lookup=%+v err=%v", lookedUp, err)
 		}
 	})
 
@@ -1100,6 +1292,63 @@ func TestPostgresLicensedMediaMigrationUpgradesLegacyThreadMedia(t *testing.T) {
 	storedDraft, err := postgres.GetThreadDraft(ctx, draftID, 72002)
 	if err != nil || storedDraft.MediaID == legacy.ID {
 		t.Fatalf("licensed draft after upgrade = %+v, %v", storedDraft, err)
+	}
+}
+
+func TestPostgresManualLicensedMediaMigrationUpgradesVersionTwo(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	postgres := newIsolatedPostgresWithoutMigration(t, ctx, databaseURL)
+
+	bootstrap, err := migrationFS.ReadFile("migrations/001_init.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	licensed, err := migrationFS.ReadFile("migrations/002_licensed_thread_media.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := postgres.pool.Exec(ctx, string(bootstrap)); err != nil {
+		t.Fatalf("apply version-1 fixture: %v", err)
+	}
+	if _, err := postgres.pool.Exec(ctx, string(licensed)); err != nil {
+		t.Fatalf("apply version-2 fixture: %v", err)
+	}
+	if _, err := postgres.pool.Exec(ctx, `
+		INSERT INTO users (telegram_id) VALUES (72004);
+		INSERT INTO thread_drafts (
+			telegram_id, voice, goal, preview_text, provider, model, revision
+		) VALUES (
+			72004, 'belcanto', 'discussion', 'Старый version-two пост', 'legacy', 'legacy', 5
+		);`); err != nil {
+		t.Fatalf("insert version-2 fixture: %v", err)
+	}
+
+	if err := postgres.Migrate(ctx); err != nil {
+		t.Fatalf("upgrade version 2 to version 3: %v", err)
+	}
+	if err := postgres.Migrate(ctx); err != nil {
+		t.Fatalf("rerun version-3 migration: %v", err)
+	}
+	if err := postgres.Ping(ctx); err != nil {
+		t.Fatalf("upgraded version-3 schema is not ready: %v", err)
+	}
+	legacy, err := postgres.GetCurrentThreadDraft(ctx, 72004)
+	if err != nil || legacy.PhotoQuery != "" || legacy.MediaMode != domain.ThreadMediaText {
+		t.Fatalf("version-2 draft backfill = %+v, %v", legacy, err)
+	}
+	mediaValue := testPexelsThreadMediaWithOperation(72004, 99501, "951", "version three licensed bytes")
+	attached, err := postgres.AttachLicensedThreadDraftMedia(ctx, legacy.ID, 72004, legacy.Revision, mediaValue)
+	if err != nil || attached.MediaMode != domain.ThreadMediaImage || attached.PhotoQuery != mediaValue.SourceQuery {
+		t.Fatalf("manual licensed attach after upgrade = %+v, %v", attached, err)
+	}
+	byOperation, err := postgres.GetThreadDraftByMediaAttachUpdate(ctx, 72004, mediaValue.AttachUpdateID)
+	if err != nil || byOperation.MediaID != attached.MediaID {
+		t.Fatalf("version-3 operation lookup = %+v, %v", byOperation, err)
 	}
 }
 
