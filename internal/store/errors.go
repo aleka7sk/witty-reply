@@ -11,3 +11,5 @@ var ErrSuperseded = errors.New("update job superseded")
 var ErrThreadDraftState = errors.New("invalid thread draft state")
 
 var ErrThreadBriefState = errors.New("invalid thread brief state")
+
+var ErrThreadFinalistSetState = errors.New("invalid thread finalist set state")

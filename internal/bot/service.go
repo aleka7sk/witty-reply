@@ -582,6 +582,10 @@ func (b *Service) handleCallback(ctx context.Context, updateID int64, callback t
 		return b.cancelThreadBrief(ctx, chatID, user, payload)
 	case session.ActionThreadBriefRetry:
 		return b.retryThreadBrief(ctx, updateID, chatID, user, payload)
+	case session.ActionThreadSelectFinalist:
+		return b.selectThreadFinalist(ctx, updateID, chatID, user, payload)
+	case session.ActionThreadFinalistCancel:
+		return b.cancelThreadFinalistSet(ctx, chatID, user, payload)
 	case session.ActionThreadNewBelcanto:
 		return b.refineThreadDraft(ctx, updateID, chatID, user, payload, domain.ThreadVoiceBelcanto, "different_angle")
 	case session.ActionThreadNewAlisher:
@@ -639,7 +643,9 @@ func threadActionRequiresConsent(action session.Action) bool {
 		session.ActionThreadMaterialNone,
 		session.ActionThreadBriefChangeObjective,
 		session.ActionThreadBriefCancel,
-		session.ActionThreadBriefRetry:
+		session.ActionThreadBriefRetry,
+		session.ActionThreadSelectFinalist,
+		session.ActionThreadFinalistCancel:
 		return true
 	default:
 		return false

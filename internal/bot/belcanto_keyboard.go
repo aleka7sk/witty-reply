@@ -1,6 +1,8 @@
 package bot
 
 import (
+	"strconv"
+
 	"github.com/aleka7sk/witty-reply/internal/domain"
 	"github.com/aleka7sk/witty-reply/internal/session"
 	"github.com/aleka7sk/witty-reply/internal/telegram"
@@ -94,6 +96,38 @@ func threadBriefRetryKeyboard(
 		{telegram.CallbackButton("🔄 Повторить генерацию", retryData)},
 		{telegram.CallbackButton("🗑 Отменить", cancelData)},
 	}}, nil
+}
+
+func threadFinalistSetKeyboard(
+	codec *session.CallbackCodec,
+	userID int64,
+	set domain.ThreadFinalistSet,
+) (*telegram.InlineKeyboardMarkup, error) {
+	rows := make([][]telegram.InlineKeyboardButton, 0, len(set.Candidates)+1)
+	for _, candidate := range set.Candidates {
+		if !candidate.Selectable {
+			continue
+		}
+		label := "Выбрать " + strconv.Itoa(candidate.Position+1)
+		if candidate.Recommended {
+			label = "⭐ Выбрать " + strconv.Itoa(candidate.Position+1)
+		}
+		data, err := encodeCallback(
+			codec, session.ActionThreadSelectFinalist, userID, set.ID, set.Revision, int8(candidate.Position),
+		)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, []telegram.InlineKeyboardButton{telegram.CallbackButton(label, data)})
+	}
+	cancelData, err := encodeCallback(
+		codec, session.ActionThreadFinalistCancel, userID, set.ID, set.Revision, -1,
+	)
+	if err != nil {
+		return nil, err
+	}
+	rows = append(rows, []telegram.InlineKeyboardButton{telegram.CallbackButton("🗑 Отменить варианты", cancelData)})
+	return &telegram.InlineKeyboardMarkup{InlineKeyboard: rows}, nil
 }
 
 func threadDraftKeyboard(

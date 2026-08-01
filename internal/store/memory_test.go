@@ -929,6 +929,191 @@ func testThreadDraft(owner int64, revision uint32, text string) domain.ThreadDra
 	}
 }
 
+func TestMemoryThreadFinalistsAreDurableAtomicAndOnlySelectionEntersHistory(t *testing.T) {
+	ctx := context.Background()
+	memory := NewMemory()
+	if _, err := memory.UpsertUser(ctx, domain.User{TelegramID: 901}); err != nil {
+		t.Fatal(err)
+	}
+	brief, _, err := memory.StartThreadBrief(ctx, 901, 9001, domain.ThreadVoiceBelcanto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err = memory.SetThreadBriefObjective(ctx, brief.ID, 901, brief.Revision, domain.ThreadObjectiveReplies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err = memory.SetThreadBriefMaterial(ctx, brief.ID, 901, brief.Revision, 9002, domain.ThreadMaterialText, "По субботам в Belcanto проходит караоке.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := testThreadFinalistSet(901, brief.ID, 0, brief.Revision, 1, 9002, "finalists-memory-9002", brief.Objective)
+	set, created, err := memory.CreateThreadFinalistSet(ctx, input)
+	if err != nil || !created || set.State != domain.ThreadFinalistSetReady || set.SelectedPosition != -1 {
+		t.Fatalf("CreateThreadFinalistSet() = %+v, %v, %v", set, created, err)
+	}
+	currentSet, err := memory.GetCurrentThreadFinalistSet(ctx, 901)
+	if err != nil || currentSet.ID != set.ID || len(currentSet.Candidates) != 5 {
+		t.Fatalf("GetCurrentThreadFinalistSet() = %+v, %v", currentSet, err)
+	}
+	if _, err := memory.GetCurrentThreadFinalistSet(ctx, 999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign current finalist lookup = %v", err)
+	}
+	if _, err := memory.GetCurrentThreadDraft(ctx, 901); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("draft existed before choice: %v", err)
+	}
+	history, err := memory.ListRecentThreadTexts(ctx, 901, 20)
+	if err != nil || len(history) != 0 {
+		t.Fatalf("unchosen finalists entered history: %v, %v", history, err)
+	}
+	replayed, created, err := memory.CreateThreadFinalistSet(ctx, input)
+	if err != nil || created || replayed.ID != set.ID {
+		t.Fatalf("generation replay = %+v, %v, %v", replayed, created, err)
+	}
+	if _, _, err := memory.SelectThreadFinalist(ctx, set.ID, 901, set.Revision, 4, 9003); !errors.Is(err, ErrThreadFinalistSetState) {
+		t.Fatalf("unselectable finalist error = %v", err)
+	}
+	draft, selected, err := memory.SelectThreadFinalist(ctx, set.ID, 901, set.Revision, 0, 9004)
+	if err != nil || !selected || draft.FinalistSetID != set.ID || draft.Text != set.Candidates[0].Text ||
+		draft.MediaMode != domain.ThreadMediaImagePending {
+		t.Fatalf("SelectThreadFinalist() = %+v, %v, %v", draft, selected, err)
+	}
+	if _, err := memory.GetCurrentThreadFinalistSet(ctx, 901); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("selected finalist set stayed current: %v", err)
+	}
+	replayedDraft, selected, err := memory.SelectThreadFinalist(ctx, set.ID, 901, set.Revision, 0, 9004)
+	if err != nil || selected || replayedDraft.ID != draft.ID {
+		t.Fatalf("selection replay = %+v, %v, %v", replayedDraft, selected, err)
+	}
+	if _, _, err := memory.SelectThreadFinalist(ctx, set.ID, 901, set.Revision, 1, 9005); !errors.Is(err, ErrThreadFinalistSetState) {
+		t.Fatalf("second selection error = %v", err)
+	}
+	history, err = memory.ListRecentThreadTexts(ctx, 901, 20)
+	if err != nil || len(history) != 1 || history[0] != draft.Text {
+		t.Fatalf("chosen history = %v, %v", history, err)
+	}
+	storedBrief, err := memory.GetThreadBrief(ctx, brief.ID, 901)
+	if err != nil || storedBrief.State != domain.ThreadBriefDraftReady {
+		t.Fatalf("selected brief = %+v, %v", storedBrief, err)
+	}
+}
+
+func TestMemoryThreadFinalistRefinementCancelRestoresOnlyCurrentSource(t *testing.T) {
+	ctx := context.Background()
+	memory := NewMemory()
+	if _, err := memory.UpsertUser(ctx, domain.User{TelegramID: 902}); err != nil {
+		t.Fatal(err)
+	}
+	baseInput := testThreadDraft(902, 1, "Какую песню вы первой выберете в караоке?")
+	baseInput.MediaMode = domain.ThreadMediaImagePending
+	baseID, err := memory.CreateThreadDraft(ctx, baseInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setInput := testThreadFinalistSet(902, 0, baseID, 1, 2, 9101, "finalists-memory-9101", domain.ThreadObjectiveReplies)
+	setInput.PreserveMediaMode = domain.ThreadMediaImagePending
+	set, created, err := memory.CreateThreadFinalistSet(ctx, setInput)
+	if err != nil || !created {
+		t.Fatalf("refinement set = %+v, %v, %v", set, created, err)
+	}
+	if _, err := memory.GetCurrentThreadDraft(ctx, 902); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("base stayed current during finalist choice: %v", err)
+	}
+	currentSet, err := memory.GetCurrentThreadFinalistSet(ctx, 902)
+	if err != nil || currentSet.ID != set.ID || currentSet.BaseDraftID != baseID {
+		t.Fatalf("current refinement finalists = %+v, %v", currentSet, err)
+	}
+	restored, ok, err := memory.CancelThreadFinalistSet(ctx, set.ID, 902, set.Revision)
+	if err != nil || !ok || restored.ID != baseID || !restored.Current {
+		t.Fatalf("cancel restore = %+v, %v, %v", restored, ok, err)
+	}
+	if _, err := memory.GetCurrentThreadFinalistSet(ctx, 902); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cancelled refinement set stayed current: %v", err)
+	}
+	replayed, ok, err := memory.CancelThreadFinalistSet(ctx, set.ID, 902, set.Revision)
+	if err != nil || !ok || replayed.ID != baseID {
+		t.Fatalf("cancel replay = %+v, %v, %v", replayed, ok, err)
+	}
+	if _, _, err := memory.StartThreadBrief(ctx, 902, 9102, domain.ThreadVoiceBelcanto); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := memory.CancelThreadFinalistSet(ctx, set.ID, 902, set.Revision); !errors.Is(err, ErrThreadFinalistSetState) {
+		t.Fatalf("stale cancel replay returned a non-current base: %v", err)
+	}
+}
+
+func TestMemoryThreadFinalistInitialCancelReplayRejectsNewWorkflow(t *testing.T) {
+	ctx := context.Background()
+	memory := NewMemory()
+	const ownerID = int64(903)
+	if _, err := memory.UpsertUser(ctx, domain.User{TelegramID: ownerID}); err != nil {
+		t.Fatal(err)
+	}
+	brief, _, err := memory.StartThreadBrief(ctx, ownerID, 9201, domain.ThreadVoiceBelcanto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err = memory.SetThreadBriefObjective(ctx, brief.ID, ownerID, brief.Revision, domain.ThreadObjectiveReplies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err = memory.SetThreadBriefMaterial(
+		ctx, brief.ID, ownerID, brief.Revision, 9202, domain.ThreadMaterialText,
+		"Подтверждённая сцена для отменяемой подборки.",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := testThreadFinalistSet(
+		ownerID, brief.ID, 0, brief.Revision, 1, 9203,
+		"finalists-memory-9203", brief.Objective,
+	)
+	set, created, err := memory.CreateThreadFinalistSet(ctx, input)
+	if err != nil || !created {
+		t.Fatalf("initial finalist set = %+v, %v, %v", set, created, err)
+	}
+	if _, restored, err := memory.CancelThreadFinalistSet(ctx, set.ID, ownerID, set.Revision); err != nil || restored {
+		t.Fatalf("initial cancel = %v, %v", restored, err)
+	}
+	if _, restored, err := memory.CancelThreadFinalistSet(ctx, set.ID, ownerID, set.Revision); err != nil || restored {
+		t.Fatalf("immediate initial cancel replay = %v, %v", restored, err)
+	}
+	newBrief, created, err := memory.StartThreadBrief(ctx, ownerID, 9204, domain.ThreadVoiceBelcanto)
+	if err != nil || !created {
+		t.Fatalf("new workflow = %+v, %v, %v", newBrief, created, err)
+	}
+	if _, _, err := memory.CancelThreadFinalistSet(ctx, set.ID, ownerID, set.Revision); !errors.Is(err, ErrThreadFinalistSetState) {
+		t.Fatalf("stale initial cancel replay = %v", err)
+	}
+	current, err := memory.GetCurrentThreadBrief(ctx, ownerID)
+	if err != nil || current.ID != newBrief.ID {
+		t.Fatalf("new workflow changed by stale cancel: %+v, %v", current, err)
+	}
+}
+
+func testThreadFinalistSet(
+	owner, briefID, baseDraftID int64,
+	sourceRevision, targetRevision uint32,
+	generationUpdateID int64,
+	generationID string,
+	objective domain.ThreadObjective,
+) domain.ThreadFinalistSet {
+	return domain.ThreadFinalistSet{
+		TelegramID: owner, BriefID: briefID, BaseDraftID: baseDraftID,
+		GenerationID: generationID, GenerationUpdateID: generationUpdateID,
+		Voice: domain.ThreadVoiceBelcanto, Objective: objective,
+		Provider: "fake", Model: "deterministic", SourceRevision: sourceRevision,
+		TargetDraftRevision: targetRevision, SelectedPosition: -1,
+		Candidates: []domain.ThreadFinalist{
+			{Position: 0, ReviewerID: "A", Goal: "ответы", Objective: objective, ScenarioID: "karaoke_choice", Mechanism: "question", MaterialBasis: "material", Text: "Какую песню вы первой выберете в караоке?", Recommended: true, Selectable: true, VisualMode: domain.ThreadFinalistVisualLicensedPhoto, PhotoSuggested: true, PhotoQuery: "vintage microphone close up"},
+			{Position: 1, ReviewerID: "B", Goal: "ответы", Objective: objective, ScenarioID: "song_memory", Mechanism: "memory", MaterialBasis: "material", Text: "Какую песню вы помните не по словам, а по голосу близкого человека?", Selectable: true, VisualMode: domain.ThreadFinalistVisualTextOnly},
+			{Position: 2, ReviewerID: "C", Goal: "ответы", Objective: objective, ScenarioID: "astana_playlist", Mechanism: "local", MaterialBasis: "material", Text: "Какая песня лучше всего звучит во время вечерней поездки по Астане?", Selectable: true, VisualMode: domain.ThreadFinalistVisualTextOnly},
+			{Position: 3, ReviewerID: "D", Goal: "ответы", Objective: objective, ScenarioID: "small_group", Mechanism: "trust", MaterialBasis: "material", Text: "Что спокойнее для первого занятия: один на один или маленькая группа?", Selectable: true, VisualMode: domain.ThreadFinalistVisualTextOnly},
+			{Position: 4, ReviewerID: "E", Goal: "ответы", Objective: objective, ScenarioID: "community_week", Mechanism: "community", MaterialBasis: "material", Text: "К чему вы бы присоединились сначала: караоке, йога или актёрское занятие?", Selectable: false, VisualMode: domain.ThreadFinalistVisualTextOnly},
+		},
+	}
+}
+
 func testThreadMedia(owner, updateID int64) domain.ThreadMedia {
 	data := []byte("normalized-jpeg")
 	digest := sha256.Sum256(data)

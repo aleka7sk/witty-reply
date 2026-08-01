@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"time"
@@ -250,6 +251,7 @@ const (
 	ThreadBriefAwaitingGoal     ThreadBriefState = "awaiting_goal"
 	ThreadBriefAwaitingMaterial ThreadBriefState = "awaiting_material"
 	ThreadBriefMaterialReady    ThreadBriefState = "material_ready"
+	ThreadBriefCandidatesReady  ThreadBriefState = "candidates_ready"
 	ThreadBriefDraftReady       ThreadBriefState = "draft_ready"
 	ThreadBriefCancelled        ThreadBriefState = "cancelled"
 )
@@ -257,7 +259,8 @@ const (
 func (s ThreadBriefState) Valid() bool {
 	switch s {
 	case ThreadBriefAwaitingGoal, ThreadBriefAwaitingMaterial,
-		ThreadBriefMaterialReady, ThreadBriefDraftReady, ThreadBriefCancelled:
+		ThreadBriefMaterialReady, ThreadBriefCandidatesReady,
+		ThreadBriefDraftReady, ThreadBriefCancelled:
 		return true
 	default:
 		return false
@@ -331,7 +334,7 @@ func (b ThreadBrief) Validate() error {
 		if !b.Objective.Selectable() || b.MaterialKind != "" || b.MaterialText != "" || b.MaterialUpdateID != 0 {
 			return errors.New("thread brief awaiting material is invalid")
 		}
-	case ThreadBriefMaterialReady, ThreadBriefDraftReady:
+	case ThreadBriefMaterialReady, ThreadBriefCandidatesReady, ThreadBriefDraftReady:
 		if !b.Objective.Selectable() || !validThreadBriefMaterial(b.MaterialKind, b.MaterialText, b.MaterialUpdateID) {
 			return errors.New("thread brief material is invalid")
 		}
@@ -377,6 +380,256 @@ func validCancelledThreadBriefChoices(brief ThreadBrief) bool {
 
 func validThreadBriefErrorCode(value string) bool {
 	return utf8.ValidString(value) && !strings.ContainsRune(value, '\x00') && utf8.RuneCountInString(value) <= 160
+}
+
+// ThreadFinalistSetState is the durable lifecycle of one exact five-post
+// editorial choice. A ready set is the only state in which a finalist may be
+// selected; selected and cancelled sets are immutable audit records.
+type ThreadFinalistSetState string
+
+const (
+	ThreadFinalistSetReady     ThreadFinalistSetState = "ready"
+	ThreadFinalistSetSelected  ThreadFinalistSetState = "selected"
+	ThreadFinalistSetCancelled ThreadFinalistSetState = "cancelled"
+)
+
+func (s ThreadFinalistSetState) Valid() bool {
+	return s == ThreadFinalistSetReady || s == ThreadFinalistSetSelected || s == ThreadFinalistSetCancelled
+}
+
+const threadFinalistCount = 5
+
+const (
+	ThreadFinalistVisualTextOnly      = "text_only"
+	ThreadFinalistVisualLicensedPhoto = "licensed_photo"
+	ThreadFinalistVisualBelcantoPhoto = "belcanto_photo"
+)
+
+// ThreadFinalist is an immutable WYSIWYG candidate. Evidence and reviewer
+// prose deliberately do not cross this boundary; the durable record contains
+// only the bounded publication text and metadata required to make a choice.
+type ThreadFinalist struct {
+	Position       int
+	ReviewerID     string
+	Goal           string
+	Objective      ThreadObjective
+	ScenarioID     string
+	Mechanism      string
+	MaterialBasis  string
+	Text           string
+	Recommended    bool
+	Selectable     bool
+	VisualMode     string
+	PhotoSuggested bool
+	PhotoQuery     string
+}
+
+// ThreadFinalistSet stores one complete generation before any publishable
+// ThreadDraft exists. SourceRevision fences the source brief or base draft;
+// TargetDraftRevision is the revision assigned to the draft only after an
+// operator atomically selects a finalist.
+type ThreadFinalistSet struct {
+	ID                  int64
+	TelegramID          int64
+	BriefID             int64
+	BaseDraftID         int64
+	GenerationID        string
+	GenerationUpdateID  int64
+	Voice               ThreadVoice
+	Objective           ThreadObjective
+	Provider            string
+	Model               string
+	SourceRevision      uint32
+	TargetDraftRevision uint32
+	PreserveMediaMode   ThreadMediaMode
+	PreserveMediaID     int64
+	State               ThreadFinalistSetState
+	Revision            uint32
+	Current             bool
+	SelectedPosition    int
+	SelectionUpdateID   int64
+	SelectedDraftID     int64
+	Candidates          []ThreadFinalist
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+}
+
+// ValidateForCreate checks caller-supplied generation output before a store
+// supplies the identity and durable lifecycle fields.
+func (s ThreadFinalistSet) ValidateForCreate() error {
+	if s.ID != 0 || s.TelegramID <= 0 || s.BriefID < 0 || s.BaseDraftID < 0 || (s.BriefID == 0 && s.BaseDraftID == 0) {
+		return errors.New("thread finalist set identity is invalid")
+	}
+	if !validThreadGenerationID(s.GenerationID) || s.GenerationUpdateID <= 0 {
+		return errors.New("thread finalist set generation is invalid")
+	}
+	if !s.Voice.Valid() || !s.Objective.Selectable() {
+		return errors.New("thread finalist set editorial metadata is invalid")
+	}
+	if !validBoundedThreadValue(s.Provider, 100) || !validBoundedThreadValue(s.Model, 160) {
+		return errors.New("thread finalist set provider metadata is invalid")
+	}
+	if s.SourceRevision == 0 || s.SourceRevision == ^uint32(0) || s.TargetDraftRevision == 0 {
+		return errors.New("thread finalist set revisions are invalid")
+	}
+	if s.BaseDraftID == 0 {
+		if s.BriefID <= 0 || s.TargetDraftRevision != 1 || s.PreserveMediaMode != "" || s.PreserveMediaID != 0 {
+			return errors.New("initial thread finalist set source is invalid")
+		}
+	} else if s.TargetDraftRevision != s.SourceRevision+1 {
+		return errors.New("refinement thread finalist set revisions are invalid")
+	}
+	if !validThreadFinalistPreservedMedia(s.PreserveMediaMode, s.PreserveMediaID) {
+		return errors.New("thread finalist set preserved media is invalid")
+	}
+	if s.State != "" && s.State != ThreadFinalistSetReady {
+		return errors.New("new thread finalist set must be ready")
+	}
+	if s.Revision > 1 || s.SelectedPosition != -1 || s.SelectionUpdateID != 0 || s.SelectedDraftID != 0 {
+		return errors.New("new thread finalist set contains selection state")
+	}
+	return validateThreadFinalists(s.Candidates, s.Objective)
+}
+
+// Validate checks a fully persisted finalist set, including optimistic
+// lifecycle fencing and the exact five-candidate invariant.
+func (s ThreadFinalistSet) Validate() error {
+	if s.ID <= 0 || s.TelegramID <= 0 || s.BriefID < 0 || s.BaseDraftID < 0 || (s.BriefID == 0 && s.BaseDraftID == 0) ||
+		!validThreadGenerationID(s.GenerationID) || s.GenerationUpdateID <= 0 || !s.Voice.Valid() ||
+		!s.Objective.Selectable() || !validBoundedThreadValue(s.Provider, 100) || !validBoundedThreadValue(s.Model, 160) ||
+		s.SourceRevision == 0 || s.SourceRevision == ^uint32(0) || s.TargetDraftRevision == 0 ||
+		!validThreadFinalistPreservedMedia(s.PreserveMediaMode, s.PreserveMediaID) ||
+		!s.State.Valid() || s.Revision == 0 {
+		return errors.New("thread finalist set persisted metadata is invalid")
+	}
+	if err := validateThreadFinalists(s.Candidates, s.Objective); err != nil {
+		return err
+	}
+	if s.BaseDraftID == 0 {
+		if s.BriefID <= 0 || s.TargetDraftRevision != 1 || s.PreserveMediaMode != "" || s.PreserveMediaID != 0 {
+			return errors.New("persisted initial thread finalist set source is invalid")
+		}
+	} else if s.TargetDraftRevision != s.SourceRevision+1 {
+		return errors.New("persisted refinement thread finalist set revisions are invalid")
+	}
+	switch s.State {
+	case ThreadFinalistSetReady:
+		if !s.Current || s.SelectedPosition != -1 || s.SelectionUpdateID != 0 || s.SelectedDraftID != 0 {
+			return errors.New("ready thread finalist set has selection state")
+		}
+	case ThreadFinalistSetSelected:
+		if s.Current || s.SelectedPosition < 0 || s.SelectedPosition >= threadFinalistCount ||
+			s.SelectionUpdateID <= 0 || s.SelectedDraftID <= 0 || !s.Candidates[s.SelectedPosition].Selectable {
+			return errors.New("selected thread finalist set is invalid")
+		}
+	case ThreadFinalistSetCancelled:
+		if s.Current || s.SelectedPosition != -1 || s.SelectionUpdateID != 0 || s.SelectedDraftID != 0 {
+			return errors.New("cancelled thread finalist set has selection state")
+		}
+	}
+	return nil
+}
+
+func validateThreadFinalists(candidates []ThreadFinalist, objective ThreadObjective) error {
+	if len(candidates) != threadFinalistCount {
+		return fmt.Errorf("thread finalist set must contain exactly %d candidates", threadFinalistCount)
+	}
+	positions := make([]bool, threadFinalistCount)
+	reviewerIDs := make(map[string]struct{}, threadFinalistCount)
+	scenarios := make(map[string]struct{}, threadFinalistCount)
+	mechanisms := make(map[string]struct{}, threadFinalistCount)
+	recommended := 0
+	for index, candidate := range candidates {
+		if candidate.Position != index || candidate.Position < 0 || candidate.Position >= threadFinalistCount || positions[candidate.Position] {
+			return errors.New("thread finalist positions are invalid")
+		}
+		positions[candidate.Position] = true
+		if !validBoundedThreadValue(candidate.ReviewerID, 16) {
+			return errors.New("thread finalist reviewer ID is invalid")
+		}
+		if _, duplicate := reviewerIDs[candidate.ReviewerID]; duplicate {
+			return errors.New("thread finalist reviewer IDs must be unique")
+		}
+		reviewerIDs[candidate.ReviewerID] = struct{}{}
+		if !validBoundedThreadValue(candidate.Goal, 120) || candidate.Objective != objective || !candidate.Objective.Selectable() ||
+			!ValidThreadScenarioID(candidate.ScenarioID) || !validBoundedThreadValue(candidate.Mechanism, 120) {
+			return errors.New("thread finalist editorial metadata is invalid")
+		}
+		if _, duplicate := scenarios[candidate.ScenarioID]; duplicate {
+			return errors.New("thread finalist scenarios must be unique")
+		}
+		scenarios[candidate.ScenarioID] = struct{}{}
+		mechanisms[candidate.Mechanism] = struct{}{}
+		if candidate.MaterialBasis != "none" && candidate.MaterialBasis != "material" {
+			return errors.New("thread finalist material basis is invalid")
+		}
+		if !validThreadPostText(candidate.Text) {
+			return errors.New("thread finalist text is invalid")
+		}
+		if candidate.PhotoQuery != "" && !validThreadPhotoSearchQuery(candidate.PhotoQuery) {
+			return errors.New("thread finalist photo query is invalid")
+		}
+		switch candidate.VisualMode {
+		case ThreadFinalistVisualTextOnly:
+			if candidate.PhotoSuggested {
+				return errors.New("text-only thread finalist cannot suggest a photo")
+			}
+		case ThreadFinalistVisualLicensedPhoto, ThreadFinalistVisualBelcantoPhoto:
+			if !candidate.PhotoSuggested {
+				return errors.New("visual thread finalist must suggest a photo")
+			}
+		default:
+			return errors.New("thread finalist visual mode is invalid")
+		}
+		if candidate.PhotoSuggested && candidate.PhotoQuery == "" {
+			return errors.New("thread finalist suggested photo requires a query")
+		}
+		if candidate.Recommended {
+			recommended++
+			if !candidate.Selectable {
+				return errors.New("recommended thread finalist must be selectable")
+			}
+		}
+	}
+	if recommended != 1 {
+		return errors.New("thread finalist set must contain exactly one recommendation")
+	}
+	if len(mechanisms) < 4 {
+		return errors.New("thread finalist set must contain at least four mechanisms")
+	}
+	return nil
+}
+
+func validThreadFinalistPreservedMedia(mode ThreadMediaMode, id int64) bool {
+	if mode == "" {
+		return id == 0
+	}
+	if mode == ThreadMediaImagePending {
+		return id >= 0
+	}
+	return mode == ThreadMediaImage && id > 0
+}
+
+func validThreadGenerationID(value string) bool {
+	return validBoundedThreadValue(value, 64) && !strings.ContainsAny(value, "\r\n\t")
+}
+
+func validBoundedThreadValue(value string, limit int) bool {
+	if !utf8.ValidString(value) || strings.ContainsRune(value, '\x00') ||
+		strings.TrimSpace(value) != value || value == "" || utf8.RuneCountInString(value) > limit {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) || unicode.In(character, unicode.Cf) {
+			return false
+		}
+	}
+	return true
+}
+
+func validThreadPostText(value string) bool {
+	return utf8.ValidString(value) && !strings.ContainsRune(value, '\x00') &&
+		strings.TrimSpace(value) != "" && utf8.RuneCountInString(value) <= MaxThreadPostRunes
 }
 
 // ValidThreadScenarioID accepts stable machine identifiers. The current
@@ -587,6 +840,7 @@ type ThreadDraft struct {
 	// values remain accepted only for pre-v4 legacy callers and are normalized
 	// by stores to explicit legacy metadata.
 	BriefID            int64
+	FinalistSetID      int64
 	Objective          ThreadObjective
 	ScenarioID         string
 	GenerationID       string
@@ -631,7 +885,7 @@ func (d ThreadDraft) ValidateForCreate() error {
 	if !d.Voice.Valid() {
 		return errors.New("thread draft voice is invalid")
 	}
-	if d.BriefID < 0 || d.GenerationUpdateID < 0 {
+	if d.BriefID < 0 || d.FinalistSetID < 0 || d.GenerationUpdateID < 0 {
 		return errors.New("thread draft editorial reference is invalid")
 	}
 	if d.Objective != "" && !d.Objective.Valid() {
@@ -643,10 +897,10 @@ func (d ThreadDraft) ValidateForCreate() error {
 	if !utf8.ValidString(d.GenerationID) || strings.ContainsAny(d.GenerationID, "\x00\r\n\t") || utf8.RuneCountInString(d.GenerationID) > 64 {
 		return errors.New("thread draft generation id is invalid")
 	}
-	if d.BriefID > 0 {
+	if d.BriefID > 0 || d.FinalistSetID > 0 {
 		if !d.Objective.Selectable() || d.ScenarioID == "" || d.ScenarioID == "legacy_unspecified" ||
 			strings.TrimSpace(d.GenerationID) == "" || d.GenerationUpdateID <= 0 {
-			return errors.New("thread draft brief metadata is incomplete")
+			return errors.New("thread draft editorial metadata is incomplete")
 		}
 	}
 	if !utf8.ValidString(d.Goal) || strings.ContainsRune(d.Goal, '\x00') || strings.TrimSpace(d.Goal) == "" || utf8.RuneCountInString(d.Goal) > 120 {

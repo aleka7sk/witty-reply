@@ -85,6 +85,7 @@ func TestCallbackSupportsConsentStyleAndScenarioActions(t *testing.T) {
 		ActionThreadObjectiveReach, ActionThreadObjectiveReplies, ActionThreadObjectiveTrust,
 		ActionThreadObjectiveTrial, ActionThreadObjectiveCommunity, ActionThreadMaterialNone,
 		ActionThreadBriefChangeObjective, ActionThreadBriefCancel, ActionThreadBriefRetry,
+		ActionThreadSelectFinalist, ActionThreadFinalistCancel,
 	} {
 		encoded, err := codec.Encode(CallbackPayload{
 			Action: action, UserID: 101, InteractionID: 101, Candidate: -1,
@@ -118,10 +119,33 @@ func TestActionNumericStability(t *testing.T) {
 		ActionThreadObjectiveReach, ActionThreadObjectiveReplies, ActionThreadObjectiveTrust,
 		ActionThreadObjectiveTrial, ActionThreadObjectiveCommunity, ActionThreadMaterialNone,
 		ActionThreadBriefChangeObjective, ActionThreadBriefCancel, ActionThreadBriefRetry,
+		ActionThreadSelectFinalist, ActionThreadFinalistCancel,
 	}
 	for index, action := range actions {
 		if want := Action(index + 1); action != want {
 			t.Fatalf("action at index %d = %d, want stable value %d", index, action, want)
 		}
+	}
+}
+
+func TestFinalistSelectionCallbackCarriesFifthPosition(t *testing.T) {
+	codec, err := NewCallbackCodec([]byte("0123456789abcdef0123456789abcdef"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := codec.Encode(CallbackPayload{
+		Action: ActionThreadSelectFinalist, UserID: 42, InteractionID: 77,
+		Revision: 3, Candidate: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := codec.DecodeForUser(encoded, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Action != ActionThreadSelectFinalist || decoded.InteractionID != 77 ||
+		decoded.Revision != 3 || decoded.Candidate != 4 {
+		t.Fatalf("decoded finalist callback = %+v", decoded)
 	}
 }

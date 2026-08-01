@@ -1412,7 +1412,409 @@ func TestPostgresThreadBriefLifecyclePersistsAndIsReplaySafe(t *testing.T) {
 	}
 }
 
-func TestPostgresThreadBriefMigrationUpgradesVersionThree(t *testing.T) {
+func TestPostgresThreadFinalistLifecycleIsDurableAndAtomic(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	postgres := newIsolatedPostgres(t, ctx, databaseURL)
+	const ownerID = int64(73003)
+	if _, err := postgres.UpsertUser(ctx, domain.User{TelegramID: ownerID, Language: "ru"}); err != nil {
+		t.Fatal(err)
+	}
+
+	brief, _, err := postgres.StartThreadBrief(ctx, ownerID, 8201, domain.ThreadVoiceBelcanto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err = postgres.SetThreadBriefObjective(ctx, brief.ID, ownerID, brief.Revision, domain.ThreadObjectiveReplies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err = postgres.SetThreadBriefMaterial(
+		ctx, brief.ID, ownerID, brief.Revision, 8202, domain.ThreadMaterialText,
+		"По субботам в Belcanto проходит караоке.",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	input := testThreadFinalistSet(
+		ownerID, brief.ID, 0, brief.Revision, 1, 8203,
+		"finalists-postgres-8203", brief.Objective,
+	)
+	set, created, err := postgres.CreateThreadFinalistSet(ctx, input)
+	if err != nil || !created || set.State != domain.ThreadFinalistSetReady || len(set.Candidates) != 5 {
+		t.Fatalf("CreateThreadFinalistSet() = %+v, %v, %v", set, created, err)
+	}
+	currentSet, err := postgres.GetCurrentThreadFinalistSet(ctx, ownerID)
+	if err != nil || currentSet.ID != set.ID || len(currentSet.Candidates) != 5 {
+		t.Fatalf("GetCurrentThreadFinalistSet() = %+v, %v", currentSet, err)
+	}
+	if _, err := postgres.GetCurrentThreadFinalistSet(ctx, ownerID+1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign current finalist lookup = %v", err)
+	}
+	storedSet, err := postgres.GetThreadFinalistSetByGenerationUpdate(ctx, ownerID, input.GenerationUpdateID)
+	if err != nil || storedSet.ID != set.ID || len(storedSet.Candidates) != 5 || storedSet.Candidates[0].Text != input.Candidates[0].Text {
+		t.Fatalf("persisted finalist set = %+v, %v", storedSet, err)
+	}
+	if _, err := postgres.GetCurrentThreadDraft(ctx, ownerID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("draft existed before finalist choice: %v", err)
+	}
+	history, err := postgres.ListRecentThreadTexts(ctx, ownerID, 20)
+	if err != nil || len(history) != 0 {
+		t.Fatalf("unchosen finalists entered history: %v, %v", history, err)
+	}
+	replayedSet, created, err := postgres.CreateThreadFinalistSet(ctx, input)
+	if err != nil || created || replayedSet.ID != set.ID {
+		t.Fatalf("generation replay = %+v, %v, %v", replayedSet, created, err)
+	}
+	if _, _, err := postgres.SelectThreadFinalist(ctx, set.ID, ownerID, set.Revision, 4, 8204); !errors.Is(err, ErrThreadFinalistSetState) {
+		t.Fatalf("unselectable finalist error = %v", err)
+	}
+
+	draft, selected, err := postgres.SelectThreadFinalist(ctx, set.ID, ownerID, set.Revision, 0, 8204)
+	if err != nil || !selected || draft.FinalistSetID != set.ID || draft.Text != set.Candidates[0].Text ||
+		draft.MediaMode != domain.ThreadMediaImagePending {
+		t.Fatalf("SelectThreadFinalist() = %+v, %v, %v", draft, selected, err)
+	}
+	if _, err := postgres.GetCurrentThreadFinalistSet(ctx, ownerID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("selected finalist set stayed current: %v", err)
+	}
+	replayedDraft, selected, err := postgres.SelectThreadFinalist(ctx, set.ID, ownerID, set.Revision, 0, 8204)
+	if err != nil || selected || replayedDraft.ID != draft.ID {
+		t.Fatalf("selection replay = %+v, %v, %v", replayedDraft, selected, err)
+	}
+	if _, _, err := postgres.SelectThreadFinalist(ctx, set.ID, ownerID, set.Revision, 1, 8205); !errors.Is(err, ErrThreadFinalistSetState) {
+		t.Fatalf("second selection error = %v", err)
+	}
+	var linkedDrafts int
+	if err := postgres.pool.QueryRow(ctx, `SELECT count(*) FROM thread_drafts WHERE finalist_set_id = $1`, set.ID).Scan(&linkedDrafts); err != nil {
+		t.Fatal(err)
+	}
+	if linkedDrafts != 1 {
+		t.Fatalf("drafts materialized from finalist set = %d, want 1", linkedDrafts)
+	}
+	history, err = postgres.ListRecentThreadTexts(ctx, ownerID, 20)
+	if err != nil || len(history) != 1 || history[0] != draft.Text {
+		t.Fatalf("selected-only history = %v, %v", history, err)
+	}
+
+	refinementInput := testThreadFinalistSet(
+		ownerID, 0, draft.ID, draft.Revision, draft.Revision+1, 8206,
+		"finalists-postgres-8206", draft.Objective,
+	)
+	refinementInput.PreserveMediaMode = domain.ThreadMediaImagePending
+	refinementSet, created, err := postgres.CreateThreadFinalistSet(ctx, refinementInput)
+	if err != nil || !created || refinementSet.BriefID != draft.BriefID {
+		t.Fatalf("refinement finalists = %+v, %v, %v", refinementSet, created, err)
+	}
+	if _, err := postgres.GetCurrentThreadDraft(ctx, ownerID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("source draft remained current during refinement choice: %v", err)
+	}
+	currentSet, err = postgres.GetCurrentThreadFinalistSet(ctx, ownerID)
+	if err != nil || currentSet.ID != refinementSet.ID || currentSet.BaseDraftID != draft.ID {
+		t.Fatalf("current refinement finalists = %+v, %v", currentSet, err)
+	}
+	restored, restoredOK, err := postgres.CancelThreadFinalistSet(
+		ctx, refinementSet.ID, ownerID, refinementSet.Revision,
+	)
+	if err != nil || !restoredOK || restored.ID != draft.ID || !restored.Current {
+		t.Fatalf("refinement cancel restore = %+v, %v, %v", restored, restoredOK, err)
+	}
+	if _, err := postgres.GetCurrentThreadFinalistSet(ctx, ownerID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cancelled refinement set stayed current: %v", err)
+	}
+	replayedRestore, restoredOK, err := postgres.CancelThreadFinalistSet(
+		ctx, refinementSet.ID, ownerID, refinementSet.Revision,
+	)
+	if err != nil || !restoredOK || replayedRestore.ID != draft.ID {
+		t.Fatalf("refinement cancel replay = %+v, %v, %v", replayedRestore, restoredOK, err)
+	}
+	if _, _, err := postgres.StartThreadBrief(ctx, ownerID, 8207, domain.ThreadVoiceBelcanto); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := postgres.CancelThreadFinalistSet(
+		ctx, refinementSet.ID, ownerID, refinementSet.Revision,
+	); !errors.Is(err, ErrThreadFinalistSetState) {
+		t.Fatalf("stale cancel replay restored a non-current source: %v", err)
+	}
+}
+
+func TestPostgresThreadFinalistInitialCancelReplayRejectsNewWorkflow(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	postgres := newIsolatedPostgres(t, ctx, databaseURL)
+	const ownerID = int64(73004)
+	if _, err := postgres.UpsertUser(ctx, domain.User{TelegramID: ownerID, Language: "ru"}); err != nil {
+		t.Fatal(err)
+	}
+
+	brief, _, err := postgres.StartThreadBrief(ctx, ownerID, 8301, domain.ThreadVoiceBelcanto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err = postgres.SetThreadBriefObjective(ctx, brief.ID, ownerID, brief.Revision, domain.ThreadObjectiveReplies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err = postgres.SetThreadBriefMaterial(
+		ctx, brief.ID, ownerID, brief.Revision, 8302, domain.ThreadMaterialText,
+		"Подтверждённая сцена для отменяемой подборки.",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := testThreadFinalistSet(
+		ownerID, brief.ID, 0, brief.Revision, 1, 8303,
+		"finalists-postgres-8303", brief.Objective,
+	)
+	set, created, err := postgres.CreateThreadFinalistSet(ctx, input)
+	if err != nil || !created {
+		t.Fatalf("initial finalist set = %+v, %v, %v", set, created, err)
+	}
+	if _, restored, err := postgres.CancelThreadFinalistSet(ctx, set.ID, ownerID, set.Revision); err != nil || restored {
+		t.Fatalf("initial cancel = %v, %v", restored, err)
+	}
+	if _, restored, err := postgres.CancelThreadFinalistSet(ctx, set.ID, ownerID, set.Revision); err != nil || restored {
+		t.Fatalf("immediate initial cancel replay = %v, %v", restored, err)
+	}
+	newBrief, created, err := postgres.StartThreadBrief(ctx, ownerID, 8304, domain.ThreadVoiceBelcanto)
+	if err != nil || !created {
+		t.Fatalf("new workflow = %+v, %v, %v", newBrief, created, err)
+	}
+	if _, _, err := postgres.CancelThreadFinalistSet(ctx, set.ID, ownerID, set.Revision); !errors.Is(err, ErrThreadFinalistSetState) {
+		t.Fatalf("stale initial cancel replay = %v", err)
+	}
+	current, err := postgres.GetCurrentThreadBrief(ctx, ownerID)
+	if err != nil || current.ID != newBrief.ID {
+		t.Fatalf("new workflow changed by stale cancel: %+v, %v", current, err)
+	}
+}
+
+func TestPostgresDeleteUserCascadesThreadFinalistAggregates(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	postgres := newIsolatedPostgres(t, ctx, databaseURL)
+	const ownerID = int64(74001)
+	fixture := createPostgresSelectedFinalistFixture(t, ctx, postgres, ownerID, 8400)
+
+	selectedRefinementInput := testThreadFinalistSet(
+		ownerID, 0, fixture.Draft.ID, fixture.Draft.Revision, fixture.Draft.Revision+1,
+		8406, "delete-refinement-selected-8406", fixture.Draft.Objective,
+	)
+	selectedRefinementInput.PreserveMediaMode = fixture.Draft.MediaMode
+	selectedRefinementInput.PreserveMediaID = fixture.Draft.MediaID
+	selectedRefinement, created, err := postgres.CreateThreadFinalistSet(ctx, selectedRefinementInput)
+	if err != nil || !created {
+		t.Fatalf("create selected refinement set = %+v, %v, %v", selectedRefinement, created, err)
+	}
+	refinedDraft, selected, err := postgres.SelectThreadFinalist(
+		ctx, selectedRefinement.ID, ownerID, selectedRefinement.Revision, 1, 8407,
+	)
+	if err != nil || !selected || refinedDraft.MediaMode != domain.ThreadMediaImage ||
+		refinedDraft.MediaID != fixture.Media.ID {
+		t.Fatalf("select preserved-media refinement = %+v, %v, %v", refinedDraft, selected, err)
+	}
+
+	readyRefinementInput := testThreadFinalistSet(
+		ownerID, 0, refinedDraft.ID, refinedDraft.Revision, refinedDraft.Revision+1,
+		8408, "delete-refinement-ready-8408", refinedDraft.Objective,
+	)
+	readyRefinementInput.PreserveMediaMode = refinedDraft.MediaMode
+	readyRefinementInput.PreserveMediaID = refinedDraft.MediaID
+	readyRefinement, created, err := postgres.CreateThreadFinalistSet(ctx, readyRefinementInput)
+	if err != nil || !created || readyRefinement.State != domain.ThreadFinalistSetReady {
+		t.Fatalf("create ready refinement set = %+v, %v, %v", readyRefinement, created, err)
+	}
+
+	if err := postgres.DeleteUser(ctx, ownerID); err != nil {
+		t.Fatalf("DeleteUser() with cyclic finalist links: %v", err)
+	}
+	for _, table := range []string{
+		"users", "thread_briefs", "thread_finalist_sets", "thread_drafts",
+		"thread_media", "thread_media_attach_operations",
+	} {
+		var count int
+		query := fmt.Sprintf("SELECT count(*) FROM %s WHERE telegram_id = $1", pgx.Identifier{table}.Sanitize())
+		if err := postgres.pool.QueryRow(ctx, query, ownerID).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if count != 0 {
+			t.Errorf("%s retained %d deleted-user rows", table, count)
+		}
+	}
+	var finalistCount int
+	if err := postgres.pool.QueryRow(ctx, `SELECT count(*) FROM thread_finalists`).Scan(&finalistCount); err != nil {
+		t.Fatal(err)
+	}
+	if finalistCount != 0 {
+		t.Fatalf("thread_finalists retained %d cascaded rows", finalistCount)
+	}
+}
+
+func TestPostgresCleanupHandlesThreadFinalistAggregateRetention(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	postgres := newIsolatedPostgres(t, ctx, databaseURL)
+	oldFixture := createPostgresSelectedFinalistFixture(t, ctx, postgres, 74002, 8500)
+	recentFixture := createPostgresSelectedFinalistFixture(t, ctx, postgres, 74003, 8600)
+
+	var databaseNow time.Time
+	if err := postgres.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := databaseNow.Add(-48 * time.Hour)
+	cutoff := databaseNow.Add(-24 * time.Hour)
+	for _, ownerID := range []int64{oldFixture.OwnerID, recentFixture.OwnerID} {
+		if _, err := postgres.pool.Exec(ctx, `UPDATE thread_finalist_sets SET created_at = $2, updated_at = $2 WHERE telegram_id = $1`, ownerID, oldTime); err != nil {
+			t.Fatalf("age finalist sets for %d: %v", ownerID, err)
+		}
+		if _, err := postgres.pool.Exec(ctx, `UPDATE thread_briefs SET created_at = $2, updated_at = $2 WHERE telegram_id = $1`, ownerID, oldTime); err != nil {
+			t.Fatalf("age briefs for %d: %v", ownerID, err)
+		}
+		if _, err := postgres.pool.Exec(ctx, `UPDATE thread_drafts SET created_at = $2, updated_at = $2 WHERE telegram_id = $1`, ownerID, oldTime); err != nil {
+			t.Fatalf("age drafts for %d: %v", ownerID, err)
+		}
+		if _, err := postgres.pool.Exec(ctx, `UPDATE thread_media SET created_at = $2 WHERE telegram_id = $1`, ownerID, oldTime); err != nil {
+			t.Fatalf("age media for %d: %v", ownerID, err)
+		}
+		if _, err := postgres.pool.Exec(ctx, `UPDATE thread_media_attach_operations SET created_at = $2 WHERE telegram_id = $1`, ownerID, oldTime); err != nil {
+			t.Fatalf("age media operation for %d: %v", ownerID, err)
+		}
+	}
+	// A recent selected draft keeps its complete linked aggregate: finalist
+	// set, source brief, licensed media, and the attach-operation tombstone.
+	if _, err := postgres.pool.Exec(ctx, `UPDATE thread_drafts SET updated_at = $2 WHERE id = $1`, recentFixture.Draft.ID, databaseNow); err != nil {
+		t.Fatalf("refresh linked draft: %v", err)
+	}
+
+	if _, err := postgres.Cleanup(ctx, cutoff); err != nil {
+		t.Fatalf("Cleanup() with finalist aggregates: %v", err)
+	}
+	for label, check := range map[string]func() error{
+		"old finalist set": func() error {
+			_, err := postgres.GetThreadFinalistSet(ctx, oldFixture.Set.ID, oldFixture.OwnerID)
+			return err
+		},
+		"old brief": func() error {
+			_, err := postgres.GetThreadBrief(ctx, oldFixture.Brief.ID, oldFixture.OwnerID)
+			return err
+		},
+		"old draft": func() error {
+			_, err := postgres.GetThreadDraft(ctx, oldFixture.Draft.ID, oldFixture.OwnerID)
+			return err
+		},
+		"old media": func() error {
+			_, err := postgres.GetThreadMedia(ctx, oldFixture.Media.ID, oldFixture.OwnerID)
+			return err
+		},
+	} {
+		if err := check(); !errors.Is(err, ErrNotFound) {
+			t.Errorf("%s survived cleanup: %v", label, err)
+		}
+	}
+	if set, err := postgres.GetThreadFinalistSet(ctx, recentFixture.Set.ID, recentFixture.OwnerID); err != nil || len(set.Candidates) != 5 {
+		t.Fatalf("recent-linked finalist set = %+v, %v", set, err)
+	}
+	if _, err := postgres.GetThreadBrief(ctx, recentFixture.Brief.ID, recentFixture.OwnerID); err != nil {
+		t.Fatalf("recent-linked brief: %v", err)
+	}
+	if draft, err := postgres.GetThreadDraft(ctx, recentFixture.Draft.ID, recentFixture.OwnerID); err != nil || draft.MediaID != recentFixture.Media.ID {
+		t.Fatalf("recent-linked draft = %+v, %v", draft, err)
+	}
+	if _, err := postgres.GetThreadMedia(ctx, recentFixture.Media.ID, recentFixture.OwnerID); err != nil {
+		t.Fatalf("recent-linked media: %v", err)
+	}
+	if draft, err := postgres.GetThreadDraftByMediaAttachUpdate(ctx, recentFixture.OwnerID, recentFixture.AttachUpdateID); err != nil || draft.ID != recentFixture.Draft.ID {
+		t.Fatalf("recent-linked media operation = %+v, %v", draft, err)
+	}
+	if _, err := postgres.GetThreadDraftByMediaAttachUpdate(ctx, oldFixture.OwnerID, oldFixture.AttachUpdateID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old media operation survived cleanup: %v", err)
+	}
+}
+
+type postgresSelectedFinalistFixture struct {
+	OwnerID        int64
+	AttachUpdateID int64
+	Brief          domain.ThreadBrief
+	Set            domain.ThreadFinalistSet
+	Draft          domain.ThreadDraft
+	Media          domain.ThreadMedia
+}
+
+func createPostgresSelectedFinalistFixture(
+	t *testing.T,
+	ctx context.Context,
+	postgres *Postgres,
+	ownerID, updateBase int64,
+) postgresSelectedFinalistFixture {
+	t.Helper()
+	if _, err := postgres.UpsertUser(ctx, domain.User{TelegramID: ownerID, Language: "ru"}); err != nil {
+		t.Fatal(err)
+	}
+	brief, _, err := postgres.StartThreadBrief(ctx, ownerID, updateBase+1, domain.ThreadVoiceBelcanto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err = postgres.SetThreadBriefObjective(ctx, brief.ID, ownerID, brief.Revision, domain.ThreadObjectiveReplies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief, err = postgres.SetThreadBriefMaterial(
+		ctx, brief.ID, ownerID, brief.Revision, updateBase+2,
+		domain.ThreadMaterialText, "По субботам в Belcanto проходит караоке.",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setInput := testThreadFinalistSet(
+		ownerID, brief.ID, 0, brief.Revision, 1, updateBase+3,
+		fmt.Sprintf("postgres-finalists-%d", updateBase), brief.Objective,
+	)
+	set, created, err := postgres.CreateThreadFinalistSet(ctx, setInput)
+	if err != nil || !created {
+		t.Fatalf("create finalist fixture = %+v, %v, %v", set, created, err)
+	}
+	draft, selected, err := postgres.SelectThreadFinalist(
+		ctx, set.ID, ownerID, set.Revision, 0, updateBase+4,
+	)
+	if err != nil || !selected || draft.MediaMode != domain.ThreadMediaImagePending {
+		t.Fatalf("select finalist fixture = %+v, %v, %v", draft, selected, err)
+	}
+	attachUpdateID := updateBase + 5
+	mediaInput := testPexelsThreadMediaWithOperation(
+		ownerID, attachUpdateID, fmt.Sprintf("%d", updateBase), fmt.Sprintf("licensed-image-%d", updateBase),
+	)
+	draft, err = postgres.AttachLicensedThreadDraftMedia(ctx, draft.ID, ownerID, draft.Revision, mediaInput)
+	if err != nil || draft.MediaMode != domain.ThreadMediaImage || draft.MediaID <= 0 {
+		t.Fatalf("attach finalist media = %+v, %v", draft, err)
+	}
+	mediaValue, err := postgres.GetThreadMedia(ctx, draft.MediaID, ownerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return postgresSelectedFinalistFixture{
+		OwnerID: ownerID, AttachUpdateID: attachUpdateID,
+		Brief: brief, Set: set, Draft: draft, Media: mediaValue,
+	}
+}
+
+func TestPostgresThreadFinalistMigrationUpgradesVersionThree(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {
 		t.Skip("TEST_DATABASE_URL is not set")
@@ -1443,24 +1845,30 @@ func TestPostgresThreadBriefMigrationUpgradesVersionThree(t *testing.T) {
 		t.Fatalf("insert version-three fixture: %v", err)
 	}
 	if err := postgres.Migrate(ctx); err != nil {
-		t.Fatalf("upgrade version 3 to version 4: %v", err)
+		t.Fatalf("upgrade version 3 to current: %v", err)
 	}
 	if err := postgres.Migrate(ctx); err != nil {
-		t.Fatalf("rerun version-4 migration: %v", err)
+		t.Fatalf("rerun current migrations: %v", err)
 	}
-	versionFour, err := migrationFS.ReadFile("migrations/004_thread_briefs.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := postgres.pool.Exec(ctx, string(versionFour)); err != nil {
-		t.Fatalf("version-4 SQL is not idempotent: %v", err)
+	// Reapplying both mutable-constraint migrations in order verifies their SQL
+	// remains independently idempotent without leaving the schema downgraded to
+	// the pre-finalist thread_briefs state check.
+	for _, path := range []string{"migrations/004_thread_briefs.sql", "migrations/005_thread_finalists.sql"} {
+		script, err := migrationFS.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := postgres.pool.Exec(ctx, string(script)); err != nil {
+			t.Fatalf("%s is not idempotent: %v", path, err)
+		}
 	}
 	if err := postgres.Ping(ctx); err != nil {
-		t.Fatalf("version-4 schema is not ready: %v", err)
+		t.Fatalf("current schema is not ready: %v", err)
 	}
 	legacy, err := postgres.GetCurrentThreadDraft(ctx, 73002)
 	if err != nil || legacy.Objective != domain.ThreadObjectiveLegacy ||
-		legacy.ScenarioID != "legacy_unspecified" || legacy.BriefID != 0 || legacy.GenerationUpdateID != 0 {
+		legacy.ScenarioID != "legacy_unspecified" || legacy.BriefID != 0 || legacy.FinalistSetID != 0 ||
+		legacy.GenerationUpdateID != 0 {
 		t.Fatalf("legacy draft backfill = %+v, %v", legacy, err)
 	}
 	brief, created, err := postgres.StartThreadBrief(ctx, 73002, 9001, domain.ThreadVoiceBelcanto)

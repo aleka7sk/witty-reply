@@ -47,6 +47,7 @@ type Memory struct {
 	reservations                map[memoryQuotaReservationKey]memoryQuotaReservation
 	generations                 map[int64]domain.GenerationRecord
 	threadBriefs                map[int64]domain.ThreadBrief
+	threadFinalistSets          map[int64]domain.ThreadFinalistSet
 	threadDrafts                map[int64]domain.ThreadDraft
 	threadMedia                 map[int64]domain.ThreadMedia
 	threadMediaAttachOperations map[memoryThreadMediaAttachKey]memoryThreadMediaAttachOperation
@@ -61,6 +62,7 @@ func NewMemory() *Memory {
 		users: make(map[int64]domain.User), updates: make(map[int64]domain.UpdateJob), usage: make(map[memoryUsageKey]int),
 		reservations: make(map[memoryQuotaReservationKey]memoryQuotaReservation),
 		generations:  make(map[int64]domain.GenerationRecord), threadBriefs: make(map[int64]domain.ThreadBrief),
+		threadFinalistSets:          make(map[int64]domain.ThreadFinalistSet),
 		threadDrafts:                make(map[int64]domain.ThreadDraft),
 		threadMedia:                 make(map[int64]domain.ThreadMedia),
 		threadMediaAttachOperations: make(map[memoryThreadMediaAttachKey]memoryThreadMediaAttachOperation),
@@ -419,6 +421,15 @@ func (m *Memory) StartThreadBrief(
 			m.threadBriefs[id] = existing
 		}
 	}
+	for id, set := range m.threadFinalistSets {
+		if set.TelegramID == brief.TelegramID && set.Current {
+			set.State = domain.ThreadFinalistSetCancelled
+			set.Current = false
+			set.Revision++
+			set.UpdatedAt = now
+			m.threadFinalistSets[id] = set
+		}
+	}
 	// Starting a new editorial flow makes every older publication keyboard
 	// stale immediately, before any potentially slow AI request begins.
 	for id, draft := range m.threadDrafts {
@@ -543,6 +554,407 @@ func (m *Memory) SetThreadBriefMaterial(
 	return brief, nil
 }
 
+func (m *Memory) CreateThreadFinalistSet(
+	_ context.Context,
+	input domain.ThreadFinalistSet,
+) (domain.ThreadFinalistSet, bool, error) {
+	if err := input.ValidateForCreate(); err != nil {
+		return domain.ThreadFinalistSet{}, false, err
+	}
+	input.Candidates = normalizedThreadFinalists(input.Candidates)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, existing := range m.threadFinalistSets {
+		if existing.TelegramID == input.TelegramID && existing.GenerationUpdateID == input.GenerationUpdateID {
+			if sameThreadFinalistGeneration(existing, input) {
+				return cloneThreadFinalistSet(existing), false, nil
+			}
+			return domain.ThreadFinalistSet{}, false, ErrThreadFinalistSetState
+		}
+		if existing.TelegramID == input.TelegramID && existing.GenerationID == input.GenerationID {
+			return domain.ThreadFinalistSet{}, false, ErrThreadFinalistSetState
+		}
+		if existing.TelegramID == input.TelegramID && existing.Current {
+			return domain.ThreadFinalistSet{}, false, ErrThreadFinalistSetState
+		}
+	}
+	if _, ok := m.users[input.TelegramID]; !ok {
+		return domain.ThreadFinalistSet{}, false, ErrNotFound
+	}
+	now := m.now().UTC()
+	var nextBrief *domain.ThreadBrief
+	var nextBase *domain.ThreadDraft
+	if input.BaseDraftID == 0 {
+		brief, ok := m.threadBriefs[input.BriefID]
+		if !ok || brief.TelegramID != input.TelegramID {
+			return domain.ThreadFinalistSet{}, false, ErrNotFound
+		}
+		if !brief.Current || brief.State != domain.ThreadBriefMaterialReady || brief.Revision != input.SourceRevision ||
+			brief.Voice != input.Voice || brief.Objective != input.Objective || input.TargetDraftRevision != 1 ||
+			input.PreserveMediaMode != "" || input.PreserveMediaID != 0 || input.SourceRevision == ^uint32(0) {
+			return domain.ThreadFinalistSet{}, false, ErrThreadBriefState
+		}
+		brief.State = domain.ThreadBriefCandidatesReady
+		brief.Revision++
+		brief.ErrorCode = ""
+		brief.UpdatedAt = now
+		if err := brief.Validate(); err != nil {
+			return domain.ThreadFinalistSet{}, false, err
+		}
+		nextBrief = &brief
+	} else {
+		base, ok := m.threadDrafts[input.BaseDraftID]
+		if !ok || base.TelegramID != input.TelegramID {
+			return domain.ThreadFinalistSet{}, false, ErrNotFound
+		}
+		if !base.Current || base.Revision != input.SourceRevision || input.SourceRevision == ^uint32(0) ||
+			(base.State != domain.ThreadDraftReady && base.State != domain.ThreadDraftFailed) ||
+			input.TargetDraftRevision != input.SourceRevision+1 {
+			return domain.ThreadFinalistSet{}, false, ErrThreadDraftState
+		}
+		if base.Objective.Selectable() && base.Objective != input.Objective {
+			return domain.ThreadFinalistSet{}, false, ErrThreadFinalistSetState
+		}
+		if input.BriefID != 0 && input.BriefID != base.BriefID {
+			return domain.ThreadFinalistSet{}, false, ErrThreadFinalistSetState
+		}
+		input.BriefID = base.BriefID
+		if err := m.validatePreservedThreadMediaLocked(input, base); err != nil {
+			return domain.ThreadFinalistSet{}, false, err
+		}
+		base.Current = false
+		base.UpdatedAt = now
+		nextBase = &base
+	}
+	input.ID = m.nextID
+	input.State = domain.ThreadFinalistSetReady
+	input.Revision = 1
+	input.Current = true
+	input.SelectedPosition = -1
+	input.SelectionUpdateID = 0
+	input.SelectedDraftID = 0
+	input.CreatedAt = now
+	input.UpdatedAt = now
+	if err := input.Validate(); err != nil {
+		return domain.ThreadFinalistSet{}, false, err
+	}
+	m.nextID++
+	if nextBrief != nil {
+		m.threadBriefs[nextBrief.ID] = *nextBrief
+	}
+	if nextBase != nil {
+		m.threadDrafts[nextBase.ID] = *nextBase
+	}
+	m.threadFinalistSets[input.ID] = cloneThreadFinalistSet(input)
+	return cloneThreadFinalistSet(input), true, nil
+}
+
+func (m *Memory) GetThreadFinalistSet(_ context.Context, id, telegramID int64) (domain.ThreadFinalistSet, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	set, ok := m.threadFinalistSets[id]
+	if !ok || set.TelegramID != telegramID {
+		return domain.ThreadFinalistSet{}, ErrNotFound
+	}
+	return cloneThreadFinalistSet(set), nil
+}
+
+func (m *Memory) GetCurrentThreadFinalistSet(_ context.Context, telegramID int64) (domain.ThreadFinalistSet, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, set := range m.threadFinalistSets {
+		if set.TelegramID == telegramID && set.Current {
+			return cloneThreadFinalistSet(set), nil
+		}
+	}
+	return domain.ThreadFinalistSet{}, ErrNotFound
+}
+
+func (m *Memory) GetThreadFinalistSetByGenerationUpdate(
+	_ context.Context,
+	telegramID, updateID int64,
+) (domain.ThreadFinalistSet, error) {
+	if updateID <= 0 {
+		return domain.ThreadFinalistSet{}, ErrNotFound
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, set := range m.threadFinalistSets {
+		if set.TelegramID == telegramID && set.GenerationUpdateID == updateID {
+			return cloneThreadFinalistSet(set), nil
+		}
+	}
+	return domain.ThreadFinalistSet{}, ErrNotFound
+}
+
+func (m *Memory) SelectThreadFinalist(
+	_ context.Context,
+	setID, telegramID int64,
+	setRevision uint32,
+	position int,
+	selectionUpdateID int64,
+) (domain.ThreadDraft, bool, error) {
+	if setID <= 0 || telegramID <= 0 || setRevision == 0 || setRevision == ^uint32(0) || position < 0 || position >= 5 || selectionUpdateID <= 0 {
+		return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, replay := range m.threadFinalistSets {
+		if replay.TelegramID != telegramID || replay.SelectionUpdateID != selectionUpdateID {
+			continue
+		}
+		if replay.ID == setID && replay.State == domain.ThreadFinalistSetSelected && replay.SelectedPosition == position {
+			draft, ok := m.threadDrafts[replay.SelectedDraftID]
+			if !ok || draft.TelegramID != telegramID || draft.FinalistSetID != setID {
+				return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+			}
+			return draft, false, nil
+		}
+		return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+	}
+	set, ok := m.threadFinalistSets[setID]
+	if !ok || set.TelegramID != telegramID {
+		return domain.ThreadDraft{}, false, ErrNotFound
+	}
+	if !set.Current || set.State != domain.ThreadFinalistSetReady || set.Revision != setRevision {
+		return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+	}
+	candidate := set.Candidates[position]
+	if candidate.Position != position || !candidate.Selectable {
+		return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+	}
+	var nextBrief *domain.ThreadBrief
+	if set.BaseDraftID == 0 {
+		brief, exists := m.threadBriefs[set.BriefID]
+		if !exists || brief.TelegramID != telegramID {
+			return domain.ThreadDraft{}, false, ErrNotFound
+		}
+		if !brief.Current || brief.State != domain.ThreadBriefCandidatesReady || brief.Revision != set.SourceRevision+1 {
+			return domain.ThreadDraft{}, false, ErrThreadBriefState
+		}
+		brief.State = domain.ThreadBriefDraftReady
+		brief.Revision++
+		brief.ErrorCode = ""
+		brief.UpdatedAt = m.now().UTC()
+		if err := brief.Validate(); err != nil {
+			return domain.ThreadDraft{}, false, err
+		}
+		nextBrief = &brief
+	} else {
+		base, exists := m.threadDrafts[set.BaseDraftID]
+		if !exists || base.TelegramID != telegramID || base.Current || base.Revision != set.SourceRevision ||
+			(base.State != domain.ThreadDraftReady && base.State != domain.ThreadDraftFailed) {
+			return domain.ThreadDraft{}, false, ErrThreadDraftState
+		}
+		if base.BriefID != set.BriefID || (base.Objective.Selectable() && base.Objective != set.Objective) {
+			return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+		}
+		if err := m.validatePreservedThreadMediaLocked(set, base); err != nil {
+			return domain.ThreadDraft{}, false, err
+		}
+	}
+	for _, current := range m.threadDrafts {
+		if current.TelegramID == telegramID && current.Current {
+			return domain.ThreadDraft{}, false, ErrThreadDraftState
+		}
+	}
+	now := m.now().UTC()
+	draft := domain.ThreadDraft{
+		TelegramID: telegramID, Voice: set.Voice, Goal: candidate.Goal,
+		BriefID: set.BriefID, FinalistSetID: set.ID, Objective: set.Objective,
+		ScenarioID: candidate.ScenarioID, GenerationID: set.GenerationID,
+		GenerationUpdateID: set.GenerationUpdateID, PhotoQuery: candidate.PhotoQuery,
+		Text: candidate.Text, Provider: set.Provider, Model: set.Model,
+		Revision: set.TargetDraftRevision, MediaMode: domain.ThreadMediaText,
+		State: domain.ThreadDraftReady, Current: true,
+	}
+	if set.PreserveMediaMode != "" {
+		draft.MediaMode = set.PreserveMediaMode
+		draft.MediaID = set.PreserveMediaID
+	} else if candidate.VisualMode != domain.ThreadFinalistVisualTextOnly {
+		draft.MediaMode = domain.ThreadMediaImagePending
+	}
+	if err := draft.ValidateForCreate(); err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	draft.ID = m.nextID
+	draft.State = domain.ThreadDraftReady
+	draft.Current = true
+	draft.CreatedAt = now
+	draft.UpdatedAt = now
+	nextSet := set
+	nextSet.State = domain.ThreadFinalistSetSelected
+	nextSet.Current = false
+	nextSet.SelectedPosition = position
+	nextSet.SelectionUpdateID = selectionUpdateID
+	nextSet.SelectedDraftID = draft.ID
+	nextSet.Revision++
+	nextSet.UpdatedAt = now
+	if err := nextSet.Validate(); err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	m.nextID++
+	m.threadDrafts[draft.ID] = draft
+	m.threadFinalistSets[nextSet.ID] = cloneThreadFinalistSet(nextSet)
+	if nextBrief != nil {
+		m.threadBriefs[nextBrief.ID] = *nextBrief
+	}
+	return draft, true, nil
+}
+
+func (m *Memory) CancelThreadFinalistSet(
+	_ context.Context,
+	setID, telegramID int64,
+	setRevision uint32,
+) (domain.ThreadDraft, bool, error) {
+	if setID <= 0 || telegramID <= 0 || setRevision == 0 || setRevision == ^uint32(0) {
+		return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	set, ok := m.threadFinalistSets[setID]
+	if !ok || set.TelegramID != telegramID {
+		return domain.ThreadDraft{}, false, ErrNotFound
+	}
+	if set.State == domain.ThreadFinalistSetCancelled && set.Revision == setRevision+1 {
+		if set.BaseDraftID == 0 {
+			for _, brief := range m.threadBriefs {
+				if brief.TelegramID == telegramID && brief.Current {
+					return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+				}
+			}
+			for _, currentSet := range m.threadFinalistSets {
+				if currentSet.TelegramID == telegramID && currentSet.Current {
+					return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+				}
+			}
+			for _, draft := range m.threadDrafts {
+				if draft.TelegramID == telegramID && draft.Current {
+					return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+				}
+			}
+			return domain.ThreadDraft{}, false, nil
+		}
+		base, exists := m.threadDrafts[set.BaseDraftID]
+		if !exists || base.TelegramID != telegramID || !base.Current || base.Revision != set.SourceRevision ||
+			(base.State != domain.ThreadDraftReady && base.State != domain.ThreadDraftFailed) {
+			return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+		}
+		return base, true, nil
+	}
+	if !set.Current || set.State != domain.ThreadFinalistSetReady || set.Revision != setRevision {
+		return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+	}
+	now := m.now().UTC()
+	var restored domain.ThreadDraft
+	restoredOK := false
+	var nextBrief *domain.ThreadBrief
+	var nextBase *domain.ThreadDraft
+	if set.BaseDraftID == 0 {
+		brief, exists := m.threadBriefs[set.BriefID]
+		if !exists || brief.TelegramID != telegramID {
+			return domain.ThreadDraft{}, false, ErrNotFound
+		}
+		if !brief.Current || brief.State != domain.ThreadBriefCandidatesReady || brief.Revision != set.SourceRevision+1 {
+			return domain.ThreadDraft{}, false, ErrThreadBriefState
+		}
+		brief.State = domain.ThreadBriefCancelled
+		brief.Current = false
+		brief.Revision++
+		brief.ErrorCode = ""
+		brief.UpdatedAt = now
+		if err := brief.Validate(); err != nil {
+			return domain.ThreadDraft{}, false, err
+		}
+		nextBrief = &brief
+	} else {
+		base, exists := m.threadDrafts[set.BaseDraftID]
+		if !exists || base.TelegramID != telegramID || base.Current || base.Revision != set.SourceRevision ||
+			(base.State != domain.ThreadDraftReady && base.State != domain.ThreadDraftFailed) {
+			return domain.ThreadDraft{}, false, ErrThreadDraftState
+		}
+		for _, current := range m.threadDrafts {
+			if current.TelegramID == telegramID && current.Current {
+				return domain.ThreadDraft{}, false, ErrThreadDraftState
+			}
+		}
+		base.Current = true
+		base.UpdatedAt = now
+		nextBase = &base
+		restored, restoredOK = base, true
+	}
+	nextSet := set
+	nextSet.State = domain.ThreadFinalistSetCancelled
+	nextSet.Current = false
+	nextSet.Revision++
+	nextSet.UpdatedAt = now
+	if err := nextSet.Validate(); err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	if nextBrief != nil {
+		m.threadBriefs[nextBrief.ID] = *nextBrief
+	}
+	if nextBase != nil {
+		m.threadDrafts[nextBase.ID] = *nextBase
+	}
+	m.threadFinalistSets[nextSet.ID] = cloneThreadFinalistSet(nextSet)
+	return restored, restoredOK, nil
+}
+
+func (m *Memory) validatePreservedThreadMediaLocked(set domain.ThreadFinalistSet, base domain.ThreadDraft) error {
+	if set.PreserveMediaMode == "" {
+		return nil
+	}
+	if base.MediaMode != set.PreserveMediaMode || base.MediaID != set.PreserveMediaID {
+		return ErrThreadDraftState
+	}
+	if set.PreserveMediaMode == domain.ThreadMediaImagePending && set.PreserveMediaID == 0 {
+		return nil
+	}
+	mediaValue, ok := m.threadMedia[set.PreserveMediaID]
+	if !ok || mediaValue.TelegramID != set.TelegramID {
+		return ErrNotFound
+	}
+	if mediaValue.EffectiveSourceKind() != domain.ThreadMediaSourceTelegram &&
+		!(mediaValue.EffectiveSourceKind() == domain.ThreadMediaSourcePexels && mediaValue.AttachUpdateID > 0) {
+		return ErrThreadDraftState
+	}
+	return nil
+}
+
+func normalizedThreadFinalists(values []domain.ThreadFinalist) []domain.ThreadFinalist {
+	result := make([]domain.ThreadFinalist, len(values))
+	for _, value := range values {
+		if value.Position >= 0 && value.Position < len(values) {
+			result[value.Position] = value
+		}
+	}
+	return result
+}
+
+func cloneThreadFinalistSet(value domain.ThreadFinalistSet) domain.ThreadFinalistSet {
+	value.Candidates = append([]domain.ThreadFinalist(nil), value.Candidates...)
+	return value
+}
+
+func sameThreadFinalistGeneration(stored, requested domain.ThreadFinalistSet) bool {
+	if stored.TelegramID != requested.TelegramID || (requested.BriefID != 0 && stored.BriefID != requested.BriefID) ||
+		stored.BaseDraftID != requested.BaseDraftID || stored.GenerationID != requested.GenerationID ||
+		stored.GenerationUpdateID != requested.GenerationUpdateID || stored.Voice != requested.Voice ||
+		stored.Objective != requested.Objective || stored.Provider != requested.Provider || stored.Model != requested.Model ||
+		stored.SourceRevision != requested.SourceRevision || stored.TargetDraftRevision != requested.TargetDraftRevision ||
+		stored.PreserveMediaMode != requested.PreserveMediaMode || stored.PreserveMediaID != requested.PreserveMediaID ||
+		len(stored.Candidates) != len(requested.Candidates) {
+		return false
+	}
+	for index := range stored.Candidates {
+		if stored.Candidates[index] != requested.Candidates[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func (m *Memory) CreateThreadDraftForBrief(
 	_ context.Context,
 	briefID int64,
@@ -552,6 +964,9 @@ func (m *Memory) CreateThreadDraftForBrief(
 ) (domain.ThreadDraft, bool, error) {
 	if briefID <= 0 || draft.TelegramID <= 0 || draft.GenerationUpdateID <= 0 {
 		return domain.ThreadDraft{}, false, ErrThreadBriefState
+	}
+	if draft.FinalistSetID != 0 {
+		return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -686,6 +1101,15 @@ func (m *Memory) CancelThreadBrief(_ context.Context, id, telegramID int64, revi
 		return err
 	}
 	m.threadBriefs[id] = brief
+	for setID, set := range m.threadFinalistSets {
+		if set.BriefID == id && set.TelegramID == telegramID && set.Current && set.State == domain.ThreadFinalistSetReady {
+			set.State = domain.ThreadFinalistSetCancelled
+			set.Current = false
+			set.Revision++
+			set.UpdatedAt = now
+			m.threadFinalistSets[setID] = set
+		}
+	}
 	for draftID, draft := range m.threadDrafts {
 		if draft.BriefID == id && draft.TelegramID == telegramID && draft.Current &&
 			(draft.State == domain.ThreadDraftReady || draft.State == domain.ThreadDraftFailed) {
@@ -700,6 +1124,9 @@ func (m *Memory) CancelThreadBrief(_ context.Context, id, telegramID int64, revi
 }
 
 func (m *Memory) CreateThreadDraft(_ context.Context, draft domain.ThreadDraft) (int64, error) {
+	if draft.FinalistSetID != 0 {
+		return 0, ErrThreadFinalistSetState
+	}
 	draft = normalizeLegacyThreadDraft(draft)
 	if err := draft.ValidateForCreate(); err != nil {
 		return 0, err
@@ -756,6 +1183,9 @@ func (m *Memory) CreateThreadDraft(_ context.Context, draft domain.ThreadDraft) 
 }
 
 func (m *Memory) CreateThreadDraftWithMedia(_ context.Context, draft domain.ThreadDraft, mediaValue domain.ThreadMedia) (int64, error) {
+	if draft.FinalistSetID != 0 {
+		return 0, ErrThreadFinalistSetState
+	}
 	draft = normalizeLegacyThreadDraft(draft)
 	if draft.MediaMode != domain.ThreadMediaImage || draft.MediaID != 0 || mediaValue.TelegramID != draft.TelegramID ||
 		mediaValue.AttachUpdateID != 0 {
@@ -1101,6 +1531,11 @@ func (m *Memory) deleteOrphanThreadMediaLocked(id int64) {
 	}
 	for _, draft := range m.threadDrafts {
 		if draft.MediaID == id {
+			return
+		}
+	}
+	for _, set := range m.threadFinalistSets {
+		if set.PreserveMediaID == id {
 			return
 		}
 	}
@@ -1486,6 +1921,11 @@ func (m *Memory) DeleteUser(_ context.Context, telegramID int64) error {
 			delete(m.threadBriefs, id)
 		}
 	}
+	for id, set := range m.threadFinalistSets {
+		if set.TelegramID == telegramID {
+			delete(m.threadFinalistSets, id)
+		}
+	}
 	for id, draft := range m.threadDrafts {
 		if draft.TelegramID == telegramID {
 			delete(m.threadDrafts, id)
@@ -1537,9 +1977,25 @@ func (m *Memory) Cleanup(_ context.Context, before time.Time) (int64, error) {
 			draft.UpdatedAt = now
 			m.threadDrafts[id] = draft
 		}
-		if draft.UpdatedAt.Before(before) {
-			delete(m.threadDrafts, id)
+	}
+	for id, set := range m.threadFinalistSets {
+		if !set.UpdatedAt.Before(before) {
+			continue
 		}
+		if selected, ok := m.threadDrafts[set.SelectedDraftID]; ok && !selected.UpdatedAt.Before(before) {
+			continue
+		}
+		delete(m.threadFinalistSets, id)
+		if selected, ok := m.threadDrafts[set.SelectedDraftID]; ok && selected.FinalistSetID == id {
+			selected.FinalistSetID = 0
+			m.threadDrafts[selected.ID] = selected
+		}
+	}
+	for id, draft := range m.threadDrafts {
+		if !draft.UpdatedAt.Before(before) || m.threadDraftReferencedByFinalistSetLocked(id) {
+			continue
+		}
+		delete(m.threadDrafts, id)
 	}
 	for id, brief := range m.threadBriefs {
 		if !brief.UpdatedAt.Before(before) {
@@ -1550,6 +2006,14 @@ func (m *Memory) Cleanup(_ context.Context, before time.Time) (int64, error) {
 			if draft.BriefID == id && !draft.UpdatedAt.Before(before) {
 				retainedDraft = true
 				break
+			}
+		}
+		if !retainedDraft {
+			for _, set := range m.threadFinalistSets {
+				if set.BriefID == id {
+					retainedDraft = true
+					break
+				}
 			}
 		}
 		if !retainedDraft {
@@ -1580,6 +2044,15 @@ func (m *Memory) Cleanup(_ context.Context, before time.Time) (int64, error) {
 		delete(m.reservations, key)
 	}
 	return deleted, nil
+}
+
+func (m *Memory) threadDraftReferencedByFinalistSetLocked(id int64) bool {
+	for _, set := range m.threadFinalistSets {
+		if set.BaseDraftID == id || set.SelectedDraftID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func nextDay(now time.Time) time.Time {

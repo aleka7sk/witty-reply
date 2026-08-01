@@ -82,10 +82,14 @@ const (
 	ActionThreadBriefChangeObjective
 	ActionThreadBriefCancel
 	ActionThreadBriefRetry
+	// Finalist actions are appended to preserve every previously issued signed
+	// callback's numeric value. They operate on one durable five-post portfolio.
+	ActionThreadSelectFinalist
+	ActionThreadFinalistCancel
 )
 
 func (a Action) Valid() bool {
-	return a >= ActionFeedbackUp && a <= ActionThreadBriefRetry
+	return a >= ActionFeedbackUp && a <= ActionThreadFinalistCancel
 }
 
 type CallbackPayload struct {

@@ -98,7 +98,47 @@ func generateThreadDraftForTest(t *testing.T, service *Service, dataStore store.
 	t.Helper()
 	user, brief, generationUpdateID := readyThreadBriefForTest(t, dataStore, startUpdateID)
 	ctx := context.Background()
+	var telegramClient *fakeTelegram
+	switch client := service.telegram.(type) {
+	case *fakeTelegram:
+		telegramClient = client
+	case *failOnceThreadTelegram:
+		telegramClient = client.base
+	default:
+		t.Fatal("test draft helper requires fake Telegram client")
+	}
+	telegramClient.mu.Lock()
+	messagesBefore := len(telegramClient.messages)
+	photosBefore := len(telegramClient.photos)
+	telegramClient.mu.Unlock()
 	if err := service.generateThreadBrief(ctx, generationUpdateID, 42, user, brief); err != nil {
+		t.Fatal(err)
+	}
+	set, err := dataStore.GetThreadFinalistSetByGenerationUpdate(ctx, 42, generationUpdateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	position := -1
+	for _, candidate := range set.Candidates {
+		if candidate.Recommended {
+			position = candidate.Position
+			break
+		}
+	}
+	if position < 0 {
+		t.Fatal("generated finalist set has no recommendation")
+	}
+	// Hide the portfolio delivery from tests that specifically exercise the
+	// downstream draft/media/publish state machine, then perform the same
+	// operator selection handler used by Telegram callbacks.
+	telegramClient.mu.Lock()
+	telegramClient.messages = telegramClient.messages[:messagesBefore]
+	telegramClient.photos = telegramClient.photos[:photosBefore]
+	telegramClient.mu.Unlock()
+	if err := service.selectThreadFinalist(ctx, generationUpdateID+1, 42, user, session.CallbackPayload{
+		Action: session.ActionThreadSelectFinalist, UserID: 42,
+		InteractionID: set.ID, Revision: set.Revision, Candidate: int8(position),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	draft, err := dataStore.GetCurrentThreadDraft(ctx, 42)

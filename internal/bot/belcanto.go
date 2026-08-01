@@ -173,6 +173,16 @@ func (b *Service) cancelCurrentThreadBriefIfPending(
 	if !b.isBelcantoOperator(user.TelegramID) {
 		return false, nil
 	}
+	set, err := b.store.GetCurrentThreadFinalistSet(ctx, user.TelegramID)
+	if err == nil {
+		return true, b.cancelThreadFinalistSet(ctx, chatID, user, session.CallbackPayload{
+			Action: session.ActionThreadFinalistCancel, UserID: user.TelegramID,
+			InteractionID: set.ID, Revision: set.Revision, Candidate: -1,
+		})
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return true, err
+	}
 	brief, err := b.store.GetCurrentThreadBrief(ctx, user.TelegramID)
 	if errors.Is(err, store.ErrNotFound) {
 		return false, nil
@@ -181,7 +191,8 @@ func (b *Service) cancelCurrentThreadBriefIfPending(
 		return true, err
 	}
 	switch brief.State {
-	case domain.ThreadBriefAwaitingGoal, domain.ThreadBriefAwaitingMaterial, domain.ThreadBriefMaterialReady:
+	case domain.ThreadBriefAwaitingGoal, domain.ThreadBriefAwaitingMaterial, domain.ThreadBriefMaterialReady,
+		domain.ThreadBriefCandidatesReady:
 	default:
 		return false, nil
 	}
@@ -222,6 +233,11 @@ func (b *Service) tryHandleThreadBriefMaterial(
 ) (bool, error) {
 	if !b.isBelcantoOperator(user.TelegramID) {
 		return false, nil
+	}
+	if replayed, replayErr := b.replayThreadFinalistSetByGenerationUpdate(
+		ctx, message.Chat.ID, user.TelegramID, updateID,
+	); replayed {
+		return true, replayErr
 	}
 	// Recover the exact preview when this message already completed a brief but
 	// the worker crashed before Telegram acknowledged the outbound send.
@@ -273,6 +289,9 @@ func (b *Service) completeThreadBriefWithoutMaterial(
 	user domain.User,
 	payload session.CallbackPayload,
 ) error {
+	if replayed, replayErr := b.replayThreadFinalistSetByGenerationUpdate(ctx, chatID, user.TelegramID, updateID); replayed {
+		return replayErr
+	}
 	current, currentErr := b.store.GetThreadBrief(ctx, payload.InteractionID, user.TelegramID)
 	if currentErr != nil {
 		if errors.Is(currentErr, store.ErrNotFound) {
@@ -292,6 +311,11 @@ func (b *Service) completeThreadBriefWithoutMaterial(
 	)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrThreadBriefState) {
+			if replayed, replayErr := b.replayThreadFinalistSetByGenerationUpdate(
+				ctx, chatID, user.TelegramID, updateID,
+			); replayed {
+				return replayErr
+			}
 			if draft, lookupErr := b.store.GetThreadDraftByGenerationUpdate(ctx, user.TelegramID, updateID); lookupErr == nil {
 				keyboard, keyboardErr := b.threadDraftKeyboard(ctx, user.TelegramID, draft)
 				if keyboardErr != nil {
@@ -315,6 +339,9 @@ func (b *Service) retryThreadBrief(
 	user domain.User,
 	payload session.CallbackPayload,
 ) error {
+	if replayed, replayErr := b.replayThreadFinalistSetByGenerationUpdate(ctx, chatID, user.TelegramID, updateID); replayed {
+		return replayErr
+	}
 	if existing, lookupErr := b.store.GetThreadDraftByGenerationUpdate(ctx, user.TelegramID, updateID); lookupErr == nil {
 		keyboard, keyboardErr := b.threadDraftKeyboard(ctx, user.TelegramID, existing)
 		if keyboardErr != nil {
@@ -359,6 +386,11 @@ func (b *Service) prepareThreadDraft(
 		return b.sendText(ctx, chatID, belcantoGeneratorUnavailableText(userLanguage(user.Language)), nil)
 	}
 	if generationUpdateID > 0 {
+		if replayed, replayErr := b.replayThreadFinalistSetByGenerationUpdate(
+			ctx, chatID, user.TelegramID, generationUpdateID,
+		); replayed {
+			return replayErr
+		}
 		if existing, lookupErr := b.store.GetThreadDraftByGenerationUpdate(ctx, user.TelegramID, generationUpdateID); lookupErr == nil {
 			keyboard, keyboardErr := b.threadDraftKeyboard(ctx, user.TelegramID, existing)
 			if keyboardErr != nil {
@@ -438,25 +470,26 @@ func (b *Service) prepareThreadDraft(
 		b.metrics.Inc("belcanto_safety_rejections")
 		return b.sendThreadGenerationFailure(ctx, chatID, user, previous, brief)
 	}
-	// The application, not a model/provider implementation, owns the external
-	// stock-search boundary. Derive the only allowed query from bounded scenario
-	// metadata before persistence or any automatic Pexels call.
-	result.Visual.Query = ai.SafeThreadPhotoQuery(result.ScenarioID)
-	draft := domain.ThreadDraft{
-		TelegramID: user.TelegramID, Voice: voice, Goal: result.Goal,
-		Objective: result.Objective, ScenarioID: result.ScenarioID,
-		GenerationID: generationID, GenerationUpdateID: generationUpdateID,
-		PhotoQuery: result.Visual.Query, Text: result.Text,
-		Provider: result.Provider, Model: result.Model, Revision: revision,
-		MediaMode: domain.ThreadMediaText, State: domain.ThreadDraftReady, Current: true,
+	finalists, ok := b.threadFinalistsFromResult(result)
+	if !ok {
+		b.metrics.Inc("belcanto_safety_rejections")
+		return b.sendThreadGenerationFailure(ctx, chatID, user, previous, brief)
+	}
+	set := domain.ThreadFinalistSet{
+		TelegramID: user.TelegramID, GenerationID: generationID,
+		GenerationUpdateID: generationUpdateID, Voice: voice, Objective: result.Objective,
+		Provider: result.Provider, Model: result.Model, TargetDraftRevision: revision,
+		State: domain.ThreadFinalistSetReady, Revision: 1, Current: true,
+		SelectedPosition: -1, Candidates: finalists,
 	}
 	if brief != nil {
-		draft.BriefID = brief.ID
+		set.BriefID = brief.ID
+		set.SourceRevision = brief.Revision
 	}
-	if strings.TrimSpace(draft.PhotoQuery) == "" {
-		draft.PhotoQuery = fallbackLicensedPhotoQuery
+	if previous != nil {
+		set.BaseDraftID = previous.ID
+		set.SourceRevision = previous.Revision
 	}
-	var previewMedia *domain.ThreadMedia
 	if previous != nil && transform != "different_angle" && voice == previous.Voice &&
 		(previous.MediaMode == domain.ThreadMediaImage || previous.MediaMode == domain.ThreadMediaImagePending) {
 		preserve := previous.MediaID == 0 && previous.MediaMode == domain.ThreadMediaImagePending
@@ -465,84 +498,44 @@ func (b *Service) prepareThreadDraft(
 			if mediaErr != nil {
 				return fmt.Errorf("load previous Threads media: %w", mediaErr)
 			}
-			// An explicit operator choice survives small text refinements. An
-			// automatic Pexels suggestion is reconsidered on every revision so it
-			// cannot silently drift from the new text.
-			preserve = previousMedia.EffectiveSourceKind() == domain.ThreadMediaSourceTelegram ||
-				(previousMedia.EffectiveSourceKind() == domain.ThreadMediaSourcePexels && previousMedia.AttachUpdateID > 0)
-			if preserve {
-				previewMedia = &previousMedia
+			switch previousMedia.EffectiveSourceKind() {
+			case domain.ThreadMediaSourceTelegram:
+				preserve = true
+			case domain.ThreadMediaSourcePexels:
+				preserve = previousMedia.AttachUpdateID > 0
+				if preserve && previous.FinalistSetID > 0 {
+					originSet, setErr := b.store.GetThreadFinalistSet(ctx, previous.FinalistSetID, user.TelegramID)
+					if setErr != nil {
+						return fmt.Errorf("load originating Threads finalist set: %w", setErr)
+					}
+					// The Pexels asset automatically attached by the finalist-selection
+					// callback is only a suggestion and must be reconsidered for the
+					// revised text. A later manual Pexels callback has its own update ID
+					// and remains an explicit operator choice worth preserving.
+					preserve = originSet.SelectionUpdateID != previousMedia.AttachUpdateID
+				}
 			}
 		}
 		if preserve {
-			draft.MediaMode = previous.MediaMode
-			draft.MediaID = previous.MediaID
+			set.PreserveMediaMode = previous.MediaMode
+			set.PreserveMediaID = previous.MediaID
 		}
 	}
-	var sourcedMedia *domain.ThreadMedia
-	if draft.MediaMode == domain.ThreadMediaText && result.Visual.Mode == "belcanto_photo" {
-		draft.MediaMode = domain.ThreadMediaImagePending
-	}
-	if draft.MediaMode == domain.ThreadMediaText && result.Visual.Mode == "licensed_photo" && b.threadPhotoSource != nil {
-		mediaValue, mediaErr := b.prepareLicensedThreadMedia(ctx, user.TelegramID, result.Visual)
-		if mediaErr != nil {
-			b.metrics.Inc("belcanto_photo_source_fallbacks")
-			b.logger.Warn(
-				"Belcanto licensed photo unavailable; using text-only post",
-				"generation_id", generationID,
-				"user", observability.UserHash(b.config.CallbackSecret, user.TelegramID),
-				"error", safeErrorCode(mediaErr),
-			)
-		} else {
-			draft.MediaMode = domain.ThreadMediaImage
-			sourcedMedia = &mediaValue
-			previewMedia = sourcedMedia
-		}
-	}
-	if brief != nil && previous == nil {
-		draft, _, err = b.store.CreateThreadDraftForBrief(ctx, brief.ID, brief.Revision, draft, sourcedMedia)
-		if err != nil {
-			return fmt.Errorf("save Threads draft for brief: %w", err)
-		}
-	} else {
-		var draftID int64
-		if sourcedMedia != nil {
-			draftID, err = b.store.CreateThreadDraftWithMedia(ctx, draft, *sourcedMedia)
-		} else {
-			draftID, err = b.store.CreateThreadDraft(ctx, draft)
-		}
-		if err != nil {
-			return fmt.Errorf("save Threads draft: %w", err)
-		}
-		if sourcedMedia != nil {
-			draft, err = b.store.GetThreadDraft(ctx, draftID, user.TelegramID)
-			if err != nil {
-				return fmt.Errorf("load sourced Threads draft: %w", err)
-			}
-		} else {
-			draft.ID = draftID
-		}
-	}
-	if draft.MediaID > 0 {
-		storedMedia, mediaErr := b.store.GetThreadMedia(ctx, draft.MediaID, user.TelegramID)
-		if mediaErr != nil {
-			return fmt.Errorf("load stored Threads preview media: %w", mediaErr)
-		}
-		previewMedia = &storedMedia
-	}
-	keyboard, err := b.threadDraftKeyboard(ctx, user.TelegramID, draft)
+	set, created, err := b.store.CreateThreadFinalistSet(ctx, set)
 	if err != nil {
-		return err
+		return fmt.Errorf("save Threads finalist set: %w", err)
 	}
-	b.recordBelcantoDraftReady(draft)
 	b.metrics.Add("input_tokens", int64(result.Usage.InputTokens))
 	b.metrics.Add("output_tokens", int64(result.Usage.OutputTokens))
-	previewErr := b.sendThreadDraftPreview(ctx, chatID, draft, keyboard)
+	previewErr := b.deliverThreadFinalistSet(ctx, chatID, user.TelegramID, set)
 	previewStatus := "sent_acknowledged"
 	if previewErr != nil {
 		previewStatus = "send_error_unknown"
 	}
-	b.logBelcantoEditorialAudit(user.TelegramID, draft, transform, result, previewMedia, previewStatus, brief)
+	if created {
+		b.metrics.Inc("belcanto_finalist_sets_ready")
+		b.logBelcantoEditorialSetAudit(user.TelegramID, set, transform, result, previewStatus, brief)
+	}
 	return previewErr
 }
 
@@ -568,6 +561,327 @@ func (b *Service) sendThreadGenerationFailure(
 		return b.sendText(ctx, chatID, belcantoGenerationErrorText(userLanguage(user.Language)), keyboard)
 	}
 	return b.sendText(ctx, chatID, belcantoGenerationErrorText(userLanguage(user.Language)), nil)
+}
+
+func (b *Service) threadFinalistsFromResult(result ai.ThreadPostResult) ([]domain.ThreadFinalist, bool) {
+	if !validThreadPostEditorialResult(result) {
+		return nil, false
+	}
+	candidates := make([]ai.ThreadPostCandidateAudit, 0, 5)
+	for _, candidate := range result.Audit.Candidates {
+		if !candidate.Eligible || !candidate.Considered {
+			continue
+		}
+		// Every displayed text is a potential operator choice. Fail the complete
+		// portfolio instead of showing a partially moderated five-post set.
+		if !b.threadPostDeliverySafe(candidate.Text) {
+			return nil, false
+		}
+		candidates = append(candidates, candidate)
+	}
+	if len(candidates) != 5 {
+		return nil, false
+	}
+	sort.SliceStable(candidates, func(left, right int) bool {
+		leftRecommended := candidates[left].Selected && candidates[left].ReviewerID == result.Audit.DeliveredWinnerID
+		rightRecommended := candidates[right].Selected && candidates[right].ReviewerID == result.Audit.DeliveredWinnerID
+		if leftRecommended != rightRecommended {
+			return leftRecommended
+		}
+		if candidates[left].Review.Total > 0 || candidates[right].Review.Total > 0 {
+			return belcantoAuditReviewBetter(candidates[left], candidates[right])
+		}
+		if candidates[left].Local.Score != candidates[right].Local.Score {
+			return candidates[left].Local.Score > candidates[right].Local.Score
+		}
+		leftDistance := belcantoAuditLengthDistance(candidates[left].Local.RuneCount)
+		rightDistance := belcantoAuditLengthDistance(candidates[right].Local.RuneCount)
+		if leftDistance != rightDistance {
+			return leftDistance < rightDistance
+		}
+		return candidates[left].ReviewerID < candidates[right].ReviewerID
+	})
+
+	finalists := make([]domain.ThreadFinalist, 0, len(candidates))
+	recommended := 0
+	for position, candidate := range candidates {
+		isRecommended := candidate.Selected && candidate.ReviewerID == result.Audit.DeliveredWinnerID
+		if isRecommended {
+			recommended++
+		}
+		selectable := candidate.Review.Total == 0 || candidate.Review.FactSafe
+		if isRecommended && !selectable {
+			return nil, false
+		}
+		visualMode := domain.ThreadFinalistVisualTextOnly
+		if isRecommended {
+			switch result.Visual.Mode {
+			case string(domain.ThreadFinalistVisualLicensedPhoto):
+				visualMode = domain.ThreadFinalistVisualLicensedPhoto
+			case string(domain.ThreadFinalistVisualBelcantoPhoto):
+				visualMode = domain.ThreadFinalistVisualBelcantoPhoto
+			}
+		}
+		photoSuggested := visualMode != domain.ThreadFinalistVisualTextOnly
+		finalists = append(finalists, domain.ThreadFinalist{
+			Position: position, ReviewerID: candidate.ReviewerID, Goal: candidate.Goal,
+			Objective: candidate.Objective, ScenarioID: candidate.ScenarioID, Mechanism: candidate.Mechanism,
+			MaterialBasis: candidate.MaterialBasis, Text: candidate.Text, Recommended: isRecommended,
+			Selectable: selectable, VisualMode: visualMode,
+			PhotoSuggested: photoSuggested, PhotoQuery: ai.SafeThreadPhotoQuery(candidate.ScenarioID),
+		})
+	}
+	return finalists, recommended == 1
+}
+
+func (b *Service) replayThreadFinalistSetByGenerationUpdate(
+	ctx context.Context,
+	chatID, telegramID, generationUpdateID int64,
+) (bool, error) {
+	if generationUpdateID <= 0 {
+		return false, nil
+	}
+	set, err := b.store.GetThreadFinalistSetByGenerationUpdate(ctx, telegramID, generationUpdateID)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return true, err
+	}
+	return true, b.deliverThreadFinalistSet(ctx, chatID, telegramID, set)
+}
+
+func (b *Service) deliverThreadFinalistSet(
+	ctx context.Context,
+	chatID, telegramID int64,
+	set domain.ThreadFinalistSet,
+) error {
+	switch set.State {
+	case domain.ThreadFinalistSetReady:
+		if !set.Current {
+			return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+		}
+		keyboard, err := threadFinalistSetKeyboard(b.callbacks, telegramID, set)
+		if err != nil {
+			return err
+		}
+		return b.sendText(ctx, chatID, threadFinalistSetText(set), keyboard)
+	case domain.ThreadFinalistSetSelected:
+		draft, err := b.store.GetThreadDraft(ctx, set.SelectedDraftID, telegramID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+			}
+			return err
+		}
+		if !draft.Current {
+			return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+		}
+		keyboard, err := b.threadDraftKeyboard(ctx, telegramID, draft)
+		if err != nil {
+			return err
+		}
+		return b.sendThreadDraftPreview(ctx, chatID, draft, keyboard)
+	case domain.ThreadFinalistSetCancelled:
+		if set.BaseDraftID == 0 {
+			return b.sendText(ctx, chatID, threadFinalistSetCancelledText(false), nil)
+		}
+		draft, err := b.store.GetThreadDraft(ctx, set.BaseDraftID, telegramID)
+		if err != nil || !draft.Current {
+			if err == nil || errors.Is(err, store.ErrNotFound) {
+				return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+			}
+			return err
+		}
+		if err := b.sendText(ctx, chatID, threadFinalistSetCancelledText(true), nil); err != nil {
+			return err
+		}
+		keyboard, err := b.threadDraftKeyboard(ctx, telegramID, draft)
+		if err != nil {
+			return err
+		}
+		return b.sendThreadDraftPreview(ctx, chatID, draft, keyboard)
+	default:
+		return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+	}
+}
+
+func (b *Service) selectThreadFinalist(
+	ctx context.Context,
+	updateID, chatID int64,
+	user domain.User,
+	payload session.CallbackPayload,
+) error {
+	if !b.isBelcantoOperator(user.TelegramID) {
+		return b.sendText(ctx, chatID, belcantoOwnerOnlyText(userLanguage(user.Language)), nil)
+	}
+	position := int(payload.Candidate)
+	if position < 0 || position >= 5 {
+		return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+	}
+	set, setErr := b.store.GetThreadFinalistSet(ctx, payload.InteractionID, user.TelegramID)
+	if setErr != nil {
+		if errors.Is(setErr, store.ErrNotFound) {
+			return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+		}
+		return setErr
+	}
+	var candidate domain.ThreadFinalist
+	candidateFound := false
+	for _, current := range set.Candidates {
+		if current.Position == position {
+			candidate = current
+			candidateFound = true
+			break
+		}
+	}
+	if !candidateFound || !candidate.Selectable {
+		return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+	}
+	draft, created, err := b.store.SelectThreadFinalist(
+		ctx, payload.InteractionID, user.TelegramID, payload.Revision, position, updateID,
+	)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrThreadFinalistSetState) ||
+			errors.Is(err, store.ErrThreadDraftState) {
+			return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+		}
+		return err
+	}
+	if created {
+		b.recordBelcantoDraftReady(draft)
+		b.logBelcantoFinalistSelected(user.TelegramID, set, draft, candidate)
+	}
+	draft, err = b.resolveSelectedThreadFinalistMedia(ctx, updateID, chatID, user.TelegramID, set, candidate, draft, created)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrThreadDraftState) ||
+			errors.Is(err, store.ErrThreadFinalistSetState) {
+			return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+		}
+		return err
+	}
+	keyboard, err := b.threadDraftKeyboard(ctx, user.TelegramID, draft)
+	if err != nil {
+		return err
+	}
+	return b.sendThreadDraftPreview(ctx, chatID, draft, keyboard)
+}
+
+func (b *Service) resolveSelectedThreadFinalistMedia(
+	ctx context.Context,
+	updateID, chatID, telegramID int64,
+	set domain.ThreadFinalistSet,
+	candidate domain.ThreadFinalist,
+	draft domain.ThreadDraft,
+	created bool,
+) (domain.ThreadDraft, error) {
+	if set.PreserveMediaMode != "" || candidate.VisualMode != domain.ThreadFinalistVisualLicensedPhoto ||
+		draft.MediaMode == domain.ThreadMediaImage {
+		return draft, nil
+	}
+	// Text is the durable fallback state. On the first call older stores may
+	// still materialize a licensed finalist directly as text; pending is the
+	// replay-safe marker used by the current store until the external lookup has
+	// either attached an image or committed the text fallback.
+	if draft.MediaMode == domain.ThreadMediaText && !created {
+		return draft, nil
+	}
+	commitTextFallback := func() (domain.ThreadDraft, error) {
+		if draft.MediaMode != domain.ThreadMediaImagePending {
+			return draft, nil
+		}
+		updated, err := b.store.SetThreadDraftMediaMode(
+			ctx, draft.ID, telegramID, draft.Revision, domain.ThreadMediaText,
+		)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrThreadDraftState) {
+				return domain.ThreadDraft{}, store.ErrThreadFinalistSetState
+			}
+			return domain.ThreadDraft{}, err
+		}
+		return updated, nil
+	}
+	if b.threadPhotoSource == nil {
+		return commitTextFallback()
+	}
+
+	stopAction := b.startChatAction(ctx, chatID, telegram.ChatActionUploadPhoto)
+	defer stopAction()
+	mediaValue, err := b.prepareLicensedThreadMedia(
+		ctx,
+		telegramID,
+		ai.ThreadPostVisualRecommendation{
+			Mode:  string(domain.ThreadFinalistVisualLicensedPhoto),
+			Query: candidate.PhotoQuery,
+		},
+	)
+	if err != nil {
+		if ctx.Err() != nil {
+			return domain.ThreadDraft{}, ctx.Err()
+		}
+		b.metrics.Inc("belcanto_photo_source_fallbacks")
+		b.logger.Warn(
+			"Belcanto automatic licensed photo unavailable; using text-only finalist",
+			"generation_id", set.GenerationID,
+			"user", observability.UserHash(b.config.CallbackSecret, telegramID),
+			"error", safeErrorCode(err),
+		)
+		return commitTextFallback()
+	}
+	mediaValue.AttachUpdateID = updateID
+	if err := mediaValue.ValidateForStore(); err != nil {
+		return domain.ThreadDraft{}, fmt.Errorf("validate automatic licensed Threads media: %w", err)
+	}
+	if err := validateUpdateLease(ctx); err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	updated, err := b.store.AttachLicensedThreadDraftMedia(
+		ctx, draft.ID, telegramID, draft.Revision, mediaValue,
+	)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrThreadDraftState) {
+			return domain.ThreadDraft{}, store.ErrThreadFinalistSetState
+		}
+		return domain.ThreadDraft{}, fmt.Errorf("attach automatic licensed Threads media: %w", err)
+	}
+	attachedMedia, err := b.store.GetThreadMedia(ctx, updated.MediaID, telegramID)
+	if err != nil {
+		return domain.ThreadDraft{}, fmt.Errorf("load automatic licensed Threads media: %w", err)
+	}
+	b.metrics.Inc("belcanto_licensed_media_selected")
+	b.logBelcantoMediaChanged(telegramID, updated, &attachedMedia, "pexels_auto_selected")
+	return updated, nil
+}
+
+func (b *Service) cancelThreadFinalistSet(
+	ctx context.Context,
+	chatID int64,
+	user domain.User,
+	payload session.CallbackPayload,
+) error {
+	if !b.isBelcantoOperator(user.TelegramID) {
+		return b.sendText(ctx, chatID, belcantoOwnerOnlyText(userLanguage(user.Language)), nil)
+	}
+	draft, restored, err := b.store.CancelThreadFinalistSet(
+		ctx, payload.InteractionID, user.TelegramID, payload.Revision,
+	)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrThreadFinalistSetState) {
+			return b.sendText(ctx, chatID, threadDraftStaleText(), nil)
+		}
+		return err
+	}
+	if !restored {
+		return b.sendText(ctx, chatID, threadFinalistSetCancelledText(false), nil)
+	}
+	if err := b.sendText(ctx, chatID, threadFinalistSetCancelledText(true), nil); err != nil {
+		return err
+	}
+	keyboard, err := b.threadDraftKeyboard(ctx, user.TelegramID, draft)
+	if err != nil {
+		return err
+	}
+	return b.sendThreadDraftPreview(ctx, chatID, draft, keyboard)
 }
 
 func (b *Service) selectLastMileThreadPost(result ai.ThreadPostResult) (ai.ThreadPostResult, bool) {
@@ -917,6 +1231,9 @@ func (b *Service) refineThreadDraft(
 ) error {
 	if !b.isBelcantoOperator(user.TelegramID) {
 		return b.sendText(ctx, chatID, belcantoOwnerOnlyText(userLanguage(user.Language)), nil)
+	}
+	if replayed, replayErr := b.replayThreadFinalistSetByGenerationUpdate(ctx, chatID, user.TelegramID, updateID); replayed {
+		return replayErr
 	}
 	if existing, lookupErr := b.store.GetThreadDraftByGenerationUpdate(ctx, user.TelegramID, updateID); lookupErr == nil {
 		keyboard, keyboardErr := b.threadDraftKeyboard(ctx, user.TelegramID, existing)

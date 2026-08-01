@@ -29,6 +29,12 @@ type Store interface {
 	GetCurrentThreadBrief(context.Context, int64) (domain.ThreadBrief, error)
 	SetThreadBriefObjective(context.Context, int64, int64, uint32, domain.ThreadObjective) (domain.ThreadBrief, error)
 	SetThreadBriefMaterial(context.Context, int64, int64, uint32, int64, domain.ThreadMaterialKind, string) (domain.ThreadBrief, error)
+	CreateThreadFinalistSet(context.Context, domain.ThreadFinalistSet) (domain.ThreadFinalistSet, bool, error)
+	GetThreadFinalistSet(context.Context, int64, int64) (domain.ThreadFinalistSet, error)
+	GetCurrentThreadFinalistSet(context.Context, int64) (domain.ThreadFinalistSet, error)
+	GetThreadFinalistSetByGenerationUpdate(context.Context, int64, int64) (domain.ThreadFinalistSet, error)
+	SelectThreadFinalist(context.Context, int64, int64, uint32, int, int64) (domain.ThreadDraft, bool, error)
+	CancelThreadFinalistSet(context.Context, int64, int64, uint32) (domain.ThreadDraft, bool, error)
 	CreateThreadDraftForBrief(context.Context, int64, uint32, domain.ThreadDraft, *domain.ThreadMedia) (domain.ThreadDraft, bool, error)
 	GetThreadDraftByGenerationUpdate(context.Context, int64, int64) (domain.ThreadDraft, error)
 	CancelThreadBrief(context.Context, int64, int64, uint32) error

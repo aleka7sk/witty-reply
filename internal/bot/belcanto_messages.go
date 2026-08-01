@@ -72,6 +72,41 @@ func threadBriefCancelledText() string {
 	return "Подготовка поста отменена. Ничего не сгенерировано и не опубликовано."
 }
 
+func threadFinalistSetText(set domain.ThreadFinalistSet) string {
+	var message strings.Builder
+	hasUnselectable := false
+	message.WriteString("🎼 Belcanto Threads — пять вариантов\n\n")
+	message.WriteString("Цель: ")
+	message.WriteString(threadObjectiveLabel(set.Objective))
+	message.WriteString("\n\nНезависимый редактор отметил свой выбор звездой. Выбери текст, который станет точным черновиком для публикации; до выбора ничего не опубликовано.\n")
+	for _, candidate := range set.Candidates {
+		message.WriteString("\n")
+		message.WriteString(fmt.Sprintf("%d. ", candidate.Position+1))
+		if candidate.Recommended {
+			message.WriteString("⭐ выбор редактора · ")
+		}
+		message.WriteString(threadScenarioLabel(candidate.ScenarioID))
+		if !candidate.Selectable {
+			hasUnselectable = true
+			message.WriteString(" · ⚠️ только для сравнения")
+		}
+		message.WriteString("\n")
+		message.WriteString(candidate.Text)
+		message.WriteString("\n")
+	}
+	if hasUnselectable {
+		message.WriteString("\nВариант без кнопки не прошёл независимый факт-чек и не может стать публикуемым черновиком.")
+	}
+	return message.String()
+}
+
+func threadFinalistSetCancelledText(restored bool) string {
+	if restored {
+		return "Новые варианты отменены. Возвращаю предыдущий черновик — он не изменён."
+	}
+	return "Подготовка поста отменена. Ничего не опубликовано."
+}
+
 func threadDraftText(draft domain.ThreadDraft) string {
 	return threadDraftTextWithContext(draft, nil, "")
 }

@@ -32,7 +32,8 @@ const (
 
 type belcantoEditorialAuditLog struct {
 	GenerationID         string                     `json:"generation_id"`
-	DraftID              int64                      `json:"draft_id"`
+	DraftID              int64                      `json:"draft_id,omitempty"`
+	FinalistSetID        int64                      `json:"finalist_set_id,omitempty"`
 	BriefID              int64                      `json:"brief_id,omitempty"`
 	User                 string                     `json:"user"`
 	Voice                string                     `json:"voice"`
@@ -146,6 +147,19 @@ type belcantoMediaChangeAuditLog struct {
 	PhotoQuery   string `json:"photo_query,omitempty"`
 }
 
+type belcantoFinalistSelectionAuditLog struct {
+	GenerationID        string `json:"generation_id"`
+	FinalistSetID       int64  `json:"finalist_set_id"`
+	DraftID             int64  `json:"draft_id"`
+	User                string `json:"user"`
+	Position            int    `json:"position"`
+	ReviewerID          string `json:"reviewer_id"`
+	ReviewerRecommended bool   `json:"reviewer_recommended"`
+	ScenarioID          string `json:"scenario_id"`
+	OperatorOverride    bool   `json:"operator_override"`
+	TextSHA256          string `json:"text_sha256"`
+}
+
 func (b *Service) logBelcantoMediaChanged(
 	telegramID int64,
 	draft domain.ThreadDraft,
@@ -175,9 +189,81 @@ func (b *Service) logBelcantoMediaChanged(
 	)
 }
 
+func (b *Service) logBelcantoFinalistSelected(
+	telegramID int64,
+	set domain.ThreadFinalistSet,
+	draft domain.ThreadDraft,
+	candidate domain.ThreadFinalist,
+) {
+	if b.config.BelcantoReviewLogMode == "off" {
+		return
+	}
+	entry := belcantoFinalistSelectionAuditLog{
+		GenerationID:        boundedBelcantoAuditMetadata(set.GenerationID, maxBelcantoAuditIdentifierRunes),
+		FinalistSetID:       set.ID,
+		DraftID:             draft.ID,
+		User:                observability.UserHash(b.config.CallbackSecret, telegramID),
+		Position:            candidate.Position,
+		ReviewerID:          boundedBelcantoAuditMetadata(candidate.ReviewerID, maxBelcantoAuditIdentifierRunes),
+		ReviewerRecommended: candidate.Recommended,
+		ScenarioID:          boundedBelcantoAuditMetadata(candidate.ScenarioID, maxBelcantoAuditIdentifierRunes),
+		OperatorOverride:    !candidate.Recommended,
+		TextSHA256:          threadAuditDigest(b.config.CallbackSecret, "text", candidate.Text),
+	}
+	b.logger.Info(
+		"Belcanto Threads finalist selected",
+		"event", "belcanto_threads_finalist_selected",
+		"schema_version", 1,
+		slog.Any("audit", entry),
+	)
+}
+
 func (b *Service) logBelcantoEditorialAudit(
 	telegramID int64,
 	draft domain.ThreadDraft,
+	transform string,
+	result ai.ThreadPostResult,
+	previewMedia *domain.ThreadMedia,
+	previewStatus string,
+	briefValues ...*domain.ThreadBrief,
+) {
+	b.logBelcantoEditorialAuditRecord(
+		telegramID, draft, 0, transform, result, previewMedia, previewStatus, briefValues...,
+	)
+}
+
+func (b *Service) logBelcantoEditorialSetAudit(
+	telegramID int64,
+	set domain.ThreadFinalistSet,
+	transform string,
+	result ai.ThreadPostResult,
+	previewStatus string,
+	briefValues ...*domain.ThreadBrief,
+) {
+	var recommended domain.ThreadFinalist
+	for _, candidate := range set.Candidates {
+		if candidate.Recommended {
+			recommended = candidate
+			break
+		}
+	}
+	draft := domain.ThreadDraft{
+		TelegramID: set.TelegramID, Voice: set.Voice, Goal: recommended.Goal,
+		BriefID: set.BriefID, Objective: set.Objective, ScenarioID: recommended.ScenarioID,
+		GenerationID: set.GenerationID, GenerationUpdateID: set.GenerationUpdateID,
+		PhotoQuery: recommended.PhotoQuery, Text: recommended.Text,
+		Provider: set.Provider, Model: set.Model, Revision: set.TargetDraftRevision,
+		MediaMode: domain.ThreadMediaText,
+	}
+	b.logBelcantoEditorialAuditRecord(
+		telegramID, draft, set.ID, transform, result, nil, previewStatus, briefValues...,
+	)
+}
+
+func (b *Service) logBelcantoEditorialAuditRecord(
+	telegramID int64,
+	draft domain.ThreadDraft,
+	finalistSetID int64,
 	transform string,
 	result ai.ThreadPostResult,
 	previewMedia *domain.ThreadMedia,
@@ -196,6 +282,7 @@ func (b *Service) logBelcantoEditorialAudit(
 	}
 	entry := belcantoEditorialAuditLog{
 		GenerationID: boundedBelcantoAuditMetadata(audit.GenerationID, maxBelcantoAuditIdentifierRunes), DraftID: draft.ID,
+		FinalistSetID:      finalistSetID,
 		BriefID:            draft.BriefID,
 		User:               observability.UserHash(b.config.CallbackSecret, telegramID),
 		Voice:              boundedBelcantoAuditMetadata(string(draft.Voice), maxBelcantoAuditIdentifierRunes),
@@ -385,6 +472,12 @@ func (b *Service) logBelcantoEditorialAudit(
 func belcantoAuditReviewBetter(left, right ai.ThreadPostCandidateAudit) bool {
 	if left.Review.Total != right.Review.Total {
 		return left.Review.Total > right.Review.Total
+	}
+	if left.Review.GoalFit != right.Review.GoalFit {
+		return left.Review.GoalFit > right.Review.GoalFit
+	}
+	if left.Review.Grounding != right.Review.Grounding {
+		return left.Review.Grounding > right.Review.Grounding
 	}
 	if belcantoAuditIntentRank(left.Review.WouldComment) != belcantoAuditIntentRank(right.Review.WouldComment) {
 		return belcantoAuditIntentRank(left.Review.WouldComment) > belcantoAuditIntentRank(right.Review.WouldComment)

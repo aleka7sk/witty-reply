@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http/httptest"
 	"strings"
@@ -128,7 +129,32 @@ func TestThreadsBriefCollectsGoalAndMaterialBeforeOneGeneration(t *testing.T) {
 	if request.Objective != domain.ThreadObjectiveReplies || request.MaterialKind != domain.ThreadMaterialText || request.Material != material || request.Voice != domain.ThreadVoiceBelcanto {
 		t.Fatalf("AI request = %+v", request)
 	}
+	set, err := memory.GetThreadFinalistSetByGenerationUpdate(ctx, 42, 102)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.State != domain.ThreadFinalistSetReady || len(set.Candidates) != 5 || set.SelectedPosition != -1 {
+		t.Fatalf("finalist set = %+v", set)
+	}
+	if _, err := memory.GetCurrentThreadDraft(ctx, 42); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("publishable draft exists before operator choice: %v", err)
+	}
+	messages = telegramClient.snapshotMessages()
+	portfolio := messages[len(messages)-1]
+	if !strings.Contains(portfolio.Text, "пять вариантов") ||
+		!strings.Contains(portfolio.Text, "Цель: содержательные ответы") ||
+		!strings.Contains(portfolio.Text, "⭐ выбор редактора") {
+		t.Fatalf("portfolio = %q", portfolio.Text)
+	}
+	chooseSecond := threadButtonCallback(t, portfolio.ReplyMarkup, "Выбрать 2")
+	if err := service.HandleUpdate(ctx, callbackUpdate(103, chooseSecond)); err != nil {
+		t.Fatal(err)
+	}
 	draft, err := memory.GetCurrentThreadDraft(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err = memory.GetThreadFinalistSet(ctx, set.ID, 42)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,19 +162,31 @@ func TestThreadsBriefCollectsGoalAndMaterialBeforeOneGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if draft.Objective != domain.ThreadObjectiveReplies || draft.ScenarioID == "" || draft.GenerationUpdateID != 102 ||
+	if set.State != domain.ThreadFinalistSetSelected || set.SelectedPosition != 1 || set.SelectedDraftID != draft.ID ||
+		set.SelectionUpdateID != 103 || draft.Text != set.Candidates[1].Text || draft.GenerationUpdateID != 102 ||
 		brief.State != domain.ThreadBriefDraftReady || brief.MaterialText != material || brief.MaterialKind != domain.ThreadMaterialText {
-		t.Fatalf("draft=%+v brief=%+v", draft, brief)
+		t.Fatalf("set=%+v draft=%+v brief=%+v", set, draft, brief)
 	}
 	messages = telegramClient.snapshotMessages()
 	preview := messages[len(messages)-1].Text
-	if !strings.Contains(preview, "Цель: содержательные ответы") ||
-		!strings.Contains(preview, "Сценарий: ") || !strings.Contains(preview, "пяти разных сценариев") ||
-		!strings.Contains(preview, "использован подтверждённый материал дня") {
-		t.Fatalf("preview = %q", preview)
+	if !strings.Contains(preview, draft.Text) || !strings.Contains(preview, "использован подтверждённый материал дня") {
+		t.Fatalf("selected preview = %q", preview)
 	}
-	if strings.Contains(preview, "UNIQUE-BRIEF") || strings.Contains(logs.String(), "UNIQUE-BRIEF") {
-		t.Fatalf("raw material leaked to preview/log: preview=%q log=%q", preview, logs.String())
+	if strings.Contains(portfolio.Text, "UNIQUE-BRIEF") || strings.Contains(preview, "UNIQUE-BRIEF") || strings.Contains(logs.String(), "UNIQUE-BRIEF") {
+		t.Fatalf("raw material leaked: portfolio=%q preview=%q log=%q", portfolio.Text, preview, logs.String())
+	}
+	if err := service.HandleUpdate(ctx, callbackUpdate(103, chooseSecond)); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := memory.GetCurrentThreadDraft(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.ID != draft.ID || replayed.Revision != draft.Revision || replayed.Text != draft.Text {
+		t.Fatalf("selection replay changed draft: before=%+v after=%+v", draft, replayed)
+	}
+	if requests, ordinary := provider.snapshot(); len(requests) != 1 || ordinary != 0 {
+		t.Fatalf("selection replay repeated AI: threads=%d ordinary=%d", len(requests), ordinary)
 	}
 }
 
@@ -217,9 +255,12 @@ func TestThreadsEvergreenShortcutGeneratesOnlyAfterExplicitConfirmation(t *testi
 		requests[0].MaterialKind != domain.ThreadMaterialNone || requests[0].Material != "" {
 		t.Fatalf("evergreen request=%+v ordinary=%d", requests, ordinary)
 	}
-	draft, err := memory.GetCurrentThreadDraft(ctx, 42)
-	if err != nil || draft.Objective != domain.ThreadObjectiveReach || draft.BriefID <= 0 {
-		t.Fatalf("evergreen draft=%+v err=%v", draft, err)
+	set, err := memory.GetThreadFinalistSetByGenerationUpdate(ctx, 42, 252)
+	if err != nil || set.Objective != domain.ThreadObjectiveReach || set.BriefID <= 0 || len(set.Candidates) != 5 {
+		t.Fatalf("evergreen finalist set=%+v err=%v", set, err)
+	}
+	if _, err := memory.GetCurrentThreadDraft(ctx, 42); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("evergreen draft existed before choice: %v", err)
 	}
 }
 
@@ -319,6 +360,82 @@ func TestThreadsCancelCommandCancelsPendingBriefWithoutGeneration(t *testing.T) 
 	}
 }
 
+func TestThreadsCancelCommandAlsoCancelsUnselectedFinalistPortfolio(t *testing.T) {
+	service, telegramClient, memory, provider := newBriefFlowService(t)
+	ctx := context.Background()
+	if err := service.HandleUpdate(ctx, textUpdate(420, "/threads")); err != nil {
+		t.Fatal(err)
+	}
+	replies := threadButtonCallback(t, telegramClient.snapshotMessages()[0].ReplyMarkup, "💬 Ответы")
+	if err := service.HandleUpdate(ctx, callbackUpdate(421, replies)); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.HandleUpdate(ctx, textUpdate(422, "Подтверждённая сцена занятия для отменяемой подборки.")); err != nil {
+		t.Fatal(err)
+	}
+	set, err := memory.GetThreadFinalistSetByGenerationUpdate(ctx, 42, 422)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.HandleUpdate(ctx, textUpdate(423, "/cancel")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := memory.GetCurrentThreadBrief(ctx, 42); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("current candidates-ready brief survived /cancel: %v", err)
+	}
+	set, err = memory.GetThreadFinalistSet(ctx, set.ID, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.State != domain.ThreadFinalistSetCancelled || set.Current {
+		t.Fatalf("cancelled finalist set = %+v", set)
+	}
+	if _, err := memory.GetCurrentThreadDraft(ctx, 42); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("draft appeared while cancelling finalists: %v", err)
+	}
+	if requests, ordinary := provider.snapshot(); len(requests) != 1 || ordinary != 0 {
+		t.Fatalf("portfolio cancel calls: threads=%d ordinary=%d", len(requests), ordinary)
+	}
+}
+
+func TestThreadsStaleInitialFinalistCancelDoesNotClaimToCancelNewWorkflow(t *testing.T) {
+	service, telegramClient, memory, _ := newBriefFlowService(t)
+	ctx := context.Background()
+	if err := service.HandleUpdate(ctx, textUpdate(430, "/threads")); err != nil {
+		t.Fatal(err)
+	}
+	replies := threadButtonCallback(t, telegramClient.snapshotMessages()[0].ReplyMarkup, "💬 Ответы")
+	if err := service.HandleUpdate(ctx, callbackUpdate(431, replies)); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.HandleUpdate(ctx, textUpdate(432, "Подтверждённая сцена занятия для отменяемой подборки.")); err != nil {
+		t.Fatal(err)
+	}
+	messages := telegramClient.snapshotMessages()
+	staleCancel := threadButtonCallback(t, messages[len(messages)-1].ReplyMarkup, "🗑 Отменить варианты")
+	if err := service.HandleUpdate(ctx, callbackUpdate(433, staleCancel)); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.HandleUpdate(ctx, textUpdate(434, "/threads")); err != nil {
+		t.Fatal(err)
+	}
+	newBrief, err := memory.GetCurrentThreadBrief(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.HandleUpdate(ctx, callbackUpdate(435, staleCancel)); err != nil {
+		t.Fatal(err)
+	}
+	current, err := memory.GetCurrentThreadBrief(ctx, 42)
+	if err != nil || current.ID != newBrief.ID || !current.Current {
+		t.Fatalf("new workflow changed by stale cancel: before=%+v after=%+v err=%v", newBrief, current, err)
+	}
+	messages = telegramClient.snapshotMessages()
+	if !strings.Contains(messages[len(messages)-1].Text, "устарела") {
+		t.Fatalf("stale cancel response = %q", messages[len(messages)-1].Text)
+	}
+}
+
 func TestThreadsNewCommandAlsoClearsPendingBrief(t *testing.T) {
 	service, _, memory, provider := newBriefFlowService(t)
 	ctx := context.Background()
@@ -343,7 +460,7 @@ func TestThreadsNewCommandAlsoClearsPendingBrief(t *testing.T) {
 }
 
 func TestThreadsDraftMetricsAreSegmentedByObjectiveAndScenario(t *testing.T) {
-	service, telegramClient, _, _ := newBriefFlowService(t)
+	service, telegramClient, memory, _ := newBriefFlowService(t)
 	ctx := context.Background()
 	if err := service.HandleUpdate(ctx, textUpdate(500, "/threads")); err != nil {
 		t.Fatal(err)
@@ -353,6 +470,22 @@ func TestThreadsDraftMetricsAreSegmentedByObjectiveAndScenario(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := service.HandleUpdate(ctx, textUpdate(502, "Подтверждённый материал для метрики сценария.")); err != nil {
+		t.Fatal(err)
+	}
+	set, err := memory.GetThreadFinalistSetByGenerationUpdate(ctx, 42, 502)
+	if err != nil {
+		t.Fatal(err)
+	}
+	position := -1
+	for _, candidate := range set.Candidates {
+		if candidate.Recommended {
+			position = candidate.Position
+			break
+		}
+	}
+	messages := telegramClient.snapshotMessages()
+	choose := threadButtonCallback(t, messages[len(messages)-1].ReplyMarkup, fmt.Sprintf("⭐ Выбрать %d", position+1))
+	if err := service.HandleUpdate(ctx, callbackUpdate(503, choose)); err != nil {
 		t.Fatal(err)
 	}
 	recorder := httptest.NewRecorder()
@@ -399,4 +532,93 @@ func TestThreadsFailedRefinementKeepsUsableCurrentDraftControls(t *testing.T) {
 		t.Fatalf("refinement failure text = %q", failure.Text)
 	}
 	_ = threadButtonCallback(t, failure.ReplyMarkup, "❤️ Теплее")
+}
+
+func TestThreadsRefinementPortfolioCancelRestoresExactBaseDraft(t *testing.T) {
+	service, telegramClient, memory, provider := newBriefFlowService(t)
+	ctx := context.Background()
+	base := generateThreadDraftForTest(t, service, memory, 700)
+	messages := telegramClient.snapshotMessages()
+	shorter := threadButtonCallback(t, messages[len(messages)-1].ReplyMarkup, "✂️ Короче")
+	if err := service.HandleUpdate(ctx, callbackUpdate(701, shorter)); err != nil {
+		t.Fatal(err)
+	}
+	set, err := memory.GetThreadFinalistSetByGenerationUpdate(ctx, 42, 701)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.BaseDraftID != base.ID || set.SourceRevision != base.Revision ||
+		set.TargetDraftRevision != base.Revision+1 || set.State != domain.ThreadFinalistSetReady {
+		t.Fatalf("refinement set = %+v", set)
+	}
+	if _, err := memory.GetCurrentThreadDraft(ctx, 42); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("base stayed current while portfolio awaits choice: %v", err)
+	}
+	messages = telegramClient.snapshotMessages()
+	cancel := threadButtonCallback(t, messages[len(messages)-1].ReplyMarkup, "🗑 Отменить варианты")
+	if err := service.HandleUpdate(ctx, callbackUpdate(702, cancel)); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := memory.GetCurrentThreadDraft(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err = memory.GetThreadFinalistSet(ctx, set.ID, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.ID != base.ID || restored.Revision != base.Revision || restored.Text != base.Text ||
+		set.State != domain.ThreadFinalistSetCancelled || set.Current {
+		t.Fatalf("restored=%+v base=%+v set=%+v", restored, base, set)
+	}
+	if requests, ordinary := provider.snapshot(); len(requests) != 2 || ordinary != 0 {
+		t.Fatalf("refinement/cancel calls: threads=%d ordinary=%d", len(requests), ordinary)
+	}
+}
+
+func TestThreadsCancelAndNewCommandsRestoreBaseFromRefinementPortfolio(t *testing.T) {
+	for index, command := range []string{"/cancel", "/new"} {
+		t.Run(command, func(t *testing.T) {
+			service, telegramClient, memory, provider := newBriefFlowService(t)
+			ctx := context.Background()
+			startUpdateID := int64(750 + index*10)
+			base := generateThreadDraftForTest(t, service, memory, startUpdateID)
+			messages := telegramClient.snapshotMessages()
+			shorter := threadButtonCallback(t, messages[len(messages)-1].ReplyMarkup, "✂️ Короче")
+			refinementUpdateID := startUpdateID + 1
+			if err := service.HandleUpdate(ctx, callbackUpdate(refinementUpdateID, shorter)); err != nil {
+				t.Fatal(err)
+			}
+			set, err := memory.GetCurrentThreadFinalistSet(ctx, 42)
+			if err != nil || set.GenerationUpdateID != refinementUpdateID || set.BaseDraftID != base.ID {
+				t.Fatalf("current refinement set = %+v, %v", set, err)
+			}
+			if err := service.HandleUpdate(ctx, textUpdate(startUpdateID+2, command)); err != nil {
+				t.Fatal(err)
+			}
+			restored, err := memory.GetCurrentThreadDraft(ctx, 42)
+			if err != nil {
+				t.Fatal(err)
+			}
+			set, err = memory.GetThreadFinalistSet(ctx, set.ID, 42)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if restored.ID != base.ID || restored.Revision != base.Revision || restored.Text != base.Text ||
+				set.State != domain.ThreadFinalistSetCancelled || set.Current {
+				t.Fatalf("command=%s restored=%+v base=%+v set=%+v", command, restored, base, set)
+			}
+			if _, err := memory.GetCurrentThreadFinalistSet(ctx, 42); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("command=%s left current finalist set: %v", command, err)
+			}
+			messages = telegramClient.snapshotMessages()
+			if len(messages) < 2 || !strings.Contains(messages[len(messages)-2].Text, "Возвращаю предыдущий черновик") ||
+				!strings.Contains(messages[len(messages)-1].Text, base.Text) {
+				t.Fatalf("command=%s cancellation delivery = %+v", command, messages)
+			}
+			if requests, ordinary := provider.snapshot(); len(requests) != 2 || ordinary != 0 {
+				t.Fatalf("command=%s calls: threads=%d ordinary=%d", command, len(requests), ordinary)
+			}
+		})
+	}
 }

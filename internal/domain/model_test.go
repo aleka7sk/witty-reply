@@ -313,3 +313,55 @@ func TestThreadDraftRequiresCompleteMetadataWhenLinkedToBrief(t *testing.T) {
 		})
 	}
 }
+
+func TestThreadFinalistSetValidationRequiresCanonicalFiveAndOneSafeRecommendation(t *testing.T) {
+	valid := ThreadFinalistSet{
+		TelegramID: 42, BriefID: 9, GenerationID: "generation-finalists-1", GenerationUpdateID: 101,
+		Voice: ThreadVoiceBelcanto, Objective: ThreadObjectiveReplies,
+		Provider: "fake", Model: "deterministic", SourceRevision: 3, TargetDraftRevision: 1,
+		SelectedPosition: -1,
+		Candidates: []ThreadFinalist{
+			{Position: 0, ReviewerID: "A", Goal: "ответы", Objective: ThreadObjectiveReplies, ScenarioID: "karaoke_choice", Mechanism: "question", MaterialBasis: "material", Text: "Какую песню вы первой выберете в караоке?", Recommended: true, Selectable: true, VisualMode: ThreadFinalistVisualLicensedPhoto, PhotoSuggested: true, PhotoQuery: "vintage microphone close up"},
+			{Position: 1, ReviewerID: "B", Goal: "ответы", Objective: ThreadObjectiveReplies, ScenarioID: "song_memory", Mechanism: "memory", MaterialBasis: "material", Text: "Какую песню вы помните не по словам, а по голосу близкого человека?", Selectable: true, VisualMode: ThreadFinalistVisualTextOnly},
+			{Position: 2, ReviewerID: "C", Goal: "ответы", Objective: ThreadObjectiveReplies, ScenarioID: "astana_playlist", Mechanism: "local", MaterialBasis: "material", Text: "Какая песня лучше всего звучит во время вечерней поездки по Астане?", Selectable: true, VisualMode: ThreadFinalistVisualTextOnly},
+			{Position: 3, ReviewerID: "D", Goal: "ответы", Objective: ThreadObjectiveReplies, ScenarioID: "small_group", Mechanism: "trust", MaterialBasis: "material", Text: "Что спокойнее для первого занятия: один на один или маленькая группа?", Selectable: true, VisualMode: ThreadFinalistVisualTextOnly},
+			{Position: 4, ReviewerID: "E", Goal: "ответы", Objective: ThreadObjectiveReplies, ScenarioID: "community_week", Mechanism: "community", MaterialBasis: "material", Text: "К чему вы бы присоединились сначала: караоке, йога или актёрское занятие?", Selectable: false, VisualMode: ThreadFinalistVisualTextOnly},
+		},
+	}
+	if err := valid.ValidateForCreate(); err != nil {
+		t.Fatalf("valid finalist set: %v", err)
+	}
+	for name, mutate := range map[string]func(*ThreadFinalistSet){
+		"four candidates": func(value *ThreadFinalistSet) { value.Candidates = value.Candidates[:4] },
+		"noncanonical": func(value *ThreadFinalistSet) {
+			value.Candidates[0], value.Candidates[1] = value.Candidates[1], value.Candidates[0]
+		},
+		"two recommendations":   func(value *ThreadFinalistSet) { value.Candidates[1].Recommended = true },
+		"unsafe recommendation": func(value *ThreadFinalistSet) { value.Candidates[0].Selectable = false },
+		"three mechanisms": func(value *ThreadFinalistSet) {
+			value.Candidates[3].Mechanism = "question"
+			value.Candidates[4].Mechanism = "memory"
+		},
+		"visual mismatch":  func(value *ThreadFinalistSet) { value.Candidates[0].PhotoSuggested = false },
+		"initial revision": func(value *ThreadFinalistSet) { value.TargetDraftRevision = 2 },
+		"source overflow":  func(value *ThreadFinalistSet) { value.SourceRevision = ^uint32(0) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := valid
+			candidate.Candidates = append([]ThreadFinalist(nil), valid.Candidates...)
+			mutate(&candidate)
+			if err := candidate.ValidateForCreate(); err == nil {
+				t.Fatal("invalid finalist set was accepted")
+			}
+		})
+	}
+	refinement := valid
+	refinement.BriefID = 0
+	refinement.BaseDraftID = 17
+	refinement.SourceRevision = 4
+	refinement.TargetDraftRevision = 5
+	refinement.PreserveMediaMode = ThreadMediaImagePending
+	if err := refinement.ValidateForCreate(); err != nil {
+		t.Fatalf("pending-media refinement: %v", err)
+	}
+}

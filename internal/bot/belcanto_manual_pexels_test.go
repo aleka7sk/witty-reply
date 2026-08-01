@@ -291,6 +291,27 @@ func TestManualPexelsChoiceSurvivesSmallTextRefinement(t *testing.T) {
 	if err := service.HandleUpdate(ctx, threadCallbackUpdate(352, "refine-with-manual-pexels", shorter)); err != nil {
 		t.Fatal(err)
 	}
+	set, err := memory.GetThreadFinalistSetByGenerationUpdate(ctx, 42, 352)
+	if err != nil {
+		t.Fatal(err)
+	}
+	position := -1
+	for _, candidate := range set.Candidates {
+		if candidate.Recommended {
+			position = candidate.Position
+			break
+		}
+	}
+	user, err := memory.GetUser(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.selectThreadFinalist(ctx, 353, 42, user, session.CallbackPayload{
+		Action: session.ActionThreadSelectFinalist, UserID: 42,
+		InteractionID: set.ID, Revision: set.Revision, Candidate: int8(position),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	refined, err := memory.GetCurrentThreadDraft(ctx, 42)
 	if err != nil {
 		t.Fatal(err)

@@ -15,6 +15,7 @@ import (
 	"github.com/aleka7sk/witty-reply/internal/ai"
 	"github.com/aleka7sk/witty-reply/internal/domain"
 	"github.com/aleka7sk/witty-reply/internal/photos"
+	"github.com/aleka7sk/witty-reply/internal/session"
 )
 
 type editorialAuditProvider struct {
@@ -109,14 +110,16 @@ type staticLicensedPhotoSource struct {
 	asset photos.Asset
 	err   error
 	query string
+	calls int
 }
 
 func (s *staticLicensedPhotoSource) Find(_ context.Context, query string) (photos.Asset, error) {
+	s.calls++
 	s.query = query
 	return s.asset, s.err
 }
 
-func TestBelcantoLogsAllFinalistsSendsOnlyWinnerAndAttachesLicensedPhoto(t *testing.T) {
+func TestBelcantoShowsAllFinalistsThenAttachesLicensedPhotoOnlyAfterSelection(t *testing.T) {
 	provider := &editorialAuditProvider{}
 	service, telegramClient, memory, _, _ := newTestService(t, provider)
 	var logs bytes.Buffer
@@ -137,7 +140,31 @@ func TestBelcantoLogsAllFinalistsSendsOnlyWinnerAndAttachesLicensedPhoto(t *test
 	if err := memory.SetConsent(ctx, 42, true); err != nil {
 		t.Fatal(err)
 	}
-	generateThreadDraftForTest(t, service, memory, 1)
+	user, brief, generationUpdateID := readyThreadBriefForTest(t, memory, 1)
+	if err := service.generateThreadBrief(ctx, generationUpdateID, 42, user, brief); err != nil {
+		t.Fatal(err)
+	}
+	set, err := memory.GetThreadFinalistSetByGenerationUpdate(ctx, 42, generationUpdateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := telegramClient.snapshotMessages()
+	if len(messages) != 1 {
+		t.Fatalf("finalist portfolio messages = %+v", messages)
+	}
+	portfolio := messages[0]
+	for _, candidate := range set.Candidates {
+		if !strings.Contains(portfolio.Text, candidate.Text) {
+			t.Fatalf("portfolio omitted finalist %d: %q", candidate.Position+1, portfolio.Text)
+		}
+	}
+	if photoSource.query != "" || len(snapshotThreadPhotos(telegramClient)) != 0 {
+		t.Fatalf("Pexels ran before selection: query=%q photos=%d", photoSource.query, len(snapshotThreadPhotos(telegramClient)))
+	}
+	selectWinner := threadButtonCallback(t, portfolio.ReplyMarkup, "⭐ Выбрать 1")
+	if err := service.HandleUpdate(ctx, threadCallbackUpdate(2, "select-winner", selectWinner)); err != nil {
+		t.Fatal(err)
+	}
 
 	photosSent := snapshotThreadPhotos(telegramClient)
 	if len(photosSent) != 1 {
@@ -160,15 +187,8 @@ func TestBelcantoLogsAllFinalistsSendsOnlyWinnerAndAttachesLicensedPhoto(t *test
 	if sourceButtons != 1 {
 		t.Fatalf("Pexels source buttons = %d, keyboard=%+v", sourceButtons, photosSent[0].ReplyMarkup)
 	}
-	telegramPayload := caption
-	for _, message := range telegramClient.snapshotMessages() {
-		telegramPayload += "\n" + message.Text
-	}
+	telegramPayload := caption + "\n" + telegramClient.snapshotMessages()[len(messages)-1].Text
 	for _, forbidden := range []string{
-		"Припев помнит настроение точнее календаря.",
-		"Тихий голос тоже держит внимание.",
-		"Какой знакомый звук первым выдаёт любимую песню?",
-		"На записи голос кажется чужим",
 		"Живая музыкальная деталь и конкретный повод ответить.",
 		"A быстрее цепляет и проще приглашает к ответу.",
 		"REJECTED_RAW_MODEL_SENTINEL",
@@ -177,7 +197,7 @@ func TestBelcantoLogsAllFinalistsSendsOnlyWinnerAndAttachesLicensedPhoto(t *test
 			t.Fatalf("Telegram leaked a finalist or review detail %q: %q", forbidden, telegramPayload)
 		}
 	}
-	if photoSource.query != "vintage microphone close up" {
+	if photoSource.query != ai.SafeThreadPhotoQuery("karaoke_archetype") {
 		t.Fatalf("photo query = %q", photoSource.query)
 	}
 	draft, err := memory.GetCurrentThreadDraft(ctx, 42)
@@ -189,11 +209,32 @@ func TestBelcantoLogsAllFinalistsSendsOnlyWinnerAndAttachesLicensedPhoto(t *test
 		t.Fatalf("media = %+v, %v", mediaValue, err)
 	}
 
-	if bytes.Count(logs.Bytes(), []byte{'\n'}) != 1 {
-		t.Fatalf("audit log is not one atomic JSON line: %q", logs.String())
+	records := bytes.Split(bytes.TrimSpace(logs.Bytes()), []byte{'\n'})
+	if len(records) != 3 {
+		t.Fatalf("audit record count = %d: %q", len(records), logs.String())
 	}
 	if strings.Contains(logs.String(), "REJECTED_RAW_MODEL_SENTINEL") {
 		t.Fatal("full audit leaked rejected raw model output")
+	}
+	var editorialRecord, selectionRecord []byte
+	for _, record := range records {
+		var envelope struct {
+			Event string `json:"event"`
+		}
+		if err := json.Unmarshal(record, &envelope); err != nil {
+			t.Fatalf("decode audit envelope: %v\n%s", err, record)
+		}
+		if envelope.Event == "belcanto_threads_editorial_review" {
+			if editorialRecord != nil {
+				t.Fatal("duplicate editorial audit record")
+			}
+			editorialRecord = record
+		} else if envelope.Event == "belcanto_threads_finalist_selected" {
+			selectionRecord = record
+		}
+	}
+	if editorialRecord == nil || selectionRecord == nil {
+		t.Fatalf("generation/selection audit records are missing: %q", logs.String())
 	}
 	var event struct {
 		Event         string `json:"event"`
@@ -203,6 +244,7 @@ func TestBelcantoLogsAllFinalistsSendsOnlyWinnerAndAttachesLicensedPhoto(t *test
 		Audit         struct {
 			GenerationID     string `json:"generation_id"`
 			DraftID          int64  `json:"draft_id"`
+			FinalistSetID    int64  `json:"finalist_set_id"`
 			User             string `json:"user"`
 			SelectedWinnerID string `json:"selected_winner_id"`
 			PreviewStatus    string `json:"preview_status"`
@@ -236,19 +278,19 @@ func TestBelcantoLogsAllFinalistsSendsOnlyWinnerAndAttachesLicensedPhoto(t *test
 			} `json:"rejected_candidates"`
 		} `json:"audit"`
 	}
-	if err := json.Unmarshal(logs.Bytes(), &event); err != nil {
-		t.Fatalf("decode audit log: %v\n%s", err, logs.String())
+	if err := json.Unmarshal(editorialRecord, &event); err != nil {
+		t.Fatalf("decode audit log: %v\n%s", err, editorialRecord)
 	}
 	if event.Event != "belcanto_threads_editorial_review" || event.Level != "INFO" ||
 		event.Message != "Belcanto Threads finalists reviewed" || event.SchemaVersion != 3 ||
-		event.Audit.DraftID != draft.ID || len(event.Audit.Finalists) != 5 {
+		event.Audit.DraftID != 0 || event.Audit.FinalistSetID != set.ID || len(event.Audit.Finalists) != 5 {
 		t.Fatalf("audit event = %+v", event)
 	}
 	if event.Audit.SelectedWinnerID != "A" || event.Audit.PreviewStatus != "sent_acknowledged" {
 		t.Fatalf("audit winner/delivery = %+v", event.Audit)
 	}
-	if event.Audit.PhotoSource != "pexels" || event.Audit.PhotoAssetID != "123" ||
-		event.Audit.PhotoSourcePage != "https://www.pexels.com/photo/microphone-123/" || event.Audit.PhotoAuthor != "Lens Author" {
+	if event.Audit.PhotoSource != "" || event.Audit.PhotoAssetID != "" ||
+		event.Audit.PhotoSourcePage != "" || event.Audit.PhotoAuthor != "" {
 		t.Fatalf("audit photo provenance = %+v", event.Audit)
 	}
 	if !event.Audit.Finalists[0].Selected || event.Audit.Finalists[0].Review.Total != event.Audit.Finalists[1].Review.Total {
@@ -281,9 +323,35 @@ func TestBelcantoLogsAllFinalistsSendsOnlyWinnerAndAttachesLicensedPhoto(t *test
 		len(event.Audit.GenerationID) != 32 || event.Audit.User == "42" {
 		t.Fatalf("audit identity = %+v selected=%d", event.Audit, selected)
 	}
+	var selectionEvent struct {
+		Event string `json:"event"`
+		Audit struct {
+			GenerationID     string `json:"generation_id"`
+			FinalistSetID    int64  `json:"finalist_set_id"`
+			DraftID          int64  `json:"draft_id"`
+			Position         int    `json:"position"`
+			ReviewerID       string `json:"reviewer_id"`
+			ScenarioID       string `json:"scenario_id"`
+			OperatorOverride bool   `json:"operator_override"`
+			TextSHA256       string `json:"text_sha256"`
+			Text             string `json:"text"`
+		} `json:"audit"`
+	}
+	if err := json.Unmarshal(selectionRecord, &selectionEvent); err != nil {
+		t.Fatal(err)
+	}
+	if selectionEvent.Event != "belcanto_threads_finalist_selected" ||
+		selectionEvent.Audit.GenerationID != set.GenerationID || selectionEvent.Audit.FinalistSetID != set.ID ||
+		selectionEvent.Audit.DraftID != draft.ID || selectionEvent.Audit.Position != 0 ||
+		selectionEvent.Audit.ReviewerID != "A" || selectionEvent.Audit.ScenarioID != "karaoke_archetype" ||
+		selectionEvent.Audit.OperatorOverride || selectionEvent.Audit.Text != "" ||
+		selectionEvent.Audit.TextSHA256 != threadAuditDigest(service.config.CallbackSecret, "text", winner) ||
+		bytes.Contains(selectionRecord, []byte(winner)) {
+		t.Fatalf("unsafe or incomplete selection audit = %+v raw=%s", selectionEvent, selectionRecord)
+	}
 }
 
-func TestBelcantoEditorialAuditRecordsPreviewFailureAfterSendAttempt(t *testing.T) {
+func TestBelcantoEditorialAuditRecordsFinalistPortfolioFailureAfterSendAttempt(t *testing.T) {
 	provider := &editorialAuditProvider{}
 	service, telegramClient, memory, _, _ := newTestService(t, provider)
 	var logs bytes.Buffer
@@ -295,7 +363,7 @@ func TestBelcantoEditorialAuditRecordsPreviewFailureAfterSendAttempt(t *testing.
 		Query: "vintage microphone close up", Alt: "Vintage microphone on an empty stage",
 		Data: threadTestImage(t, 800, 1_000, color.RGBA{R: 30, G: 80, B: 140, A: 255}),
 	}}
-	service.telegram = &failOnceThreadTelegram{base: telegramClient, failNextPhoto: true}
+	service.telegram = &failOnceThreadTelegram{base: telegramClient, failNextMessage: true}
 	service.belcantoOperators[42] = struct{}{}
 	ctx := context.Background()
 	if _, err := memory.UpsertUser(ctx, domain.User{TelegramID: 42, Language: "ru"}); err != nil {
@@ -308,8 +376,8 @@ func TestBelcantoEditorialAuditRecordsPreviewFailureAfterSendAttempt(t *testing.
 	if err := service.generateThreadBrief(ctx, generationUpdateID, 42, user, brief); err == nil {
 		t.Fatal("expected Telegram preview failure")
 	}
-	if len(snapshotThreadPhotos(telegramClient)) != 0 {
-		t.Fatal("failed Telegram preview was recorded as delivered")
+	if len(telegramClient.snapshotMessages()) != 0 || len(snapshotThreadPhotos(telegramClient)) != 0 {
+		t.Fatal("failed Telegram finalist portfolio was recorded as delivered")
 	}
 	var event struct {
 		Event string `json:"event"`
@@ -376,11 +444,28 @@ func TestBelcantoRefinementDoesNotReusePexelsPhotoAgainstReviewerDecision(t *tes
 	if err := service.prepareThreadDraft(ctx, 1_000_011, 42, user, domain.ThreadVoiceBelcanto, "shorter", &first, nil); err != nil {
 		t.Fatal(err)
 	}
+	set, err := memory.GetThreadFinalistSetByGenerationUpdate(ctx, 42, 1_000_011)
+	if err != nil {
+		t.Fatal(err)
+	}
+	position := -1
+	for _, candidate := range set.Candidates {
+		if candidate.Recommended {
+			position = candidate.Position
+			break
+		}
+	}
+	if err := service.selectThreadFinalist(ctx, 1_000_012, 42, user, session.CallbackPayload{
+		Action: session.ActionThreadSelectFinalist, UserID: 42,
+		InteractionID: set.ID, Revision: set.Revision, Candidate: int8(position),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	refined, err := memory.GetCurrentThreadDraft(ctx, 42)
 	if err != nil || refined.MediaMode != domain.ThreadMediaText || refined.MediaID != 0 {
 		t.Fatalf("refined draft = %+v, %v", refined, err)
 	}
-	if len(snapshotThreadPhotos(telegramClient)) != 1 || len(telegramClient.snapshotMessages()) != 1 {
+	if len(snapshotThreadPhotos(telegramClient)) != 1 || len(telegramClient.snapshotMessages()) != 2 {
 		t.Fatalf("photos=%d messages=%d", len(snapshotThreadPhotos(telegramClient)), len(telegramClient.snapshotMessages()))
 	}
 }
@@ -707,11 +792,125 @@ func TestThreadPostEditorialBoundaryRejectsMalformedProviderAudit(t *testing.T) 
 	}
 }
 
+func TestThreadFinalistPortfolioPinsRecommendationAndHidesUnsafeSelectionButton(t *testing.T) {
+	provider := &editorialAuditProvider{}
+	service, _, _, _, codec := newTestService(t, provider)
+	result, err := provider.GenerateThreadPost(context.Background(), ai.ThreadPostRequest{
+		GenerationID: "0123456789abcdef0123456789abcdef",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// B has the highest raw score but fails the independent fact check. The
+	// delivered reviewer winner remains first; B is visible for comparison and
+	// deliberately receives no callback button.
+	result.Audit.Candidates[1].Review.Total = 99
+	result.Audit.Candidates[1].Review.FactSafe = false
+	finalists, ok := service.threadFinalistsFromResult(result)
+	if !ok {
+		t.Fatal("valid five-finalist portfolio was rejected")
+	}
+	if !finalists[0].Recommended || finalists[0].ReviewerID != "A" ||
+		finalists[1].ReviewerID != "B" || finalists[1].Selectable {
+		t.Fatalf("finalist order/safety = %+v", finalists)
+	}
+	set := domain.ThreadFinalistSet{
+		ID: 77, TelegramID: 42, Objective: domain.ThreadObjectiveReplies,
+		Revision: 1, Candidates: finalists,
+	}
+	keyboard, err := threadFinalistSetKeyboard(codec, 42, set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectButtons := 0
+	for _, row := range keyboard.InlineKeyboard {
+		for _, button := range row {
+			if strings.Contains(button.Text, "Выбрать") {
+				selectButtons++
+				if button.Text == "Выбрать 2" {
+					t.Fatal("fact-unsafe finalist exposed a selection callback")
+				}
+			}
+		}
+	}
+	if selectButtons != 4 {
+		t.Fatalf("selection buttons = %d, keyboard=%+v", selectButtons, keyboard)
+	}
+	portfolio := threadFinalistSetText(set)
+	if !strings.Contains(portfolio, finalists[1].Text) ||
+		!strings.Contains(portfolio, "Вариант без кнопки не прошёл независимый факт-чек") {
+		t.Fatalf("unsafe comparison disclosure = %q", portfolio)
+	}
+	set.Candidates[1].Selectable = true
+	if allSelectable := threadFinalistSetText(set); strings.Contains(allSelectable, "Вариант без кнопки") {
+		t.Fatalf("all-selectable portfolio contains irrelevant warning: %q", allSelectable)
+	}
+	result.Audit.Candidates[0].Review.FactSafe = false
+	if _, accepted := service.threadFinalistsFromResult(result); accepted {
+		t.Fatal("fact-unsafe reviewer recommendation was accepted")
+	}
+}
+
+func TestSelectedLicensedFinalistNeverOverridesPreservedPendingOperatorPhotoChoice(t *testing.T) {
+	provider := &editorialAuditProvider{}
+	service, _, memory, _, _ := newTestService(t, provider)
+	service.config.BelcantoReviewLogMode = "off"
+	service.belcantoOperators[42] = struct{}{}
+	ctx := context.Background()
+	user, err := memory.UpsertUser(ctx, domain.User{TelegramID: 42, Language: "ru"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := memory.SetConsent(ctx, 42, true); err != nil {
+		t.Fatal(err)
+	}
+	base := generateThreadDraftForTest(t, service, memory, 800)
+	pending, err := memory.SetThreadDraftMediaMode(ctx, base.ID, 42, base.Revision, domain.ThreadMediaImagePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	photoSource := &staticLicensedPhotoSource{asset: photos.Asset{
+		Provider: "pexels", AssetID: "preserve-1", PageURL: "https://www.pexels.com/photo/preserve-1/",
+		Author: "Preserve Lens", AuthorURL: "https://www.pexels.com/@preserve-lens",
+		Data: threadTestImage(t, 800, 1_000, color.RGBA{R: 20, G: 80, B: 130, A: 255}),
+	}}
+	service.threadPhotoSource = photoSource
+	if err := service.prepareThreadDraft(ctx, 900, 42, user, domain.ThreadVoiceBelcanto, "shorter", &pending, nil); err != nil {
+		t.Fatal(err)
+	}
+	set, err := memory.GetThreadFinalistSetByGenerationUpdate(ctx, 42, 900)
+	if err != nil {
+		t.Fatal(err)
+	}
+	position := -1
+	for _, candidate := range set.Candidates {
+		if candidate.Recommended {
+			position = candidate.Position
+			break
+		}
+	}
+	if err := service.selectThreadFinalist(ctx, 901, 42, user, session.CallbackPayload{
+		Action: session.ActionThreadSelectFinalist, UserID: 42,
+		InteractionID: set.ID, Revision: set.Revision, Candidate: int8(position),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	selected, err := memory.GetCurrentThreadDraft(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.PreserveMediaMode != domain.ThreadMediaImagePending || selected.MediaMode != domain.ThreadMediaImagePending ||
+		selected.MediaID != 0 || photoSource.query != "" {
+		t.Fatalf("preserved pending choice was replaced: set=%+v draft=%+v query=%q", set, selected, photoSource.query)
+	}
+}
+
 func TestBelcantoPhotoSourceFailureKeepsWinnerTextReady(t *testing.T) {
 	provider := &editorialAuditProvider{}
 	service, telegramClient, memory, _, _ := newTestService(t, provider)
 	service.config.BelcantoReviewLogMode = "off"
-	service.threadPhotoSource = &staticLicensedPhotoSource{err: errors.New("Pexels unavailable")}
+	photoSource := &staticLicensedPhotoSource{err: errors.New("Pexels unavailable")}
+	service.threadPhotoSource = photoSource
 	service.belcantoOperators[42] = struct{}{}
 	ctx := context.Background()
 	if _, err := memory.UpsertUser(ctx, domain.User{TelegramID: 42, Language: "ru"}); err != nil {
@@ -727,5 +926,27 @@ func TestBelcantoPhotoSourceFailureKeepsWinnerTextReady(t *testing.T) {
 	}
 	if len(telegramClient.snapshotMessages()) != 1 || len(snapshotThreadPhotos(telegramClient)) != 0 {
 		t.Fatalf("messages=%+v photos=%+v", telegramClient.snapshotMessages(), snapshotThreadPhotos(telegramClient))
+	}
+	set, err := memory.GetThreadFinalistSetByGenerationUpdate(ctx, 42, 1_000_001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	position := set.SelectedPosition
+	user, err := memory.GetUser(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.selectThreadFinalist(ctx, 1_000_002, 42, user, session.CallbackPayload{
+		Action: session.ActionThreadSelectFinalist, UserID: 42,
+		InteractionID: set.ID, Revision: 1, Candidate: int8(position),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := memory.GetCurrentThreadDraft(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.ID != draft.ID || replayed.Revision != draft.Revision || photoSource.calls != 1 {
+		t.Fatalf("fallback replay changed result or repeated Pexels: before=%+v after=%+v calls=%d", draft, replayed, photoSource.calls)
 	}
 }

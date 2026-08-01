@@ -96,6 +96,7 @@ func (p *Postgres) Migrate(ctx context.Context) error {
 		{version: 2, path: "migrations/002_licensed_thread_media.sql"},
 		{version: 3, path: "migrations/003_manual_licensed_media.sql"},
 		{version: 4, path: "migrations/004_thread_briefs.sql"},
+		{version: 5, path: "migrations/005_thread_finalists.sql"},
 	} {
 		applied := false
 		if hasMigrationTable {
@@ -134,8 +135,10 @@ func (p *Postgres) Ping(ctx context.Context) error {
 		   AND to_regclass('thread_media') IS NOT NULL
 		   AND to_regclass('thread_media_attach_operations') IS NOT NULL
 		   AND to_regclass('thread_briefs') IS NOT NULL
+		   AND to_regclass('thread_finalist_sets') IS NOT NULL
+		   AND to_regclass('thread_finalists') IS NOT NULL
 		   AND to_regclass('thread_drafts') IS NOT NULL
-		   AND EXISTS (SELECT 1 FROM schema_migrations WHERE version = 4)`).Scan(&ready); err != nil {
+		   AND EXISTS (SELECT 1 FROM schema_migrations WHERE version = 5)`).Scan(&ready); err != nil {
 		return fmt.Errorf("check database schema: %w", err)
 	}
 	if !ready {
@@ -592,6 +595,12 @@ func (p *Postgres) StartThreadBrief(
 		return domain.ThreadBrief{}, false, err
 	}
 	if _, err := tx.Exec(ctx, `
+		UPDATE thread_finalist_sets
+		SET state = 'cancelled', is_current = FALSE, revision = revision + 1, updated_at = now()
+		WHERE telegram_id = $1 AND is_current AND state = 'ready'`, brief.TelegramID); err != nil {
+		return domain.ThreadBrief{}, false, err
+	}
+	if _, err := tx.Exec(ctx, `
 		UPDATE thread_drafts SET is_current = FALSE, updated_at = now()
 		WHERE telegram_id = $1 AND is_current`, brief.TelegramID); err != nil {
 		return domain.ThreadBrief{}, false, err
@@ -756,6 +765,533 @@ func (p *Postgres) SetThreadBriefMaterial(
 	return brief, nil
 }
 
+func (p *Postgres) CreateThreadFinalistSet(
+	ctx context.Context,
+	input domain.ThreadFinalistSet,
+) (domain.ThreadFinalistSet, bool, error) {
+	if err := input.ValidateForCreate(); err != nil {
+		return domain.ThreadFinalistSet{}, false, err
+	}
+	input.Candidates = normalizedThreadFinalists(input.Candidates)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return domain.ThreadFinalistSet{}, false, err
+	}
+	defer rollback(tx)
+	var owner int64
+	if err := tx.QueryRow(ctx, `SELECT telegram_id FROM users WHERE telegram_id = $1 FOR UPDATE`, input.TelegramID).Scan(&owner); err != nil {
+		return domain.ThreadFinalistSet{}, false, mapNotFound(err)
+	}
+	existing, lookupErr := getThreadFinalistSetByGenerationUpdate(ctx, tx, input.TelegramID, input.GenerationUpdateID, false)
+	if lookupErr == nil {
+		if !sameThreadFinalistGeneration(existing, input) {
+			return domain.ThreadFinalistSet{}, false, ErrThreadFinalistSetState
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.ThreadFinalistSet{}, false, err
+		}
+		return existing, false, nil
+	}
+	if !errors.Is(lookupErr, pgx.ErrNoRows) {
+		return domain.ThreadFinalistSet{}, false, lookupErr
+	}
+	var generationConflict, currentConflict bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM thread_finalist_sets
+			WHERE telegram_id = $1 AND generation_id = $2
+		), EXISTS (
+			SELECT 1 FROM thread_finalist_sets
+			WHERE telegram_id = $1 AND is_current
+		)`, input.TelegramID, input.GenerationID).Scan(&generationConflict, &currentConflict); err != nil {
+		return domain.ThreadFinalistSet{}, false, err
+	}
+	if generationConflict || currentConflict {
+		return domain.ThreadFinalistSet{}, false, ErrThreadFinalistSetState
+	}
+	if input.BaseDraftID == 0 {
+		brief, briefErr := scanThreadBrief(tx.QueryRow(ctx, threadBriefSelect+`
+			WHERE id = $1 AND telegram_id = $2 FOR UPDATE`, input.BriefID, input.TelegramID))
+		if errors.Is(briefErr, pgx.ErrNoRows) {
+			return domain.ThreadFinalistSet{}, false, ErrNotFound
+		}
+		if briefErr != nil {
+			return domain.ThreadFinalistSet{}, false, briefErr
+		}
+		if !brief.Current || brief.State != domain.ThreadBriefMaterialReady || brief.Revision != input.SourceRevision ||
+			brief.Voice != input.Voice || brief.Objective != input.Objective {
+			return domain.ThreadFinalistSet{}, false, ErrThreadBriefState
+		}
+	} else {
+		base, baseErr := scanThreadDraft(tx.QueryRow(ctx, threadDraftSelect+`
+			WHERE id = $1 AND telegram_id = $2 FOR UPDATE`, input.BaseDraftID, input.TelegramID))
+		if errors.Is(baseErr, pgx.ErrNoRows) {
+			return domain.ThreadFinalistSet{}, false, ErrNotFound
+		}
+		if baseErr != nil {
+			return domain.ThreadFinalistSet{}, false, baseErr
+		}
+		if !base.Current || base.Revision != input.SourceRevision ||
+			(base.State != domain.ThreadDraftReady && base.State != domain.ThreadDraftFailed) {
+			return domain.ThreadFinalistSet{}, false, ErrThreadDraftState
+		}
+		if base.Objective.Selectable() && base.Objective != input.Objective {
+			return domain.ThreadFinalistSet{}, false, ErrThreadFinalistSetState
+		}
+		if input.BriefID != 0 && input.BriefID != base.BriefID {
+			return domain.ThreadFinalistSet{}, false, ErrThreadFinalistSetState
+		}
+		input.BriefID = base.BriefID
+		if err := validatePostgresPreservedThreadMedia(ctx, tx, input, base); err != nil {
+			return domain.ThreadFinalistSet{}, false, err
+		}
+	}
+	created, err := scanThreadFinalistSet(tx.QueryRow(ctx, `
+		INSERT INTO thread_finalist_sets (
+			telegram_id, brief_id, base_draft_id, generation_id, generation_update_id,
+			voice, objective, provider, model, source_revision, target_draft_revision,
+			preserve_media_mode, preserve_media_id, state, revision, is_current,
+			selected_position, selection_update_id, selected_draft_id
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+			'ready', 1, TRUE, NULL, NULL, NULL
+		) RETURNING `+threadFinalistSetColumns,
+		input.TelegramID, nullablePositiveInt64(input.BriefID), nullablePositiveInt64(input.BaseDraftID),
+		input.GenerationID, input.GenerationUpdateID, input.Voice, input.Objective, input.Provider, input.Model,
+		input.SourceRevision, input.TargetDraftRevision, input.PreserveMediaMode,
+		nullablePositiveInt64(input.PreserveMediaID),
+	))
+	if err != nil {
+		return domain.ThreadFinalistSet{}, false, err
+	}
+	for _, candidate := range input.Candidates {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO thread_finalists (
+				set_id, position, reviewer_id, goal, objective, scenario_id, mechanism,
+				material_basis, preview_text, recommended, selectable, visual_mode, photo_suggested, photo_query
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+			created.ID, candidate.Position, candidate.ReviewerID, candidate.Goal, candidate.Objective,
+			candidate.ScenarioID, candidate.Mechanism, candidate.MaterialBasis, candidate.Text,
+			candidate.Recommended, candidate.Selectable, candidate.VisualMode, candidate.PhotoSuggested, candidate.PhotoQuery,
+		); err != nil {
+			return domain.ThreadFinalistSet{}, false, err
+		}
+	}
+	if input.BaseDraftID == 0 {
+		tag, updateErr := tx.Exec(ctx, `
+			UPDATE thread_briefs
+			SET state = 'candidates_ready', revision = revision + 1,
+				error_code = '', updated_at = now()
+			WHERE id = $1 AND telegram_id = $2 AND revision = $3 AND is_current
+			  AND state = 'material_ready'`, input.BriefID, input.TelegramID, input.SourceRevision)
+		if updateErr != nil {
+			return domain.ThreadFinalistSet{}, false, updateErr
+		}
+		if tag.RowsAffected() != 1 {
+			return domain.ThreadFinalistSet{}, false, ErrThreadBriefState
+		}
+	} else {
+		tag, updateErr := tx.Exec(ctx, `
+			UPDATE thread_drafts SET is_current = FALSE, updated_at = now()
+			WHERE id = $1 AND telegram_id = $2 AND revision = $3 AND is_current
+			  AND state IN ('draft', 'failed')`, input.BaseDraftID, input.TelegramID, input.SourceRevision)
+		if updateErr != nil {
+			return domain.ThreadFinalistSet{}, false, updateErr
+		}
+		if tag.RowsAffected() != 1 {
+			return domain.ThreadFinalistSet{}, false, ErrThreadDraftState
+		}
+	}
+	created, err = loadThreadFinalists(ctx, tx, created)
+	if err != nil {
+		return domain.ThreadFinalistSet{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.ThreadFinalistSet{}, false, err
+	}
+	return created, true, nil
+}
+
+func (p *Postgres) GetThreadFinalistSet(ctx context.Context, id, telegramID int64) (domain.ThreadFinalistSet, error) {
+	set, err := scanThreadFinalistSet(p.pool.QueryRow(ctx, threadFinalistSetSelect+`
+		WHERE id = $1 AND telegram_id = $2`, id, telegramID))
+	if err != nil {
+		return domain.ThreadFinalistSet{}, mapNotFound(err)
+	}
+	set, err = loadThreadFinalists(ctx, p.pool, set)
+	if err != nil {
+		return domain.ThreadFinalistSet{}, err
+	}
+	return set, nil
+}
+
+func (p *Postgres) GetCurrentThreadFinalistSet(ctx context.Context, telegramID int64) (domain.ThreadFinalistSet, error) {
+	set, err := scanThreadFinalistSet(p.pool.QueryRow(ctx, threadFinalistSetSelect+`
+		WHERE telegram_id = $1 AND is_current`, telegramID))
+	if err != nil {
+		return domain.ThreadFinalistSet{}, mapNotFound(err)
+	}
+	set, err = loadThreadFinalists(ctx, p.pool, set)
+	if err != nil {
+		return domain.ThreadFinalistSet{}, err
+	}
+	return set, nil
+}
+
+func (p *Postgres) GetThreadFinalistSetByGenerationUpdate(
+	ctx context.Context,
+	telegramID, updateID int64,
+) (domain.ThreadFinalistSet, error) {
+	if updateID <= 0 {
+		return domain.ThreadFinalistSet{}, ErrNotFound
+	}
+	set, err := getThreadFinalistSetByGenerationUpdate(ctx, p.pool, telegramID, updateID, false)
+	if err != nil {
+		return domain.ThreadFinalistSet{}, mapNotFound(err)
+	}
+	return set, nil
+}
+
+func (p *Postgres) SelectThreadFinalist(
+	ctx context.Context,
+	setID, telegramID int64,
+	setRevision uint32,
+	position int,
+	selectionUpdateID int64,
+) (domain.ThreadDraft, bool, error) {
+	if setID <= 0 || telegramID <= 0 || setRevision == 0 || setRevision == ^uint32(0) || position < 0 || position >= 5 || selectionUpdateID <= 0 {
+		return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	defer rollback(tx)
+	var owner int64
+	if err := tx.QueryRow(ctx, `SELECT telegram_id FROM users WHERE telegram_id = $1 FOR UPDATE`, telegramID).Scan(&owner); err != nil {
+		return domain.ThreadDraft{}, false, mapNotFound(err)
+	}
+	replay, replayErr := scanThreadFinalistSet(tx.QueryRow(ctx, threadFinalistSetSelect+`
+		WHERE telegram_id = $1 AND selection_update_id = $2`, telegramID, selectionUpdateID))
+	if replayErr == nil {
+		if replay.ID != setID || replay.State != domain.ThreadFinalistSetSelected || replay.SelectedPosition != position {
+			return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+		}
+		draft, draftErr := scanThreadDraft(tx.QueryRow(ctx, threadDraftSelect+`
+			WHERE id = $1 AND telegram_id = $2 AND finalist_set_id = $3`, replay.SelectedDraftID, telegramID, setID))
+		if draftErr != nil {
+			return domain.ThreadDraft{}, false, mapNotFound(draftErr)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.ThreadDraft{}, false, err
+		}
+		return draft, false, nil
+	}
+	if !errors.Is(replayErr, pgx.ErrNoRows) {
+		return domain.ThreadDraft{}, false, replayErr
+	}
+	peek, err := scanThreadFinalistSet(tx.QueryRow(ctx, threadFinalistSetSelect+`
+		WHERE id = $1 AND telegram_id = $2`, setID, telegramID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ThreadDraft{}, false, ErrNotFound
+	}
+	if err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	if peek.BaseDraftID == 0 {
+		if _, err := scanThreadBrief(tx.QueryRow(ctx, threadBriefSelect+`
+			WHERE id = $1 AND telegram_id = $2 FOR UPDATE`, peek.BriefID, telegramID)); err != nil {
+			return domain.ThreadDraft{}, false, mapNotFound(err)
+		}
+	}
+	set, err := scanThreadFinalistSet(tx.QueryRow(ctx, threadFinalistSetSelect+`
+		WHERE id = $1 AND telegram_id = $2 FOR UPDATE`, setID, telegramID))
+	if err != nil {
+		return domain.ThreadDraft{}, false, mapNotFound(err)
+	}
+	set, err = loadThreadFinalists(ctx, tx, set)
+	if err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	if !set.Current || set.State != domain.ThreadFinalistSetReady || set.Revision != setRevision {
+		return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+	}
+	candidate := set.Candidates[position]
+	if candidate.Position != position || !candidate.Selectable {
+		return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+	}
+	if set.BaseDraftID == 0 {
+		brief, briefErr := scanThreadBrief(tx.QueryRow(ctx, threadBriefSelect+`
+			WHERE id = $1 AND telegram_id = $2`, set.BriefID, telegramID))
+		if briefErr != nil {
+			return domain.ThreadDraft{}, false, mapNotFound(briefErr)
+		}
+		if !brief.Current || brief.State != domain.ThreadBriefCandidatesReady || brief.Revision != set.SourceRevision+1 {
+			return domain.ThreadDraft{}, false, ErrThreadBriefState
+		}
+	} else {
+		base, baseErr := scanThreadDraft(tx.QueryRow(ctx, threadDraftSelect+`
+			WHERE id = $1 AND telegram_id = $2 FOR UPDATE`, set.BaseDraftID, telegramID))
+		if baseErr != nil {
+			return domain.ThreadDraft{}, false, mapNotFound(baseErr)
+		}
+		if base.Current || base.Revision != set.SourceRevision ||
+			(base.State != domain.ThreadDraftReady && base.State != domain.ThreadDraftFailed) {
+			return domain.ThreadDraft{}, false, ErrThreadDraftState
+		}
+	}
+	draft := domain.ThreadDraft{
+		TelegramID: telegramID, Voice: set.Voice, Goal: candidate.Goal,
+		BriefID: set.BriefID, FinalistSetID: set.ID, Objective: set.Objective,
+		ScenarioID: candidate.ScenarioID, GenerationID: set.GenerationID,
+		GenerationUpdateID: set.GenerationUpdateID, PhotoQuery: candidate.PhotoQuery,
+		Text: candidate.Text, Provider: set.Provider, Model: set.Model,
+		Revision: set.TargetDraftRevision, MediaMode: domain.ThreadMediaText,
+	}
+	if set.PreserveMediaMode != "" {
+		draft.MediaMode = set.PreserveMediaMode
+		draft.MediaID = set.PreserveMediaID
+	} else if candidate.VisualMode != domain.ThreadFinalistVisualTextOnly {
+		draft.MediaMode = domain.ThreadMediaImagePending
+	}
+	if err := draft.ValidateForCreate(); err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	var hasCurrent bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM thread_drafts WHERE telegram_id = $1 AND is_current
+	)`, telegramID).Scan(&hasCurrent); err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	if hasCurrent {
+		return domain.ThreadDraft{}, false, ErrThreadDraftState
+	}
+	created, err := scanThreadDraft(tx.QueryRow(ctx, `
+		INSERT INTO thread_drafts (
+			telegram_id, voice, goal, brief_id, finalist_set_id, objective, scenario_id,
+			generation_id, generation_update_id, photo_query, preview_text, provider, model,
+			revision, media_mode, media_id, state, is_current
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+			'draft', TRUE
+		) RETURNING `+threadDraftColumns,
+		telegramID, set.Voice, candidate.Goal, nullablePositiveInt64(set.BriefID), set.ID,
+		set.Objective, candidate.ScenarioID, set.GenerationID, set.GenerationUpdateID,
+		candidate.PhotoQuery, candidate.Text, set.Provider, set.Model, set.TargetDraftRevision,
+		draft.MediaMode, nullablePositiveInt64(draft.MediaID),
+	))
+	if err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE thread_finalist_sets
+		SET state = 'selected', is_current = FALSE, selected_position = $4,
+			selection_update_id = $5, selected_draft_id = $6,
+			revision = revision + 1, updated_at = now()
+		WHERE id = $1 AND telegram_id = $2 AND revision = $3
+		  AND is_current AND state = 'ready'`, setID, telegramID, setRevision, position, selectionUpdateID, created.ID)
+	if err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	if tag.RowsAffected() != 1 {
+		return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+	}
+	if set.BaseDraftID == 0 {
+		tag, err = tx.Exec(ctx, `
+			UPDATE thread_briefs
+			SET state = 'draft_ready', revision = revision + 1, error_code = '', updated_at = now()
+			WHERE id = $1 AND telegram_id = $2 AND revision = $3 AND is_current
+			  AND state = 'candidates_ready'`, set.BriefID, telegramID, set.SourceRevision+1)
+		if err != nil {
+			return domain.ThreadDraft{}, false, err
+		}
+		if tag.RowsAffected() != 1 {
+			return domain.ThreadDraft{}, false, ErrThreadBriefState
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	return created, true, nil
+}
+
+func (p *Postgres) CancelThreadFinalistSet(
+	ctx context.Context,
+	setID, telegramID int64,
+	setRevision uint32,
+) (domain.ThreadDraft, bool, error) {
+	if setID <= 0 || telegramID <= 0 || setRevision == 0 || setRevision == ^uint32(0) {
+		return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	defer rollback(tx)
+	var owner int64
+	if err := tx.QueryRow(ctx, `SELECT telegram_id FROM users WHERE telegram_id = $1 FOR UPDATE`, telegramID).Scan(&owner); err != nil {
+		return domain.ThreadDraft{}, false, mapNotFound(err)
+	}
+	peek, err := scanThreadFinalistSet(tx.QueryRow(ctx, threadFinalistSetSelect+`
+		WHERE id = $1 AND telegram_id = $2`, setID, telegramID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ThreadDraft{}, false, ErrNotFound
+	}
+	if err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	if peek.BaseDraftID == 0 {
+		if _, err := scanThreadBrief(tx.QueryRow(ctx, threadBriefSelect+`
+			WHERE id = $1 AND telegram_id = $2 FOR UPDATE`, peek.BriefID, telegramID)); err != nil {
+			return domain.ThreadDraft{}, false, mapNotFound(err)
+		}
+	}
+	set, err := scanThreadFinalistSet(tx.QueryRow(ctx, threadFinalistSetSelect+`
+		WHERE id = $1 AND telegram_id = $2 FOR UPDATE`, setID, telegramID))
+	if err != nil {
+		return domain.ThreadDraft{}, false, mapNotFound(err)
+	}
+	set, err = loadThreadFinalists(ctx, tx, set)
+	if err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	if set.State == domain.ThreadFinalistSetCancelled && set.Revision == setRevision+1 {
+		if set.BaseDraftID == 0 {
+			var hasCurrentWorkflow bool
+			if err := tx.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1 FROM thread_briefs WHERE telegram_id = $1 AND is_current
+				) OR EXISTS (
+					SELECT 1 FROM thread_finalist_sets WHERE telegram_id = $1 AND is_current
+				) OR EXISTS (
+					SELECT 1 FROM thread_drafts WHERE telegram_id = $1 AND is_current
+				)`, telegramID).Scan(&hasCurrentWorkflow); err != nil {
+				return domain.ThreadDraft{}, false, err
+			}
+			if hasCurrentWorkflow {
+				return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return domain.ThreadDraft{}, false, err
+			}
+			return domain.ThreadDraft{}, false, nil
+		}
+		base, baseErr := scanThreadDraft(tx.QueryRow(ctx, threadDraftSelect+`
+			WHERE id = $1 AND telegram_id = $2`, set.BaseDraftID, telegramID))
+		if baseErr != nil {
+			return domain.ThreadDraft{}, false, mapNotFound(baseErr)
+		}
+		if !base.Current || base.Revision != set.SourceRevision ||
+			(base.State != domain.ThreadDraftReady && base.State != domain.ThreadDraftFailed) {
+			return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.ThreadDraft{}, false, err
+		}
+		return base, true, nil
+	}
+	if !set.Current || set.State != domain.ThreadFinalistSetReady || set.Revision != setRevision {
+		return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+	}
+	var restored domain.ThreadDraft
+	restoredOK := false
+	if set.BaseDraftID == 0 {
+		brief, briefErr := scanThreadBrief(tx.QueryRow(ctx, threadBriefSelect+`
+			WHERE id = $1 AND telegram_id = $2`, set.BriefID, telegramID))
+		if briefErr != nil {
+			return domain.ThreadDraft{}, false, mapNotFound(briefErr)
+		}
+		if !brief.Current || brief.State != domain.ThreadBriefCandidatesReady || brief.Revision != set.SourceRevision+1 {
+			return domain.ThreadDraft{}, false, ErrThreadBriefState
+		}
+		tag, updateErr := tx.Exec(ctx, `
+			UPDATE thread_briefs
+			SET state = 'cancelled', is_current = FALSE, revision = revision + 1,
+				error_code = '', updated_at = now()
+			WHERE id = $1 AND telegram_id = $2 AND revision = $3 AND is_current
+			  AND state = 'candidates_ready'`, set.BriefID, telegramID, set.SourceRevision+1)
+		if updateErr != nil {
+			return domain.ThreadDraft{}, false, updateErr
+		}
+		if tag.RowsAffected() != 1 {
+			return domain.ThreadDraft{}, false, ErrThreadBriefState
+		}
+	} else {
+		base, baseErr := scanThreadDraft(tx.QueryRow(ctx, threadDraftSelect+`
+			WHERE id = $1 AND telegram_id = $2 FOR UPDATE`, set.BaseDraftID, telegramID))
+		if baseErr != nil {
+			return domain.ThreadDraft{}, false, mapNotFound(baseErr)
+		}
+		if base.Current || base.Revision != set.SourceRevision ||
+			(base.State != domain.ThreadDraftReady && base.State != domain.ThreadDraftFailed) {
+			return domain.ThreadDraft{}, false, ErrThreadDraftState
+		}
+		var hasCurrent bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM thread_drafts WHERE telegram_id = $1 AND is_current
+		)`, telegramID).Scan(&hasCurrent); err != nil {
+			return domain.ThreadDraft{}, false, err
+		}
+		if hasCurrent {
+			return domain.ThreadDraft{}, false, ErrThreadDraftState
+		}
+		updated, updateErr := scanThreadDraft(tx.QueryRow(ctx, `
+			UPDATE thread_drafts SET is_current = TRUE, updated_at = now()
+			WHERE id = $1 AND telegram_id = $2 AND revision = $3 AND NOT is_current
+			  AND state IN ('draft', 'failed')
+			RETURNING `+threadDraftColumns, set.BaseDraftID, telegramID, set.SourceRevision))
+		if updateErr != nil {
+			return domain.ThreadDraft{}, false, mapNotFound(updateErr)
+		}
+		restored, restoredOK = updated, true
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE thread_finalist_sets
+		SET state = 'cancelled', is_current = FALSE, revision = revision + 1, updated_at = now()
+		WHERE id = $1 AND telegram_id = $2 AND revision = $3
+		  AND is_current AND state = 'ready'`, setID, telegramID, setRevision)
+	if err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	if tag.RowsAffected() != 1 {
+		return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.ThreadDraft{}, false, err
+	}
+	return restored, restoredOK, nil
+}
+
+func validatePostgresPreservedThreadMedia(
+	ctx context.Context,
+	tx pgx.Tx,
+	set domain.ThreadFinalistSet,
+	base domain.ThreadDraft,
+) error {
+	if set.PreserveMediaMode == "" {
+		return nil
+	}
+	if base.MediaMode != set.PreserveMediaMode || base.MediaID != set.PreserveMediaID {
+		return ErrThreadDraftState
+	}
+	if set.PreserveMediaMode == domain.ThreadMediaImagePending && set.PreserveMediaID == 0 {
+		return nil
+	}
+	var sourceKind domain.ThreadMediaSource
+	var attachUpdateID sql.NullInt64
+	if err := tx.QueryRow(ctx, `
+		SELECT source_kind, attach_update_id FROM thread_media
+		WHERE id = $1 AND telegram_id = $2 FOR SHARE`, set.PreserveMediaID, set.TelegramID,
+	).Scan(&sourceKind, &attachUpdateID); err != nil {
+		return mapNotFound(err)
+	}
+	if sourceKind != domain.ThreadMediaSourceTelegram &&
+		!(sourceKind == domain.ThreadMediaSourcePexels && attachUpdateID.Valid) {
+		return ErrThreadDraftState
+	}
+	return nil
+}
+
 func (p *Postgres) CreateThreadDraftForBrief(
 	ctx context.Context,
 	briefID int64,
@@ -765,6 +1301,9 @@ func (p *Postgres) CreateThreadDraftForBrief(
 ) (domain.ThreadDraft, bool, error) {
 	if briefID <= 0 || draft.TelegramID <= 0 || draft.GenerationUpdateID <= 0 || briefRevision == ^uint32(0) {
 		return domain.ThreadDraft{}, false, ErrThreadBriefState
+	}
+	if draft.FinalistSetID != 0 {
+		return domain.ThreadDraft{}, false, ErrThreadFinalistSetState
 	}
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
@@ -950,10 +1489,19 @@ func (p *Postgres) CancelThreadBrief(ctx context.Context, id, telegramID int64, 
 		  AND state IN ('draft', 'failed')`, id, telegramID); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE thread_finalist_sets
+		SET state = 'cancelled', is_current = FALSE, revision = revision + 1, updated_at = now()
+		WHERE brief_id = $1 AND telegram_id = $2 AND is_current AND state = 'ready'`, id, telegramID); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
 func (p *Postgres) CreateThreadDraft(ctx context.Context, draft domain.ThreadDraft) (int64, error) {
+	if draft.FinalistSetID != 0 {
+		return 0, ErrThreadFinalistSetState
+	}
 	draft = normalizeLegacyThreadDraft(draft)
 	if err := draft.ValidateForCreate(); err != nil {
 		return 0, err
@@ -1024,6 +1572,9 @@ func (p *Postgres) CreateThreadDraft(ctx context.Context, draft domain.ThreadDra
 }
 
 func (p *Postgres) CreateThreadDraftWithMedia(ctx context.Context, draft domain.ThreadDraft, mediaValue domain.ThreadMedia) (int64, error) {
+	if draft.FinalistSetID != 0 {
+		return 0, ErrThreadFinalistSetState
+	}
 	draft = normalizeLegacyThreadDraft(draft)
 	if draft.MediaMode != domain.ThreadMediaImage || draft.MediaID != 0 || mediaValue.TelegramID != draft.TelegramID ||
 		mediaValue.AttachUpdateID != 0 {
@@ -1952,20 +2503,45 @@ func (p *Postgres) Cleanup(ctx context.Context, before time.Time) (int64, error)
 	}
 	rows.Close()
 	if _, err := tx.Exec(ctx, `
+		DELETE FROM thread_finalist_sets AS finalist_set
+		WHERE finalist_set.updated_at < $1
+		  AND NOT EXISTS (
+			SELECT 1 FROM thread_drafts AS selected_draft
+			WHERE selected_draft.id = finalist_set.selected_draft_id
+			  AND selected_draft.updated_at >= $1
+		  )`, before); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `
 		DELETE FROM thread_briefs AS brief
 		WHERE brief.updated_at < $1
 		  AND NOT EXISTS (
 			SELECT 1 FROM thread_drafts AS draft
 			WHERE draft.brief_id = brief.id AND draft.updated_at >= $1
-			  )`, before); err != nil {
+			  )
+		  AND NOT EXISTS (
+			SELECT 1 FROM thread_finalist_sets AS finalist_set
+			WHERE finalist_set.brief_id = brief.id
+		  )`, before); err != nil {
 		return 0, err
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM thread_drafts WHERE updated_at < $1`, before); err != nil {
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM thread_drafts AS draft
+		WHERE draft.updated_at < $1
+		  AND NOT EXISTS (
+			SELECT 1 FROM thread_finalist_sets AS finalist_set
+			WHERE finalist_set.base_draft_id = draft.id
+			   OR finalist_set.selected_draft_id = draft.id
+		  )`, before); err != nil {
 		return 0, err
 	}
 	if _, err := tx.Exec(ctx, `
 		DELETE FROM thread_media AS media
-		WHERE NOT EXISTS (SELECT 1 FROM thread_drafts AS draft WHERE draft.media_id = media.id)`); err != nil {
+		WHERE NOT EXISTS (SELECT 1 FROM thread_drafts AS draft WHERE draft.media_id = media.id)
+		  AND NOT EXISTS (
+			SELECT 1 FROM thread_finalist_sets AS finalist_set
+			WHERE finalist_set.preserve_media_id = media.id
+		  )`); err != nil {
 		return 0, err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM processed_updates WHERE processed_at < $1`, before); err != nil {
@@ -2022,7 +2598,7 @@ func rollback(tx pgx.Tx) {
 }
 
 const threadDraftColumns = `
-	id, telegram_id, voice, goal, brief_id, objective, scenario_id, generation_id,
+	id, telegram_id, voice, goal, brief_id, finalist_set_id, objective, scenario_id, generation_id,
 	generation_update_id, photo_query, preview_text, provider, model, revision,
 	media_mode, media_id, media_rights_confirmed_at,
 	state, is_current, container_id, post_id, permalink, error_code,
@@ -2039,10 +2615,11 @@ func scanThreadDraft(row threadDraftScanner) (domain.ThreadDraft, error) {
 	var draft domain.ThreadDraft
 	var revision int64
 	var briefID sql.NullInt64
+	var finalistSetID sql.NullInt64
 	var generationUpdateID sql.NullInt64
 	var mediaID sql.NullInt64
 	err := row.Scan(
-		&draft.ID, &draft.TelegramID, &draft.Voice, &draft.Goal, &briefID, &draft.Objective,
+		&draft.ID, &draft.TelegramID, &draft.Voice, &draft.Goal, &briefID, &finalistSetID, &draft.Objective,
 		&draft.ScenarioID, &draft.GenerationID, &generationUpdateID, &draft.PhotoQuery, &draft.Text,
 		&draft.Provider, &draft.Model, &revision, &draft.MediaMode, &mediaID,
 		&draft.MediaRightsConfirmedAt, &draft.State, &draft.Current,
@@ -2057,6 +2634,9 @@ func scanThreadDraft(row threadDraftScanner) (domain.ThreadDraft, error) {
 		draft.Revision = uint32(revision)
 		if briefID.Valid {
 			draft.BriefID = briefID.Int64
+		}
+		if finalistSetID.Valid {
+			draft.FinalistSetID = finalistSetID.Int64
 		}
 		if generationUpdateID.Valid {
 			draft.GenerationUpdateID = generationUpdateID.Int64
@@ -2098,6 +2678,125 @@ func scanThreadBrief(row threadDraftScanner) (domain.ThreadBrief, error) {
 		return domain.ThreadBrief{}, fmt.Errorf("invalid persisted thread brief: %w", err)
 	}
 	return brief, nil
+}
+
+const threadFinalistSetColumns = `
+	id, telegram_id, brief_id, base_draft_id, generation_id, generation_update_id,
+	voice, objective, provider, model, source_revision, target_draft_revision,
+	preserve_media_mode, preserve_media_id, state, revision, is_current,
+	selected_position, selection_update_id, selected_draft_id, created_at, updated_at`
+
+const threadFinalistSetSelect = `SELECT ` + threadFinalistSetColumns + ` FROM thread_finalist_sets`
+
+type threadFinalistQuerier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func scanThreadFinalistSet(row threadDraftScanner) (domain.ThreadFinalistSet, error) {
+	var set domain.ThreadFinalistSet
+	var briefID sql.NullInt64
+	var baseDraftID sql.NullInt64
+	var preserveMediaID sql.NullInt64
+	var selectedPosition sql.NullInt16
+	var selectionUpdateID sql.NullInt64
+	var selectedDraftID sql.NullInt64
+	var sourceRevision int64
+	var targetDraftRevision int64
+	var revision int64
+	err := row.Scan(
+		&set.ID, &set.TelegramID, &briefID, &baseDraftID, &set.GenerationID,
+		&set.GenerationUpdateID, &set.Voice, &set.Objective, &set.Provider, &set.Model,
+		&sourceRevision, &targetDraftRevision, &set.PreserveMediaMode, &preserveMediaID,
+		&set.State, &revision, &set.Current, &selectedPosition, &selectionUpdateID,
+		&selectedDraftID, &set.CreatedAt, &set.UpdatedAt,
+	)
+	if err != nil {
+		return domain.ThreadFinalistSet{}, err
+	}
+	if sourceRevision < 1 || uint64(sourceRevision) > uint64(^uint32(0)) ||
+		targetDraftRevision < 1 || uint64(targetDraftRevision) > uint64(^uint32(0)) ||
+		revision < 1 || uint64(revision) > uint64(^uint32(0)) {
+		return domain.ThreadFinalistSet{}, fmt.Errorf("invalid persisted thread finalist set revision")
+	}
+	set.SourceRevision = uint32(sourceRevision)
+	set.TargetDraftRevision = uint32(targetDraftRevision)
+	set.Revision = uint32(revision)
+	set.SelectedPosition = -1
+	if briefID.Valid {
+		set.BriefID = briefID.Int64
+	}
+	if baseDraftID.Valid {
+		set.BaseDraftID = baseDraftID.Int64
+	}
+	if preserveMediaID.Valid {
+		set.PreserveMediaID = preserveMediaID.Int64
+	}
+	if selectedPosition.Valid {
+		set.SelectedPosition = int(selectedPosition.Int16)
+	}
+	if selectionUpdateID.Valid {
+		set.SelectionUpdateID = selectionUpdateID.Int64
+	}
+	if selectedDraftID.Valid {
+		set.SelectedDraftID = selectedDraftID.Int64
+	}
+	return set, nil
+}
+
+func loadThreadFinalists(
+	ctx context.Context,
+	queryer threadFinalistQuerier,
+	set domain.ThreadFinalistSet,
+) (domain.ThreadFinalistSet, error) {
+	rows, err := queryer.Query(ctx, `
+		SELECT position, reviewer_id, goal, objective, scenario_id, mechanism,
+			material_basis, preview_text, recommended, selectable, visual_mode, photo_suggested, photo_query
+		FROM thread_finalists
+		WHERE set_id = $1
+		ORDER BY position`, set.ID)
+	if err != nil {
+		return domain.ThreadFinalistSet{}, err
+	}
+	defer rows.Close()
+	set.Candidates = make([]domain.ThreadFinalist, 0, 5)
+	for rows.Next() {
+		var candidate domain.ThreadFinalist
+		if err := rows.Scan(
+			&candidate.Position, &candidate.ReviewerID, &candidate.Goal, &candidate.Objective,
+			&candidate.ScenarioID, &candidate.Mechanism, &candidate.MaterialBasis, &candidate.Text,
+			&candidate.Recommended, &candidate.Selectable, &candidate.VisualMode,
+			&candidate.PhotoSuggested, &candidate.PhotoQuery,
+		); err != nil {
+			return domain.ThreadFinalistSet{}, err
+		}
+		set.Candidates = append(set.Candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return domain.ThreadFinalistSet{}, err
+	}
+	if err := set.Validate(); err != nil {
+		return domain.ThreadFinalistSet{}, fmt.Errorf("invalid persisted thread finalist set: %w", err)
+	}
+	return set, nil
+}
+
+func getThreadFinalistSetByGenerationUpdate(
+	ctx context.Context,
+	queryer threadFinalistQuerier,
+	telegramID, updateID int64,
+	forUpdate bool,
+) (domain.ThreadFinalistSet, error) {
+	query := threadFinalistSetSelect + `
+		WHERE telegram_id = $1 AND generation_update_id = $2`
+	if forUpdate {
+		query += ` FOR UPDATE`
+	}
+	set, err := scanThreadFinalistSet(queryer.QueryRow(ctx, query, telegramID, updateID))
+	if err != nil {
+		return domain.ThreadFinalistSet{}, err
+	}
+	return loadThreadFinalists(ctx, queryer, set)
 }
 
 const threadMediaColumns = `
