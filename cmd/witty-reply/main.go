@@ -21,6 +21,7 @@ import (
 	"github.com/aleka7sk/witty-reply/internal/session"
 	"github.com/aleka7sk/witty-reply/internal/store"
 	"github.com/aleka7sk/witty-reply/internal/telegram"
+	"github.com/aleka7sk/witty-reply/internal/threadmedia"
 	threadspub "github.com/aleka7sk/witty-reply/internal/threads"
 	"github.com/aleka7sk/witty-reply/internal/transcribe"
 )
@@ -101,6 +102,18 @@ func runContext(ctx context.Context) error {
 	if renderErr != nil {
 		logger.Warn("meme renderer disabled", "error", renderErr)
 	}
+	threadsMediaBaseURL := cfg.Belcanto.ThreadsMediaBaseURL
+	if threadsMediaBaseURL == "" && cfg.Belcanto.ThreadsProvider == "fake" {
+		// The fake publisher validates the complete image flow but never fetches
+		// the URL. A reserved domain keeps local smoke tests zero-risk.
+		threadsMediaBaseURL = "https://media.invalid"
+	}
+	threadsMedia, err := threadmedia.New(
+		threadsMediaBaseURL, []byte(cfg.Telegram.CallbackSecret), threadmedia.DefaultURLTTL, dataStore,
+	)
+	if err != nil {
+		return fmt.Errorf("create Threads media gateway: %w", err)
+	}
 
 	service, err := bot.NewService(
 		telegramClient, provider, transcriber, dataStore, sessions, callbacks, safetyFilter, renderer, metrics, logger,
@@ -108,6 +121,7 @@ func runContext(ctx context.Context) error {
 			ProviderTimeout: cfg.AI.Timeout, UsageLocation: usageLocation, CallbackSecret: cfg.Telegram.CallbackSecret,
 			PrivacyURL: cfg.PrivacyURL, SpeechProvider: cfg.Speech.Provider,
 			BelcantoOperatorIDs: cfg.Belcanto.OperatorIDs, ThreadsPublisher: threadsPublisher,
+			ThreadMediaURL: threadsMedia.PublicURL,
 			Limits: bot.Limits{
 				TextDaily: cfg.Limits.TextDaily, MediaDaily: cfg.Limits.MediaDaily, MemeDaily: cfg.Limits.MemeDaily,
 				RefinementDaily: cfg.Limits.RefinementDaily, StyleExamples: cfg.Limits.StyleExamples,
@@ -140,7 +154,7 @@ func runContext(ctx context.Context) error {
 	server := httpserver.New(httpserver.Config{
 		Address: cfg.HTTP.Address, ReadTimeout: cfg.HTTP.ReadTimeout, WriteTimeout: cfg.HTTP.WriteTimeout,
 		IdleTimeout: cfg.HTTP.IdleTimeout, WebhookPath: cfg.Telegram.WebhookPath, Environment: cfg.Environment,
-	}, webhookHandler, metrics.Handler(), dataStore.Ping, logger)
+	}, webhookHandler, threadsMedia, metrics.Handler(), dataStore.Ping, logger)
 	serverErrors := make(chan error, 1)
 	go func() {
 		logger.Info("HTTP server listening", "address", cfg.HTTP.Address)

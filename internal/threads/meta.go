@@ -131,6 +131,43 @@ func (client *Meta) CreateText(ctx context.Context, text, replyToID string) (str
 	return id, nil
 }
 
+func (client *Meta) CreateImage(ctx context.Context, text, imageURL, replyToID string) (string, error) {
+	const operation = "create_image"
+	if client == nil {
+		return "", configOperationError(operation)
+	}
+	if err := validateText(text, operation); err != nil {
+		return "", err
+	}
+	if err := validateImageURL(imageURL, operation); err != nil {
+		return "", err
+	}
+	if err := validateOptionalID(replyToID, operation); err != nil {
+		return "", err
+	}
+
+	form := url.Values{
+		"access_token": {client.accessToken},
+		"media_type":   {"IMAGE"},
+		"image_url":    {strings.TrimSpace(imageURL)},
+		"text":         {text},
+	}
+	if replyToID = strings.TrimSpace(replyToID); replyToID != "" {
+		form.Set("reply_to_id", replyToID)
+	}
+	// Container creation cannot publish content. A lost response may leave an
+	// unpublished orphan container, so creating a replacement is safe.
+	body, err := client.doForm(ctx, operation, client.userEndpoint("threads"), form, false)
+	if err != nil {
+		return "", err
+	}
+	id, err := decodeID(body)
+	if err != nil {
+		return "", &Error{Operation: operation, Code: CodeInvalidResponse, Class: Definite}
+	}
+	return id, nil
+}
+
 func (client *Meta) ContainerStatus(ctx context.Context, id string) (Status, error) {
 	const operation = "container_status"
 	if client == nil {

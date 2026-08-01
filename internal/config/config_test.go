@@ -72,6 +72,63 @@ func TestMetaThreadsRequiresCredentialsAndOperators(t *testing.T) {
 	}
 }
 
+func TestMetaThreadsTextOnlyConfigDoesNotRequirePublicMediaOrigin(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", strings.Repeat("x", 32))
+	t.Setenv("TELEGRAM_CALLBACK_SECRET", strings.Repeat("y", 32))
+	t.Setenv("AI_PROVIDER", "fake")
+	t.Setenv("STORE_DRIVER", "memory")
+	t.Setenv("BELCANTO_OPERATOR_IDS", "42")
+	t.Setenv("THREADS_PROVIDER", "meta")
+	t.Setenv("THREADS_USER_ID", "17840000000000000")
+	t.Setenv("THREADS_ACCESS_TOKEN", "token")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("text-only Meta config was rejected: %v", err)
+	}
+	if cfg.Belcanto.ThreadsMediaBaseURL != "" {
+		t.Fatalf("media base URL = %q, want empty", cfg.Belcanto.ThreadsMediaBaseURL)
+	}
+}
+
+func TestThreadsMediaBaseURLUsesWebhookOriginAndRejectsPaths(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", strings.Repeat("x", 32))
+	t.Setenv("TELEGRAM_CALLBACK_SECRET", strings.Repeat("y", 32))
+	t.Setenv("AI_PROVIDER", "fake")
+	t.Setenv("STORE_DRIVER", "memory")
+	t.Setenv("TELEGRAM_WEBHOOK_URL", "https://bot.example.com")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Belcanto.ThreadsMediaBaseURL != "https://bot.example.com" {
+		t.Fatalf("media base URL = %q", cfg.Belcanto.ThreadsMediaBaseURL)
+	}
+
+	t.Setenv("THREADS_MEDIA_BASE_URL", "https://bot.example.com/private/path")
+	_, err = Load()
+	if err == nil || !strings.Contains(err.Error(), "THREADS_MEDIA_BASE_URL") {
+		t.Fatalf("invalid media base URL error = %v", err)
+	}
+}
+
+func TestDisabledThreadsIgnoresPathfulWebhookForMediaFallback(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", strings.Repeat("x", 32))
+	t.Setenv("TELEGRAM_CALLBACK_SECRET", strings.Repeat("y", 32))
+	t.Setenv("AI_PROVIDER", "fake")
+	t.Setenv("STORE_DRIVER", "memory")
+	t.Setenv("TELEGRAM_WEBHOOK_URL", "https://bot.example.com/base")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("disabled Threads config rejected a pathful webhook base: %v", err)
+	}
+	if cfg.Belcanto.ThreadsMediaBaseURL != "" {
+		t.Fatalf("media base URL = %q, want no unsafe fallback", cfg.Belcanto.ThreadsMediaBaseURL)
+	}
+}
+
 func TestValidateProductionRequirements(t *testing.T) {
 	t.Setenv("TELEGRAM_BOT_TOKEN", strings.Repeat("x", 32))
 	t.Setenv("TELEGRAM_CALLBACK_SECRET", strings.Repeat("y", 32))

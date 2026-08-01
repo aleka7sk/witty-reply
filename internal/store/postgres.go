@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -71,6 +72,7 @@ func (p *Postgres) Ping(ctx context.Context) error {
 		   AND to_regclass('telegram_update_jobs') IS NOT NULL
 		   AND to_regclass('quota_reservations') IS NOT NULL
 		   AND to_regclass('generations') IS NOT NULL
+		   AND to_regclass('thread_media') IS NOT NULL
 		   AND to_regclass('thread_drafts') IS NOT NULL
 		   AND EXISTS (SELECT 1 FROM schema_migrations WHERE version = 1)`).Scan(&ready); err != nil {
 		return fmt.Errorf("check database schema: %w", err)
@@ -498,6 +500,9 @@ func (p *Postgres) CreateThreadDraft(ctx context.Context, draft domain.ThreadDra
 	if err := draft.ValidateForCreate(); err != nil {
 		return 0, err
 	}
+	if draft.MediaMode == "" {
+		draft.MediaMode = domain.ThreadMediaText
+	}
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
@@ -506,6 +511,15 @@ func (p *Postgres) CreateThreadDraft(ctx context.Context, draft domain.ThreadDra
 	var owner int64
 	if err := tx.QueryRow(ctx, `SELECT telegram_id FROM users WHERE telegram_id = $1 FOR UPDATE`, draft.TelegramID).Scan(&owner); err != nil {
 		return 0, mapNotFound(err)
+	}
+	if draft.MediaID > 0 {
+		var mediaOwner int64
+		if err := tx.QueryRow(ctx, `SELECT telegram_id FROM thread_media WHERE id = $1 FOR SHARE`, draft.MediaID).Scan(&mediaOwner); err != nil {
+			return 0, mapNotFound(err)
+		}
+		if mediaOwner != draft.TelegramID {
+			return 0, ErrNotFound
+		}
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE thread_drafts SET is_current = FALSE, updated_at = now()
@@ -516,10 +530,11 @@ func (p *Postgres) CreateThreadDraft(ctx context.Context, draft domain.ThreadDra
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO thread_drafts (
 			telegram_id, voice, goal, preview_text, provider, model,
-			revision, state, is_current
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', TRUE)
+			revision, media_mode, media_id, state, is_current
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'draft', TRUE)
 		RETURNING id`,
 		draft.TelegramID, draft.Voice, draft.Goal, draft.Text, draft.Provider, draft.Model, draft.Revision,
+		draft.MediaMode, nullablePositiveInt64(draft.MediaID),
 	).Scan(&id); err != nil {
 		return 0, err
 	}
@@ -531,6 +546,190 @@ func (p *Postgres) CreateThreadDraft(ctx context.Context, draft domain.ThreadDra
 
 func (p *Postgres) GetThreadDraft(ctx context.Context, id, telegramID int64) (domain.ThreadDraft, error) {
 	draft, err := scanThreadDraft(p.pool.QueryRow(ctx, threadDraftSelect+` WHERE id = $1 AND telegram_id = $2`, id, telegramID))
+	if err != nil {
+		return domain.ThreadDraft{}, mapNotFound(err)
+	}
+	return draft, nil
+}
+
+func (p *Postgres) GetCurrentThreadDraft(ctx context.Context, telegramID int64) (domain.ThreadDraft, error) {
+	draft, err := scanThreadDraft(p.pool.QueryRow(ctx, threadDraftSelect+` WHERE telegram_id = $1 AND is_current`, telegramID))
+	if err != nil {
+		return domain.ThreadDraft{}, mapNotFound(err)
+	}
+	return draft, nil
+}
+
+func (p *Postgres) SetThreadDraftMediaMode(
+	ctx context.Context,
+	id, telegramID int64,
+	revision uint32,
+	mode domain.ThreadMediaMode,
+) (domain.ThreadDraft, error) {
+	if mode != domain.ThreadMediaText && mode != domain.ThreadMediaImagePending && mode != domain.ThreadMediaImage {
+		return domain.ThreadDraft{}, ErrThreadDraftState
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	defer rollback(tx)
+	draft, err := scanThreadDraft(tx.QueryRow(ctx, `
+		UPDATE thread_drafts
+		SET revision = revision + 1,
+			media_mode = $5,
+			media_id = CASE WHEN $5 = 'text' THEN NULL ELSE media_id END,
+			media_rights_confirmed_at = NULL,
+			state = 'draft', container_id = '', post_id = '', permalink = '',
+			error_code = '', claim_token = '', claim_expires_at = NULL,
+			publish_started_at = NULL, published_at = NULL, updated_at = now()
+		WHERE id = $1 AND telegram_id = $2 AND revision = $3
+		  AND is_current AND revision < $4 AND state IN ('draft', 'failed')
+		  AND ($5 <> 'image' OR (media_mode = 'image_pending' AND media_id IS NOT NULL))
+		RETURNING `+threadDraftColumns,
+		id, telegramID, revision, int64(^uint32(0)), mode,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		if _, lookupErr := scanThreadDraft(tx.QueryRow(
+			ctx, threadDraftSelect+` WHERE id = $1 AND telegram_id = $2`, id, telegramID,
+		)); lookupErr != nil {
+			return domain.ThreadDraft{}, mapNotFound(lookupErr)
+		}
+		return domain.ThreadDraft{}, ErrThreadDraftState
+	}
+	if err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM thread_media AS media
+		WHERE media.telegram_id = $1
+		  AND NOT EXISTS (SELECT 1 FROM thread_drafts AS draft WHERE draft.media_id = media.id)`, telegramID); err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	return draft, nil
+}
+
+func (p *Postgres) AttachThreadDraftMedia(
+	ctx context.Context,
+	id, telegramID int64,
+	revision uint32,
+	mediaValue domain.ThreadMedia,
+) (domain.ThreadDraft, error) {
+	if mediaValue.TelegramID != telegramID {
+		return domain.ThreadDraft{}, ErrNotFound
+	}
+	if err := mediaValue.ValidateForStore(); err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	defer rollback(tx)
+	var mediaID int64
+	insertErr := tx.QueryRow(ctx, `
+		INSERT INTO thread_media (
+			telegram_id, source_update_id, content, media_type,
+			width, height, digest, delivery_key
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (telegram_id, source_update_id) DO NOTHING
+		RETURNING id`,
+		mediaValue.TelegramID, mediaValue.SourceUpdateID, mediaValue.Data, mediaValue.MediaType,
+		mediaValue.Width, mediaValue.Height, mediaValue.Digest, mediaValue.DeliveryKey,
+	).Scan(&mediaID)
+	if errors.Is(insertErr, pgx.ErrNoRows) {
+		// The Telegram update was already committed. It is an idempotent retry
+		// only for the exact draft that owns that attachment; never move a replay
+		// to a later draft merely because the owner is the same.
+		if err := tx.QueryRow(ctx, `
+			SELECT id FROM thread_media
+			WHERE telegram_id = $1 AND source_update_id = $2
+			FOR SHARE`, telegramID, mediaValue.SourceUpdateID).Scan(&mediaID); err != nil {
+			return domain.ThreadDraft{}, mapNotFound(err)
+		}
+		draft, err := scanThreadDraft(tx.QueryRow(ctx, threadDraftSelect+`
+			WHERE id = $1 AND telegram_id = $2 AND media_id = $3`, id, telegramID, mediaID))
+		if err == nil {
+			return draft, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return domain.ThreadDraft{}, err
+		}
+		if _, lookupErr := scanThreadDraft(tx.QueryRow(
+			ctx, threadDraftSelect+` WHERE id = $1 AND telegram_id = $2`, id, telegramID,
+		)); lookupErr != nil {
+			return domain.ThreadDraft{}, mapNotFound(lookupErr)
+		}
+		return domain.ThreadDraft{}, ErrThreadDraftState
+	}
+	if insertErr != nil {
+		return domain.ThreadDraft{}, insertErr
+	}
+	draft, err := scanThreadDraft(tx.QueryRow(ctx, `
+		UPDATE thread_drafts
+		SET revision = revision + 1, media_mode = 'image', media_id = $5,
+			media_rights_confirmed_at = NULL,
+			state = 'draft', container_id = '', post_id = '', permalink = '',
+			error_code = '', claim_token = '', claim_expires_at = NULL,
+			publish_started_at = NULL, published_at = NULL, updated_at = now()
+		WHERE id = $1 AND telegram_id = $2 AND revision = $3
+		  AND is_current AND revision < $4 AND media_mode = 'image_pending'
+		  AND state IN ('draft', 'failed')
+		RETURNING `+threadDraftColumns,
+		id, telegramID, revision, int64(^uint32(0)), mediaID,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		if _, lookupErr := scanThreadDraft(tx.QueryRow(
+			ctx, threadDraftSelect+` WHERE id = $1 AND telegram_id = $2`, id, telegramID,
+		)); lookupErr != nil {
+			return domain.ThreadDraft{}, mapNotFound(lookupErr)
+		}
+		return domain.ThreadDraft{}, ErrThreadDraftState
+	}
+	if err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM thread_media AS media
+		WHERE media.telegram_id = $1
+		  AND NOT EXISTS (SELECT 1 FROM thread_drafts AS current_draft WHERE current_draft.media_id = media.id)`, telegramID); err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.ThreadDraft{}, err
+	}
+	return draft, nil
+}
+
+func (p *Postgres) GetThreadMedia(ctx context.Context, id, telegramID int64) (domain.ThreadMedia, error) {
+	mediaValue, err := scanThreadMedia(p.pool.QueryRow(ctx, threadMediaSelect+` WHERE id = $1 AND telegram_id = $2`, id, telegramID))
+	if err != nil {
+		return domain.ThreadMedia{}, mapNotFound(err)
+	}
+	return mediaValue, nil
+}
+
+func (p *Postgres) GetThreadMediaByDeliveryKey(ctx context.Context, deliveryKey string) (domain.ThreadMedia, error) {
+	if err := validateThreadField("media delivery key", deliveryKey, 32, true); err != nil {
+		return domain.ThreadMedia{}, ErrNotFound
+	}
+	mediaValue, err := scanThreadMedia(p.pool.QueryRow(ctx, threadMediaSelect+` WHERE delivery_key = $1`, deliveryKey))
+	if err != nil {
+		return domain.ThreadMedia{}, mapNotFound(err)
+	}
+	return mediaValue, nil
+}
+
+func (p *Postgres) GetThreadDraftByMediaUpdate(ctx context.Context, telegramID, sourceUpdateID int64) (domain.ThreadDraft, error) {
+	draft, err := scanThreadDraft(p.pool.QueryRow(ctx, threadDraftSelect+`
+		WHERE telegram_id = $1
+		  AND media_id = (
+			SELECT id FROM thread_media WHERE telegram_id = $1 AND source_update_id = $2
+		  )
+		ORDER BY is_current DESC, updated_at DESC, id DESC LIMIT 1`, telegramID, sourceUpdateID))
 	if err != nil {
 		return domain.ThreadDraft{}, mapNotFound(err)
 	}
@@ -596,9 +795,15 @@ func (p *Postgres) ClaimThreadDraft(
 				WHEN state = 'publishing' AND publish_started_at IS NOT NULL THEN publish_started_at
 				ELSE NULL
 			END,
+			media_rights_confirmed_at = CASE
+				WHEN state = 'publishing' AND publish_started_at IS NOT NULL THEN media_rights_confirmed_at
+				WHEN media_mode = 'image' THEN $5
+				ELSE NULL
+			END,
 			updated_at = $5
 		WHERE id = $1 AND telegram_id = $2 AND revision = $3
 		  AND is_current
+		  AND (media_mode = 'text' OR (media_mode = 'image' AND media_id IS NOT NULL))
 		  AND (
 			state IN ('draft', 'failed')
 			OR (
@@ -754,6 +959,7 @@ func (p *Postgres) FailThreadDraft(ctx context.Context, id, telegramID int64, cl
 	tag, err := p.pool.Exec(ctx, `
 		UPDATE thread_drafts
 		SET state = $4, error_code = $5, claim_token = '', claim_expires_at = NULL,
+			container_id = CASE WHEN $4 = 'failed' THEN '' ELSE container_id END,
 			publish_started_at = CASE WHEN $4 = 'failed' THEN NULL ELSE publish_started_at END,
 			updated_at = now()
 		WHERE id = $1 AND telegram_id = $2 AND state = 'publishing'
@@ -954,6 +1160,11 @@ func (p *Postgres) Cleanup(ctx context.Context, before time.Time) (int64, error)
 	if _, err := tx.Exec(ctx, `DELETE FROM thread_drafts WHERE updated_at < $1`, before); err != nil {
 		return 0, err
 	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM thread_media AS media
+		WHERE NOT EXISTS (SELECT 1 FROM thread_drafts AS draft WHERE draft.media_id = media.id)`); err != nil {
+		return 0, err
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM processed_updates WHERE processed_at < $1`, before); err != nil {
 		return 0, err
 	}
@@ -1009,6 +1220,7 @@ func rollback(tx pgx.Tx) {
 
 const threadDraftColumns = `
 	id, telegram_id, voice, goal, preview_text, provider, model, revision,
+	media_mode, media_id, media_rights_confirmed_at,
 	state, is_current, container_id, post_id, permalink, error_code,
 	claim_token, claim_expires_at, publish_started_at,
 	created_at, updated_at, published_at`
@@ -1022,9 +1234,11 @@ type threadDraftScanner interface {
 func scanThreadDraft(row threadDraftScanner) (domain.ThreadDraft, error) {
 	var draft domain.ThreadDraft
 	var revision int64
+	var mediaID sql.NullInt64
 	err := row.Scan(
 		&draft.ID, &draft.TelegramID, &draft.Voice, &draft.Goal, &draft.Text,
-		&draft.Provider, &draft.Model, &revision, &draft.State, &draft.Current,
+		&draft.Provider, &draft.Model, &revision, &draft.MediaMode, &mediaID,
+		&draft.MediaRightsConfirmedAt, &draft.State, &draft.Current,
 		&draft.ContainerID, &draft.PostID, &draft.Permalink, &draft.ErrorCode,
 		&draft.ClaimToken, &draft.ClaimExpiresAt, &draft.PublishStartedAt,
 		&draft.CreatedAt, &draft.UpdatedAt, &draft.PublishedAt,
@@ -1034,6 +1248,35 @@ func scanThreadDraft(row threadDraftScanner) (domain.ThreadDraft, error) {
 			return domain.ThreadDraft{}, fmt.Errorf("invalid persisted thread draft revision %d", revision)
 		}
 		draft.Revision = uint32(revision)
+		if mediaID.Valid {
+			draft.MediaID = mediaID.Int64
+		}
 	}
 	return draft, err
+}
+
+const threadMediaColumns = `
+	id, telegram_id, source_update_id, content, media_type, width, height,
+	digest, delivery_key, created_at`
+
+const threadMediaSelect = `SELECT ` + threadMediaColumns + ` FROM thread_media`
+
+func scanThreadMedia(row threadDraftScanner) (domain.ThreadMedia, error) {
+	var mediaValue domain.ThreadMedia
+	err := row.Scan(
+		&mediaValue.ID, &mediaValue.TelegramID, &mediaValue.SourceUpdateID,
+		&mediaValue.Data, &mediaValue.MediaType, &mediaValue.Width, &mediaValue.Height,
+		&mediaValue.Digest, &mediaValue.DeliveryKey, &mediaValue.CreatedAt,
+	)
+	if err == nil {
+		err = mediaValue.ValidateForStore()
+	}
+	return mediaValue, err
+}
+
+func nullablePositiveInt64(value int64) any {
+	if value <= 0 {
+		return nil
+	}
+	return value
 }

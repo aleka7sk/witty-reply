@@ -14,7 +14,7 @@ func threadDraftKeyboard(codec *session.CallbackCodec, userID int64, draft domai
 		}
 		return telegram.CallbackButton(label, data), nil
 	}
-	rows := make([][]telegram.InlineKeyboardButton, 0, 5)
+	rows := make([][]telegram.InlineKeyboardButton, 0, 6)
 	appendRow := func(items ...struct {
 		label  string
 		action session.Action
@@ -30,11 +30,59 @@ func threadDraftKeyboard(codec *session.CallbackCodec, userID int64, draft domai
 		rows = append(rows, row)
 		return nil
 	}
+	if draft.MediaMode == domain.ThreadMediaImagePending {
+		if draft.MediaID > 0 {
+			if err := appendRow(struct {
+				label  string
+				action session.Action
+			}{"↩️ Оставить прежнее фото", session.ActionThreadKeepImage}); err != nil {
+				return nil, err
+			}
+		}
+		if err := appendRow(struct {
+			label  string
+			action session.Action
+		}{"📝 Оставить только текст", session.ActionThreadUseText}); err != nil {
+			return nil, err
+		}
+		if err := appendRow(struct {
+			label  string
+			action session.Action
+		}{"🗑 Отменить", session.ActionThreadCancel}); err != nil {
+			return nil, err
+		}
+		return &telegram.InlineKeyboardMarkup{InlineKeyboard: rows}, nil
+	}
+	publishLabel := "✅ Опубликовать"
+	if draft.MediaMode == domain.ThreadMediaImage {
+		publishLabel = "✅ Права есть — опубликовать"
+	}
 	if err := appendRow(struct {
 		label  string
 		action session.Action
-	}{"✅ Опубликовать", session.ActionThreadPublish}); err != nil {
+	}{publishLabel, session.ActionThreadPublish}); err != nil {
 		return nil, err
+	}
+	if draft.MediaMode == domain.ThreadMediaImage {
+		if err := appendRow(
+			struct {
+				label  string
+				action session.Action
+			}{"🖼 Заменить фото", session.ActionThreadUseImage},
+			struct {
+				label  string
+				action session.Action
+			}{"📝 Только текст", session.ActionThreadUseText},
+		); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := appendRow(struct {
+			label  string
+			action session.Action
+		}{"🖼 Добавить реальное фото", session.ActionThreadUseImage}); err != nil {
+			return nil, err
+		}
 	}
 	if err := appendRow(
 		struct {

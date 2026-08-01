@@ -1,6 +1,8 @@
 package domain
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"time"
@@ -169,6 +171,11 @@ type GenerationRecord struct {
 // preview stored in ThreadDraft is the text sent to Threads after approval.
 const MaxThreadPostRunes = 500
 
+// MaxThreadMediaBytes is the durable output bound for a normalized image used
+// by a first-party Threads post. The original Telegram upload may be larger;
+// only the metadata-free JPEG delivered to Meta must fit this eight MiB limit.
+const MaxThreadMediaBytes = 8 << 20
+
 type ThreadVoice string
 
 const (
@@ -178,6 +185,80 @@ const (
 
 func (v ThreadVoice) Valid() bool {
 	return v == ThreadVoiceBelcanto || v == ThreadVoiceAlisher
+}
+
+// ThreadMediaMode describes the operator-visible format of one exact preview.
+// ImagePending is durable so an image upload can be routed correctly after a
+// process restart; it is never publishable.
+type ThreadMediaMode string
+
+const (
+	ThreadMediaText         ThreadMediaMode = "text"
+	ThreadMediaImagePending ThreadMediaMode = "image_pending"
+	ThreadMediaImage        ThreadMediaMode = "image"
+)
+
+func (m ThreadMediaMode) Valid() bool {
+	return m == ThreadMediaText || m == ThreadMediaImagePending || m == ThreadMediaImage
+}
+
+// ThreadMedia is a normalized, metadata-free image attached to one or more
+// retained draft revisions. Data is never logged and is removed with the
+// owning user or by normal content-retention cleanup.
+type ThreadMedia struct {
+	ID             int64
+	TelegramID     int64
+	SourceUpdateID int64
+	Data           []byte
+	MediaType      string
+	Width          int
+	Height         int
+	Digest         string
+	DeliveryKey    string
+	CreatedAt      time.Time
+}
+
+func (m ThreadMedia) ValidateForStore() error {
+	if m.TelegramID <= 0 {
+		return errors.New("thread media owner is required")
+	}
+	if m.SourceUpdateID <= 0 {
+		return errors.New("thread media source update is required")
+	}
+	if len(m.Data) == 0 || len(m.Data) > MaxThreadMediaBytes {
+		return errors.New("thread media must contain 1 byte to 8 MiB")
+	}
+	if m.MediaType != "image/jpeg" {
+		return errors.New("thread media must be a normalized JPEG")
+	}
+	if m.Width < 1 || m.Height < 1 || m.Width > 8_000 || m.Height > 8_000 || int64(m.Width)*int64(m.Height) > 12_000_000 {
+		return errors.New("thread media dimensions are invalid")
+	}
+	longSide, shortSide := max(m.Width, m.Height), min(m.Width, m.Height)
+	if m.Width < 320 || m.Width > 1_440 || longSide > shortSide*10 {
+		return errors.New("thread media does not satisfy Threads geometry limits")
+	}
+	if len(m.Digest) != 64 {
+		return errors.New("thread media digest is invalid")
+	}
+	for _, character := range m.Digest {
+		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
+			return errors.New("thread media digest is invalid")
+		}
+	}
+	digest := sha256.Sum256(m.Data)
+	if m.Digest != hex.EncodeToString(digest[:]) {
+		return errors.New("thread media digest does not match content")
+	}
+	if len(m.DeliveryKey) != 32 {
+		return errors.New("thread media delivery key is invalid")
+	}
+	for _, character := range m.DeliveryKey {
+		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
+			return errors.New("thread media delivery key is invalid")
+		}
+	}
+	return nil
 }
 
 type ThreadDraftState string
@@ -214,6 +295,8 @@ type ThreadDraft struct {
 	Provider    string
 	Model       string
 	Revision    uint32
+	MediaMode   ThreadMediaMode
+	MediaID     int64
 	State       ThreadDraftState
 	Current     bool
 	ContainerID string
@@ -226,9 +309,13 @@ type ThreadDraft struct {
 	ClaimToken       string
 	ClaimExpiresAt   *time.Time
 	PublishStartedAt *time.Time
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	PublishedAt      *time.Time
+	// MediaRightsConfirmedAt is set atomically by the image publish button.
+	// It records the operator's explicit confirmation that Belcanto may publish
+	// the image and that every identifiable person has consented.
+	MediaRightsConfirmedAt *time.Time
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+	PublishedAt            *time.Time
 }
 
 // ValidateForCreate enforces the durable preview boundary without rewriting
@@ -254,6 +341,25 @@ func (d ThreadDraft) ValidateForCreate() error {
 	}
 	if d.Revision == 0 {
 		return errors.New("thread draft revision must be positive")
+	}
+	mediaMode := d.MediaMode
+	if mediaMode == "" {
+		mediaMode = ThreadMediaText
+	}
+	if !mediaMode.Valid() {
+		return errors.New("thread draft media mode is invalid")
+	}
+	if mediaMode == ThreadMediaText && d.MediaID != 0 {
+		return errors.New("text thread draft cannot reference media")
+	}
+	if mediaMode == ThreadMediaImage && d.MediaID <= 0 {
+		return errors.New("image thread draft requires media")
+	}
+	if d.MediaID < 0 {
+		return errors.New("thread draft media id is invalid")
+	}
+	if d.MediaRightsConfirmedAt != nil {
+		return errors.New("new thread draft cannot pre-confirm media rights")
 	}
 	if d.State != "" && d.State != ThreadDraftReady {
 		return errors.New("new thread draft state must be draft")

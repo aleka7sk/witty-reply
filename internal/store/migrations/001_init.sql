@@ -113,6 +113,28 @@ CREATE TABLE IF NOT EXISTS generations (
 
 CREATE INDEX IF NOT EXISTS idx_generations_user_created ON generations (telegram_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS thread_media (
+    id BIGSERIAL PRIMARY KEY,
+    telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+    source_update_id BIGINT NOT NULL CHECK (source_update_id > 0),
+    content BYTEA NOT NULL CHECK (octet_length(content) BETWEEN 1 AND 8388608),
+    media_type TEXT NOT NULL CHECK (media_type = 'image/jpeg'),
+    width INTEGER NOT NULL CHECK (width BETWEEN 1 AND 8000),
+    height INTEGER NOT NULL CHECK (height BETWEEN 1 AND 8000),
+    digest TEXT NOT NULL CHECK (digest ~ '^[0-9a-f]{64}$'),
+    delivery_key TEXT NOT NULL UNIQUE CHECK (delivery_key ~ '^[0-9a-f]{32}$'),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK ((width::bigint * height::bigint) <= 12000000),
+    CHECK (width BETWEEN 320 AND 1440),
+    CHECK (GREATEST(width, height) <= LEAST(width, height) * 10)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_thread_media_source_update
+    ON thread_media (telegram_id, source_update_id);
+
+CREATE INDEX IF NOT EXISTS idx_thread_media_user_created
+    ON thread_media (telegram_id, created_at DESC, id DESC);
+
 CREATE TABLE IF NOT EXISTS thread_drafts (
     id BIGSERIAL PRIMARY KEY,
     telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
@@ -125,6 +147,10 @@ CREATE TABLE IF NOT EXISTS thread_drafts (
     provider TEXT NOT NULL CHECK (char_length(btrim(provider)) BETWEEN 1 AND 100),
     model TEXT NOT NULL CHECK (char_length(btrim(model)) BETWEEN 1 AND 160),
     revision BIGINT NOT NULL CHECK (revision > 0 AND revision <= 4294967295),
+    media_mode TEXT NOT NULL DEFAULT 'text'
+        CHECK (media_mode IN ('text', 'image_pending', 'image')),
+    media_id BIGINT REFERENCES thread_media(id),
+    media_rights_confirmed_at TIMESTAMPTZ,
     state TEXT NOT NULL DEFAULT 'draft'
         CHECK (state IN ('draft', 'publishing', 'published', 'failed', 'unknown', 'cancelled')),
     is_current BOOLEAN NOT NULL DEFAULT TRUE,
@@ -141,6 +167,11 @@ CREATE TABLE IF NOT EXISTS thread_drafts (
     CHECK (
         (state = 'published' AND published_at IS NOT NULL)
         OR (state <> 'published' AND published_at IS NULL)
+    ),
+    CHECK (
+        (media_mode = 'text' AND media_id IS NULL)
+        OR media_mode = 'image_pending'
+        OR (media_mode = 'image' AND media_id IS NOT NULL)
     )
 );
 
@@ -153,6 +184,26 @@ ALTER TABLE thread_drafts
     ADD COLUMN IF NOT EXISTS claim_expires_at TIMESTAMPTZ;
 ALTER TABLE thread_drafts
     ADD COLUMN IF NOT EXISTS publish_started_at TIMESTAMPTZ;
+ALTER TABLE thread_drafts
+    ADD COLUMN IF NOT EXISTS media_mode TEXT NOT NULL DEFAULT 'text';
+ALTER TABLE thread_drafts
+    ADD COLUMN IF NOT EXISTS media_id BIGINT REFERENCES thread_media(id);
+ALTER TABLE thread_drafts
+    ADD COLUMN IF NOT EXISTS media_rights_confirmed_at TIMESTAMPTZ;
+ALTER TABLE thread_drafts
+    DROP CONSTRAINT IF EXISTS thread_drafts_media_mode_check;
+ALTER TABLE thread_drafts
+    ADD CONSTRAINT thread_drafts_media_mode_check
+    CHECK (media_mode IN ('text', 'image_pending', 'image'));
+ALTER TABLE thread_drafts
+    DROP CONSTRAINT IF EXISTS thread_drafts_media_invariant_check;
+ALTER TABLE thread_drafts
+    ADD CONSTRAINT thread_drafts_media_invariant_check
+    CHECK (
+        (media_mode = 'text' AND media_id IS NULL)
+        OR media_mode = 'image_pending'
+        OR (media_mode = 'image' AND media_id IS NOT NULL)
+    );
 
 -- A row left in the old unphased publishing state cannot prove whether Meta
 -- was called. Fail closed once during upgrade instead of blindly retrying it.

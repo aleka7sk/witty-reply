@@ -26,6 +26,12 @@ type Store interface {
 	GetGeneration(context.Context, int64, int64) (domain.GenerationRecord, error)
 	CreateThreadDraft(context.Context, domain.ThreadDraft) (int64, error)
 	GetThreadDraft(context.Context, int64, int64) (domain.ThreadDraft, error)
+	GetCurrentThreadDraft(context.Context, int64) (domain.ThreadDraft, error)
+	SetThreadDraftMediaMode(context.Context, int64, int64, uint32, domain.ThreadMediaMode) (domain.ThreadDraft, error)
+	AttachThreadDraftMedia(context.Context, int64, int64, uint32, domain.ThreadMedia) (domain.ThreadDraft, error)
+	GetThreadMedia(context.Context, int64, int64) (domain.ThreadMedia, error)
+	GetThreadMediaByDeliveryKey(context.Context, string) (domain.ThreadMedia, error)
+	GetThreadDraftByMediaUpdate(context.Context, int64, int64) (domain.ThreadDraft, error)
 	ListRecentThreadTexts(context.Context, int64, int) ([]string, error)
 	ClaimThreadDraft(context.Context, int64, int64, uint32, string, time.Time, time.Duration) (domain.ThreadDraft, bool, error)
 	SetThreadContainer(context.Context, int64, int64, string, string) error

@@ -10,7 +10,7 @@ Operator: **Alisher Tolegenov**. Support and privacy questions: [GitHub Issues](
 
 The service receives Telegram account identifiers, Telegram-supplied profile fields present in the update envelope (such as name, username, and language code), and the submitted text, screenshot, image document, or voice note. Submitted content is sent to the configured AI provider to choose between the `reply` and `comment` scenarios and create suggestions. The provider receives only a fixed source-type hint such as `screenshot` or `forwarded_channel`; names, usernames, and Telegram IDs are not copied into that hint. Voice notes may also be sent to the configured speech-to-text provider.
 
-An allowlisted Belcanto operator can ask the bot to generate a first-party Threads post without submitting source content. The AI provider receives editorial controls, recent generated post text for repetition avoidance, and only the fixed fact that Belcanto is a vocal school in Astana. The exact preview is sent to Meta only after the operator presses the explicit publish-confirmation button.
+An allowlisted Belcanto operator can ask the bot to generate a first-party Threads post without submitting source content. The AI provider receives editorial controls, recent generated post text for repetition avoidance, and only the fixed fact that Belcanto is a vocal school in Astana. The operator may optionally attach one real photo; it is not sent to the AI provider. The exact text or photo-plus-text preview is sent to Meta only after the operator presses the explicit publish-confirmation button. For a photo, that button also confirms Belcanto's usage rights and any required consent from identifiable people.
 
 ## Storage
 
@@ -18,20 +18,20 @@ An allowlisted Belcanto operator can ask the bot to generate a first-party Threa
 - The Telegram numeric user ID, language code, consent time, and style settings are stored until profile deletion. Telegram username and first/last name may exist temporarily inside the encrypted update envelope but are not copied into profile or generation tables; the service does not fetch or store avatars.
 - Source content and the immediately previous candidates are held in process memory while the short session is active so the user can request refinements, choose an ambiguous scenario, or correct the detected scenario without resending the source. They disappear after the configured inactivity TTL or a process restart; a valid action renews the inactivity window, while a stale button does not.
 - Generated candidates, the resolved `reply` or `comment` scenario, a secret-keyed source digest, explicit feedback, and provider/model identifiers are normally retained for seven days by default, then removed by the hourly cleanup job. Token totals are exported only as content-free aggregate metrics, not stored per user or generation.
-- Belcanto Threads drafts retain the generated preview, voice, editorial goal, provider/model identifiers, revision, publication state, Meta container/post identifiers, and permalink when returned. They are normally removed by the same default seven-day cleanup. The Meta access token is never stored in a draft.
+- Belcanto Threads drafts retain the generated preview, voice, editorial goal, provider/model identifiers, revision, selected format, publication state, Meta container/post identifiers, and permalink when returned. An attached photo is resized, re-encoded as JPEG to remove EXIF/GPS metadata, stored with an owner check, and normally removed by the same default seven-day cleanup. The Meta access token and Telegram file URL are never stored in a draft or media row.
 - Daily usage counters are kept for quota enforcement and account operations until profile deletion; they do not contain the submitted message.
 - Profile settings and style examples explicitly saved by the user are kept until reset or deletion.
 - Content-free aggregated operational metrics may be retained longer.
 
 ## External processors
 
-Telegram delivers messages to the bot. Anthropic processes AI requests when the production provider is enabled. If voice support is enabled, the voice note is first sent to the configured speech-to-text provider and the resulting transcript is then sent to the AI provider. For the operator-only Belcanto workspace, Meta receives the exact approved post and publishes it to the connected Threads account. Each provider processes data under its own terms and privacy policy.
+Telegram delivers messages to the bot. Anthropic processes AI requests when the production provider is enabled. If voice support is enabled, the voice note is first sent to the configured speech-to-text provider and the resulting transcript is then sent to the AI provider. For the operator-only Belcanto workspace, Meta receives the exact approved post and, for an image post, fetches the normalized photo from a short-lived signed HTTPS URL. The URL contains no Telegram credential or user ID. Each provider processes data under its own terms and privacy policy.
 
 ## User controls
 
 - `/privacy` shows the in-bot summary and the deployment's public policy URL.
 - `/style` shows or resets personalization.
-- `/threads` creates a preview for an allowlisted Belcanto operator; optional buttons replace it, cancel discards it, and only the explicit publish button sends it to Meta.
+- `/threads` creates a preview for an allowlisted Belcanto operator; optional buttons replace the text, attach/replace/remove a photo, or cancel the draft, and only the explicit publish button sends it to Meta.
 - `/delete_me` permanently deletes the user's application data after confirmation.
 - A user may stop processing by withdrawing consent and deleting the profile.
 

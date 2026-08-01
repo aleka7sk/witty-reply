@@ -16,7 +16,7 @@ The product supports witty teasing and firm boundaries. It is not an automated h
 - Reply refinements: funnier, sharper, softer, shorter, more, and meme.
 - Public-comment refinements: funnier, subtler, bolder, more absurd, shorter, a genuinely different angle, and three more.
 - Original 1080×1080 Cyrillic PNG meme cards rendered locally with DejaVu — no scraping or unlicensed template catalog.
-- Operator-only Belcanto Threads Copilot: `/threads` prepares one complete school post with no topic required, offers Belcanto/Alisher voices and optional refinements, and publishes only after an explicit `✅ Опубликовать` confirmation.
+- Operator-only Belcanto Threads Copilot: `/threads` prepares one complete school post with no topic required, lets the operator choose text-only or attach one real photo, offers Belcanto/Alisher voices and optional refinements, and publishes only after an explicit confirmation.
 - Two-step official Threads API publishing with durable draft state and an atomic claim that blocks duplicate publication after double taps, Telegram redelivery, or a process restart.
 - Consent gate, user-owned signed callbacks, atomic daily quotas, feedback, saved style examples, reset, and complete profile deletion.
 - AES-256-GCM encrypted durable Telegram inbox with per-user ordering, at-least-once processing, retries, lease recovery, dead-lettering, and payload scrubbing at a terminal state.
@@ -144,7 +144,9 @@ help - Помощь
 
 This is a separate, operator-only workspace inside the same Telegram bot. It does not change the ordinary reply/comment flow or consume its quotas.
 
-Send `/threads`. The bot chooses an evergreen editorial premise itself and returns one WYSIWYG Russian post. Normal use needs no topic and no editing: review the exact text and press `✅ Опубликовать`. Optional buttons can make it shorter, warmer, wittier, remove sales cues, choose a different premise, or switch between the Belcanto and Alisher voices.
+Send `/threads`. The bot chooses an evergreen editorial premise itself and returns one WYSIWYG Russian post. Text-only is the default: review the exact text and press `✅ Опубликовать`. To use a visual, press `🖼 Добавить реальное фото`, send one photo, review the combined preview, and press `✅ Права есть — опубликовать`. The photo can be replaced or removed before publication. Optional buttons can also make the text shorter, warmer, wittier, remove sales cues, choose a different premise, or switch between the Belcanto and Alisher voices.
+
+The media path deliberately uses only an operator-supplied real Belcanto photo—there is no automatic stock or AI-generated image. The upload is resized to the Threads limit, re-encoded as JPEG to remove EXIF/GPS metadata, stored with the owned draft, and never sent to the AI provider. The confirmation label records that Belcanto may use the image and has consent from identifiable people (and a legal representative for children).
 
 The first slice is deliberately fact-closed. It knows only that Belcanto is a vocal school in Astana. The model and application validator reject invented prices, discounts, trial terms, students, teachers, testimonials, results, events, schedules, availability, and current happenings.
 
@@ -167,9 +169,13 @@ THREADS_PROVIDER=meta
 THREADS_USER_ID=17840000000000000
 THREADS_ACCESS_TOKEN=TH...
 THREADS_API_BASE_URL=https://graph.threads.net/v1.0
+# Needed for image posts when TELEGRAM_WEBHOOK_URL is not this public origin:
+THREADS_MEDIA_BASE_URL=https://bot.example.com
 ```
 
-After restart, confirmation performs the official two-step flow: create a text container, wait until it is ready, persist its ID, then publish that exact preview. A short fenced lease makes a crash before the irreversible call safely recoverable. Once `threads_publish` has started, the bot reconciles only through container status and never repeats the call without proof that it is safe. A second tap cannot create a duplicate; an unprovable outcome becomes `unknown` and requires a manual account check.
+For an image post, Meta must be able to fetch the normalized JPEG from this deployment. `THREADS_MEDIA_BASE_URL` is an HTTPS origin only (no path); it defaults to `TELEGRAM_WEBHOOK_URL`. It is optional for text-only operation: if neither origin is configured, image publication fails closed without affecting text publication.
+
+After restart, confirmation performs the official two-step flow: create the exact text or image container, wait until it is ready, persist its ID, then publish that exact preview. A short fenced lease makes a crash before the irreversible call safely recoverable. Once `threads_publish` has started, the bot reconciles only through container status and never repeats the call without proof that it is safe. A second tap cannot create a duplicate; an unprovable outcome becomes `unknown` and requires a manual account check.
 
 Meta setup references: [Get started](https://developers.facebook.com/documentation/threads/get-started), [publishing posts](https://developers.facebook.com/documentation/threads/posts), and [access tokens](https://developers.facebook.com/documentation/threads/get-started/get-access-tokens-and-permissions).
 

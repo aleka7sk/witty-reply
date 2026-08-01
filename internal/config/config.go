@@ -107,12 +107,13 @@ type Speech struct {
 // Belcanto configures the operator-only Threads copilot. It is optional so the
 // existing Witty Reply product can run without any Meta credentials.
 type Belcanto struct {
-	OperatorIDs        []int64
-	ThreadsProvider    string
-	ThreadsUserID      string
-	ThreadsAccessToken string
-	ThreadsBaseURL     string
-	ThreadsTimeout     time.Duration
+	OperatorIDs         []int64
+	ThreadsProvider     string
+	ThreadsUserID       string
+	ThreadsAccessToken  string
+	ThreadsBaseURL      string
+	ThreadsMediaBaseURL string
+	ThreadsTimeout      time.Duration
 }
 
 func Load() (Config, error) {
@@ -169,9 +170,13 @@ func Load() (Config, error) {
 		Belcanto: Belcanto{
 			OperatorIDs: operatorIDs, ThreadsProvider: strings.ToLower(get("THREADS_PROVIDER", "disabled")),
 			ThreadsUserID: get("THREADS_USER_ID", ""), ThreadsAccessToken: get("THREADS_ACCESS_TOKEN", ""),
-			ThreadsBaseURL: strings.TrimRight(get("THREADS_API_BASE_URL", "https://graph.threads.net/v1.0"), "/"),
-			ThreadsTimeout: duration("THREADS_TIMEOUT", 20*time.Second),
+			ThreadsBaseURL:      strings.TrimRight(get("THREADS_API_BASE_URL", "https://graph.threads.net/v1.0"), "/"),
+			ThreadsMediaBaseURL: strings.TrimRight(get("THREADS_MEDIA_BASE_URL", ""), "/"),
+			ThreadsTimeout:      duration("THREADS_TIMEOUT", 20*time.Second),
 		},
+	}
+	if cfg.Belcanto.ThreadsMediaBaseURL == "" && isAbsoluteHTTPSOrigin(cfg.Telegram.WebhookURL) {
+		cfg.Belcanto.ThreadsMediaBaseURL = cfg.Telegram.WebhookURL
 	}
 
 	// Reusing the bot token is convenient for a local smoke test, but production
@@ -265,6 +270,9 @@ func (c Config) Validate() error {
 	if c.Belcanto.ThreadsTimeout < time.Second {
 		errs = append(errs, errors.New("THREADS_TIMEOUT must be at least one second"))
 	}
+	if c.Belcanto.ThreadsMediaBaseURL != "" && !isAbsoluteHTTPSOrigin(c.Belcanto.ThreadsMediaBaseURL) {
+		errs = append(errs, errors.New("THREADS_MEDIA_BASE_URL must be an absolute HTTPS origin without credentials, path, query, or fragment"))
+	}
 	if c.Telegram.WorkerCount < 1 || c.Telegram.QueueSize < 1 {
 		errs = append(errs, errors.New("BOT_WORKERS and BOT_QUEUE_SIZE must be positive"))
 	}
@@ -318,6 +326,15 @@ func isAbsoluteHTTPSURL(raw string, allowQuery bool) bool {
 		return false
 	}
 	return allowQuery || parsed.RawQuery == ""
+}
+
+func isAbsoluteHTTPSOrigin(raw string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
+		parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+		return false
+	}
+	return true
 }
 
 func isProductionTelegramAPIURL(raw string) bool {

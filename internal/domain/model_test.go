@@ -1,6 +1,8 @@
 package domain
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
 )
@@ -75,6 +77,9 @@ func TestThreadDraftValidateForCreate(t *testing.T) {
 		{name: "provider", mutate: func(d *ThreadDraft) { d.Provider = "" }},
 		{name: "model", mutate: func(d *ThreadDraft) { d.Model = "" }},
 		{name: "revision", mutate: func(d *ThreadDraft) { d.Revision = 0 }},
+		{name: "media mode", mutate: func(d *ThreadDraft) { d.MediaMode = "video" }},
+		{name: "image without media", mutate: func(d *ThreadDraft) { d.MediaMode = ThreadMediaImage }},
+		{name: "text with media", mutate: func(d *ThreadDraft) { d.MediaMode = ThreadMediaText; d.MediaID = 1 }},
 		{name: "state", mutate: func(d *ThreadDraft) { d.State = ThreadDraftPublished }},
 	}
 	for _, test := range tests {
@@ -83,6 +88,40 @@ func TestThreadDraftValidateForCreate(t *testing.T) {
 			test.mutate(&draft)
 			if err := draft.ValidateForCreate(); err == nil {
 				t.Fatal("invalid draft was accepted")
+			}
+		})
+	}
+}
+
+func TestThreadMediaValidateForStore(t *testing.T) {
+	data := []byte("normalized-jpeg")
+	digest := sha256.Sum256(data)
+	valid := ThreadMedia{
+		TelegramID: 42, SourceUpdateID: 100, Data: data, MediaType: "image/jpeg",
+		Width: 1_000, Height: 800, Digest: hex.EncodeToString(digest[:]),
+		DeliveryKey: "0123456789abcdef0123456789abcdef",
+	}
+	if err := valid.ValidateForStore(); err != nil {
+		t.Fatalf("valid media: %v", err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*ThreadMedia)
+	}{
+		{name: "source", mutate: func(value *ThreadMedia) { value.SourceUpdateID = 0 }},
+		{name: "size", mutate: func(value *ThreadMedia) { value.Data = make([]byte, MaxThreadMediaBytes+1) }},
+		{name: "type", mutate: func(value *ThreadMedia) { value.MediaType = "image/png" }},
+		{name: "width", mutate: func(value *ThreadMedia) { value.Width = 200 }},
+		{name: "ratio", mutate: func(value *ThreadMedia) { value.Width, value.Height = 1_440, 100 }},
+		{name: "digest", mutate: func(value *ThreadMedia) { value.Digest = strings.Repeat("0", 64) }},
+		{name: "delivery", mutate: func(value *ThreadMedia) { value.DeliveryKey = "short" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value := valid
+			test.mutate(&value)
+			if err := value.ValidateForStore(); err == nil {
+				t.Fatal("invalid media was accepted")
 			}
 		})
 	}

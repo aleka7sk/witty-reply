@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
@@ -392,8 +394,11 @@ func TestMemoryThreadDraftLifecycleIsOwnedCurrentAndIdempotent(t *testing.T) {
 	if err := memory.FailThreadDraft(ctx, secondID, 42, "second-claim", "temporary", false); err != nil {
 		t.Fatal(err)
 	}
-	if retried, claimed, err := memory.ClaimThreadDraft(ctx, secondID, 42, 2, "retry-claim", now, time.Minute); err != nil || !claimed || retried.ErrorCode != "" || retried.ContainerID != "container-2" {
+	if retried, claimed, err := memory.ClaimThreadDraft(ctx, secondID, 42, 2, "retry-claim", now, time.Minute); err != nil || !claimed || retried.ErrorCode != "" || retried.ContainerID != "" {
 		t.Fatalf("retry claim = %+v, %v, %v", retried, claimed, err)
+	}
+	if err := memory.SetThreadContainer(ctx, secondID, 42, "retry-claim", "container-2-retry"); err != nil {
+		t.Fatal(err)
 	}
 	if err := memory.BeginThreadPublish(ctx, secondID, 42, "retry-claim", now, time.Minute); err != nil {
 		t.Fatal(err)
@@ -424,6 +429,114 @@ func TestMemoryThreadDraftLifecycleIsOwnedCurrentAndIdempotent(t *testing.T) {
 	}
 	if _, err := memory.GetThreadDraft(ctx, firstID, 42); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("draft survived DeleteUser(): %v", err)
+	}
+}
+
+func TestMemoryThreadMediaLifecycleIsRevisionedOwnedAndReplaySafe(t *testing.T) {
+	ctx := context.Background()
+	memory := NewMemory()
+	now := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	memory.now = func() time.Time { return now }
+	if _, err := memory.UpsertUser(ctx, domain.User{TelegramID: 42, Language: "ru"}); err != nil {
+		t.Fatal(err)
+	}
+	draftID, err := memory.CreateThreadDraft(ctx, testThreadDraft(42, 1, "Пост с фотографией"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := memory.SetThreadDraftMediaMode(ctx, draftID, 42, 1, domain.ThreadMediaImagePending)
+	if err != nil || pending.Revision != 2 || pending.MediaMode != domain.ThreadMediaImagePending {
+		t.Fatalf("pending = %+v, %v", pending, err)
+	}
+	if stale, claimed, err := memory.ClaimThreadDraft(ctx, draftID, 42, 1, "old", now, time.Minute); err != nil || claimed || stale.Revision != 2 {
+		t.Fatalf("stale claim = %+v, %v, %v", stale, claimed, err)
+	}
+
+	mediaValue := testThreadMedia(42, 100)
+	attached, err := memory.AttachThreadDraftMedia(ctx, draftID, 42, pending.Revision, mediaValue)
+	if err != nil || attached.Revision != 3 || attached.MediaMode != domain.ThreadMediaImage || attached.MediaID <= 0 {
+		t.Fatalf("attached = %+v, %v", attached, err)
+	}
+	replayed, err := memory.AttachThreadDraftMedia(ctx, draftID, 42, pending.Revision, mediaValue)
+	if err != nil || replayed.ID != attached.ID || replayed.MediaID != attached.MediaID || replayed.Revision != attached.Revision {
+		t.Fatalf("replayed = %+v, %v", replayed, err)
+	}
+	byUpdate, err := memory.GetThreadDraftByMediaUpdate(ctx, 42, 100)
+	if err != nil || byUpdate.MediaID != attached.MediaID {
+		t.Fatalf("by update = %+v, %v", byUpdate, err)
+	}
+	if _, err := memory.GetThreadMedia(ctx, attached.MediaID, 77); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-owner media read = %v", err)
+	}
+
+	claimedDraft, claimed, err := memory.ClaimThreadDraft(ctx, draftID, 42, attached.Revision, "image-claim", now, time.Minute)
+	if err != nil || !claimed || claimedDraft.MediaRightsConfirmedAt == nil {
+		t.Fatalf("image claim = %+v, %v, %v", claimedDraft, claimed, err)
+	}
+	if err := memory.FailThreadDraft(ctx, draftID, 42, "image-claim", "test", false); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = memory.SetThreadDraftMediaMode(ctx, draftID, 42, attached.Revision, domain.ThreadMediaImagePending)
+	if err != nil || pending.MediaID != attached.MediaID || pending.MediaRightsConfirmedAt != nil {
+		t.Fatalf("replacement pending = %+v, %v", pending, err)
+	}
+	kept, err := memory.SetThreadDraftMediaMode(ctx, draftID, 42, pending.Revision, domain.ThreadMediaImage)
+	if err != nil || kept.MediaID != attached.MediaID || kept.MediaMode != domain.ThreadMediaImage {
+		t.Fatalf("kept image = %+v, %v", kept, err)
+	}
+	textOnly, err := memory.SetThreadDraftMediaMode(ctx, draftID, 42, kept.Revision, domain.ThreadMediaText)
+	if err != nil || textOnly.MediaID != 0 || textOnly.MediaMode != domain.ThreadMediaText {
+		t.Fatalf("text only = %+v, %v", textOnly, err)
+	}
+	if _, err := memory.GetThreadMedia(ctx, attached.MediaID, 42); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("detached media survived without references: %v", err)
+	}
+}
+
+func TestMemoryThreadMediaReplayCannotAttachToAnotherDraft(t *testing.T) {
+	ctx := context.Background()
+	memory := NewMemory()
+	if _, err := memory.UpsertUser(ctx, domain.User{TelegramID: 42}); err != nil {
+		t.Fatal(err)
+	}
+	firstID, err := memory.CreateThreadDraft(ctx, testThreadDraft(42, 1, "Первый пост"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPending, err := memory.SetThreadDraftMediaMode(ctx, firstID, 42, 1, domain.ThreadMediaImagePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mediaValue := testThreadMedia(42, 101)
+	attached, err := memory.AttachThreadDraftMedia(ctx, firstID, 42, firstPending.Revision, mediaValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondID, err := memory.CreateThreadDraft(ctx, testThreadDraft(42, 4, "Второй пост"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPending, err := memory.SetThreadDraftMediaMode(ctx, secondID, 42, 4, domain.ThreadMediaImagePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := memory.AttachThreadDraftMedia(ctx, secondID, 42, secondPending.Revision, mediaValue); !errors.Is(err, ErrThreadDraftState) {
+		t.Fatalf("cross-draft replay = %v, want ErrThreadDraftState", err)
+	}
+	secondAfter, err := memory.GetThreadDraft(ctx, secondID, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondAfter.MediaMode != domain.ThreadMediaImagePending || secondAfter.MediaID != 0 || secondAfter.Revision != secondPending.Revision {
+		t.Fatalf("cross-draft replay mutated second draft: %+v", secondAfter)
+	}
+	firstAfter, err := memory.GetThreadDraft(ctx, firstID, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstAfter.MediaID != attached.MediaID {
+		t.Fatalf("cross-draft replay detached first media: %+v", firstAfter)
 	}
 }
 
@@ -533,5 +646,15 @@ func testThreadDraft(owner int64, revision uint32, text string) domain.ThreadDra
 		Provider:   "fake",
 		Model:      "deterministic",
 		Revision:   revision,
+	}
+}
+
+func testThreadMedia(owner, updateID int64) domain.ThreadMedia {
+	data := []byte("normalized-jpeg")
+	digest := sha256.Sum256(data)
+	return domain.ThreadMedia{
+		TelegramID: owner, SourceUpdateID: updateID, Data: data, MediaType: "image/jpeg",
+		Width: 1_000, Height: 800, Digest: hex.EncodeToString(digest[:]),
+		DeliveryKey: fmt.Sprintf("%032x", updateID),
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -21,6 +22,13 @@ type Publisher interface {
 	CreateText(ctx context.Context, text, replyToID string) (containerID string, err error)
 	ContainerStatus(ctx context.Context, id string) (Status, error)
 	Publish(ctx context.Context, containerID string) (Publication, error)
+}
+
+// ImagePublisher is additive so existing text-only publisher implementations
+// remain source-compatible. The bot requires this capability only after the
+// operator has selected and previewed a real image.
+type ImagePublisher interface {
+	CreateImage(ctx context.Context, text, imageURL, replyToID string) (containerID string, err error)
 }
 
 type ContainerState string
@@ -158,6 +166,10 @@ func (Disabled) CreateText(context.Context, string, string) (string, error) {
 	return "", disabledError("create_text")
 }
 
+func (Disabled) CreateImage(context.Context, string, string, string) (string, error) {
+	return "", disabledError("create_image")
+}
+
 func (Disabled) ContainerStatus(context.Context, string) (Status, error) {
 	return Status{}, disabledError("container_status")
 }
@@ -200,6 +212,26 @@ func (f *Fake) CreateText(_ context.Context, text, replyToID string) (string, er
 		return "", err
 	}
 	if err := validateOptionalID(replyToID, "create_text"); err != nil {
+		return "", err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureInitialized()
+	f.nextID++
+	id := fmt.Sprintf("fake-container-%06d", f.nextID)
+	f.containers[id] = &fakeContainer{}
+	return id, nil
+}
+
+func (f *Fake) CreateImage(_ context.Context, text, imageURL, replyToID string) (string, error) {
+	if err := validateText(text, "create_image"); err != nil {
+		return "", err
+	}
+	if err := validateImageURL(imageURL, "create_image"); err != nil {
+		return "", err
+	}
+	if err := validateOptionalID(replyToID, "create_image"); err != nil {
 		return "", err
 	}
 
@@ -269,6 +301,17 @@ func validateOptionalID(id, operation string) error {
 		return nil
 	}
 	return validateRequiredID(id, operation)
+}
+
+func validateImageURL(rawURL, operation string) error {
+	if len(rawURL) > 2048 {
+		return &Error{Operation: operation, Code: CodeInvalidInput, Class: Definite}
+	}
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+		return &Error{Operation: operation, Code: CodeInvalidInput, Class: Definite}
+	}
+	return nil
 }
 
 func validateRequiredID(id, operation string) error {

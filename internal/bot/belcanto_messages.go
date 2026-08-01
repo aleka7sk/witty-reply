@@ -40,10 +40,40 @@ func threadDraftText(draft domain.ThreadDraft) string {
 		voice = "Алишер"
 	}
 	goal := threadGoalLabel(draft.Goal)
+	format := "📝 только текст"
+	rights := ""
+	if draft.MediaMode == domain.ThreadMediaImage {
+		format = "🖼 фото + текст"
+		rights = "\n\nНажимая «Права есть — опубликовать», ты подтверждаешь право Belcanto использовать фото и согласие всех узнаваемых людей; для детей — согласие законного представителя."
+	}
 	return fmt.Sprintf(
-		"🎼 Belcanto Threads\n\nПост готов — его можно публиковать без правок.\n\nАвтор: %s\nЦель: %s\nТон: тёплый и остроумный · без прямой продажи\n\n%s\n\n%d/500",
-		voice, goal, draft.Text, utf8.RuneCountInString(draft.Text),
+		"🎼 Belcanto Threads\n\nПост готов — его можно публиковать без правок.\n\nАвтор: %s\nЦель: %s\nФормат: %s\nТон: тёплый и остроумный · без прямой продажи\n\n%s\n\n%d/500%s",
+		voice, goal, format, draft.Text, utf8.RuneCountInString(draft.Text), rights,
 	)
+}
+
+func threadImagePromptText(hasPrevious bool) string {
+	lead := "Пришли одно реальное фото Belcanto."
+	if hasPrevious {
+		lead = "Пришли новое реальное фото Belcanto. Прежнее останется сохранено, пока замена не будет принята."
+	}
+	return "🖼 " + lead + "\n\nПодойдёт живой кадр школы, занятия, пространства или музыкальная деталь. Стоковые и AI-изображения не используем. Подпись к фото не нужна — готовый текст уже сохранён.\n\nЕсли в кадре есть люди, убедись, что они согласны на публичную публикацию. Отправь фото не альбомом."
+}
+
+func threadImageInvalidText() string {
+	return "Не получилось подготовить это фото для Threads. Нужен JPEG или PNG до 8 МБ, шириной от 320 до 1440 px и с соотношением сторон не более 10:1. Черновик сохранён — пришли другое фото."
+}
+
+func threadImageAlbumText() string {
+	return "Для этой версии нужен один кадр, не альбом. Отправь одно фото отдельным сообщением."
+}
+
+func threadImageRequiredText() string {
+	return "Сначала пришли фото для этой публикации или выбери «Оставить только текст»."
+}
+
+func threadImageDeliveryUnavailableText() string {
+	return "Фото и текст сохранены, но публичная доставка изображения в Threads не настроена. Публикации не было. Укажи THREADS_MEDIA_BASE_URL с публичным HTTPS-адресом приложения."
 }
 
 func threadGoalLabel(goal string) string {
@@ -62,10 +92,13 @@ func threadsNotConnectedText() string {
 }
 
 func threadDraftStaleText() string {
-	return "Эта версия поста уже устарела. Открой /threads — я подготовлю свежую."
+	return "Эта карточка уже устарела. Используй кнопки под последним предпросмотром."
 }
 
 func threadDraftStateText(draft domain.ThreadDraft) string {
+	if draft.MediaMode == domain.ThreadMediaImagePending {
+		return threadImageRequiredText()
+	}
 	switch draft.State {
 	case domain.ThreadDraftPublishing:
 		return "Публикация уже выполняется."

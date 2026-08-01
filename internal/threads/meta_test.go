@@ -104,6 +104,49 @@ func TestMetaTextReplyFlowUsesExactEndpointsAndOrder(t *testing.T) {
 	}
 }
 
+func TestMetaCreateImageUsesExactImageForm(t *testing.T) {
+	const (
+		accessToken = "test-image-access-token"
+		postText    = "Так выглядит момент перед первой нотой 🎼"
+		imageURL    = "https://media.example.test/threads/media/0123456789abcdef0123456789abcdef/1785589200/signature.jpg"
+		replyToID   = "thread-image-reply-456"
+	)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		if request.Method != http.MethodPost || request.URL.Path != "/v1.0/user-123/threads" {
+			t.Errorf("unexpected create request: %s %s", request.Method, request.URL.Path)
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		assertForm(t, request, map[string]string{
+			"access_token": accessToken,
+			"image_url":    imageURL,
+			"media_type":   "IMAGE",
+			"reply_to_id":  replyToID,
+			"text":         postText,
+		})
+		writeJSON(writer, http.StatusOK, `{"id":"image-container-1"}`)
+	}))
+	defer server.Close()
+
+	client := newTestMeta(t, Config{
+		UserID:      "user-123",
+		AccessToken: accessToken,
+		BaseURL:     server.URL + "/v1.0/",
+	})
+	containerID, err := client.CreateImage(context.Background(), postText, imageURL, replyToID)
+	if err != nil {
+		t.Fatalf("CreateImage() error = %v", err)
+	}
+	if containerID != "image-container-1" {
+		t.Fatalf("CreateImage() id = %q", containerID)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("request count = %d, want 1", got)
+	}
+}
+
 func TestMetaCreateFailureStopsBeforePublish(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
@@ -275,6 +318,40 @@ func TestMetaValidatesUnicodeRuneLimitBeforeNetwork(t *testing.T) {
 	}
 }
 
+func TestMetaCreateImageRejectsInvalidURLBeforeNetwork(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		writeJSON(writer, http.StatusOK, `{"id":"unexpected-container"}`)
+	}))
+	defer server.Close()
+	client := newTestMeta(t, Config{UserID: "user", AccessToken: "token", BaseURL: server.URL})
+
+	tests := []struct {
+		name     string
+		imageURL string
+	}{
+		{name: "empty", imageURL: ""},
+		{name: "HTTP", imageURL: "http://media.example.test/image.jpg"},
+		{name: "missing host", imageURL: "https:///image.jpg"},
+		{name: "credentials", imageURL: "https://user:password@media.example.test/image.jpg"},
+		{name: "fragment", imageURL: "https://media.example.test/image.jpg#private"},
+		{name: "malformed", imageURL: "://not-a-url"},
+		{name: "too long", imageURL: "https://media.example.test/" + strings.Repeat("x", 2049)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := client.CreateImage(context.Background(), "text", test.imageURL, "")
+			if err == nil || SafeCode(err) != string(CodeInvalidInput) || IsAmbiguous(err) {
+				t.Fatalf("CreateImage() error = %v", err)
+			}
+		})
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("invalid image URLs made %d network requests", got)
+	}
+}
+
 func TestMetaConfigurationAndAuthenticationCodes(t *testing.T) {
 	if _, err := NewMeta(Config{UserID: "user"}); err == nil || SafeCode(err) != string(CodeConfig) {
 		t.Fatalf("missing-token error = %v", err)
@@ -331,6 +408,33 @@ func TestDisabledAndFakePublishers(t *testing.T) {
 	status, err = fake.ContainerStatus(context.Background(), first)
 	if err != nil || status.State != StatePublished {
 		t.Fatalf("fake status after publish = %+v, %v", status, err)
+	}
+}
+
+func TestDisabledAndFakeImagePublishers(t *testing.T) {
+	const imageURL = "https://media.example.test/threads/media/image.jpg"
+	disabled := NewDisabled()
+	if _, err := disabled.CreateImage(context.Background(), "text", imageURL, ""); err == nil ||
+		SafeCode(err) != string(CodeDisabled) || !errors.Is(err, ErrDisabled) {
+		t.Fatalf("disabled CreateImage() error = %v", err)
+	}
+
+	fake := NewFake()
+	if _, err := fake.CreateImage(context.Background(), "text", "http://media.example.test/image.jpg", ""); err == nil ||
+		SafeCode(err) != string(CodeInvalidInput) || IsAmbiguous(err) {
+		t.Fatalf("fake invalid-image CreateImage() error = %v", err)
+	}
+	containerID, err := fake.CreateImage(context.Background(), "image text", imageURL, "thread-1")
+	if err != nil || containerID != "fake-container-000001" {
+		t.Fatalf("fake image container = %q, %v", containerID, err)
+	}
+	status, err := fake.ContainerStatus(context.Background(), containerID)
+	if err != nil || status.State != StateFinished {
+		t.Fatalf("fake image status = %+v, %v", status, err)
+	}
+	publication, err := fake.Publish(context.Background(), containerID)
+	if err != nil || publication.ID != "fake-publication-000001" {
+		t.Fatalf("fake image publication = %+v, %v", publication, err)
 	}
 }
 

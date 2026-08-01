@@ -56,6 +56,7 @@ type Config struct {
 	SpeechProvider      string
 	BelcantoOperatorIDs []int64
 	ThreadsPublisher    threadspub.Publisher
+	ThreadMediaURL      func(string) (string, error)
 	Limits              Limits
 }
 
@@ -124,6 +125,7 @@ type Service struct {
 	provider          ai.Provider
 	threadGenerator   ai.ThreadPostGenerator
 	threadPublisher   threadspub.Publisher
+	threadMediaURL    func(string) (string, error)
 	transcriber       transcribe.Transcriber
 	store             store.Store
 	sessions          *session.Cache[interaction]
@@ -179,7 +181,8 @@ func NewService(
 	}
 	return &Service{
 		telegram: telegramClient, provider: provider, threadGenerator: threadGenerator, threadPublisher: config.ThreadsPublisher,
-		transcriber: transcriber, store: dataStore, sessions: sessions,
+		threadMediaURL: config.ThreadMediaURL,
+		transcriber:    transcriber, store: dataStore, sessions: sessions,
 		callbacks: callbacks, safety: safetyFilter, threadSafety: safety.New(safety.Config{MaxRunes: 500, CandidateCount: 1}),
 		renderer: renderer, metrics: metrics, logger: logger, config: config, belcantoOperators: operators,
 	}, nil
@@ -219,7 +222,13 @@ func (b *Service) QueuePolicy(update telegram.Update) UpdateQueuePolicy {
 		case "new", "cancel", "delete_me", "delete_data":
 			return UpdateQueuePolicy{Superseding: true}
 		case "":
-			if _, err := b.classifyInput(*update.Message); err == nil {
+			if raw, err := b.classifyInput(*update.Message); err == nil {
+				if raw.kind == domain.InputImage && b.isBelcantoOperator(update.Message.From.ID) {
+					// An operator image may be the durable second step of a
+					// Threads draft. Keep it ordered and retryable until storage
+					// can decide whether it belongs to that workflow.
+					return UpdateQueuePolicy{}
+				}
 				return UpdateQueuePolicy{Supersedable: true, Superseding: true}
 			}
 		}
@@ -299,6 +308,9 @@ func (b *Service) handleMessage(ctx context.Context, updateID int64, message tel
 			return keyboardErr
 		}
 		return b.sendText(ctx, message.Chat.ID, consentRequiredText(lang), keyboard)
+	}
+	if handled, mediaErr := b.tryHandleThreadMediaUpload(ctx, updateID, message, user); handled {
+		return mediaErr
 	}
 
 	raw, err := b.classifyInput(message)
@@ -543,6 +555,12 @@ func (b *Service) handleCallback(ctx context.Context, updateID int64, callback t
 		return b.refineThreadDraft(ctx, chatID, user, payload, "", "different_angle")
 	case session.ActionThreadNoSell:
 		return b.refineThreadDraft(ctx, chatID, user, payload, "", "no_sell")
+	case session.ActionThreadUseImage:
+		return b.setThreadDraftMediaMode(ctx, chatID, user, payload, domain.ThreadMediaImagePending)
+	case session.ActionThreadUseText:
+		return b.setThreadDraftMediaMode(ctx, chatID, user, payload, domain.ThreadMediaText)
+	case session.ActionThreadKeepImage:
+		return b.setThreadDraftMediaMode(ctx, chatID, user, payload, domain.ThreadMediaImage)
 	case session.ActionThreadPublish:
 		return b.publishThreadDraft(ctx, chatID, user, payload)
 	case session.ActionThreadCancel:
@@ -565,7 +583,10 @@ func threadActionRequiresConsent(action session.Action) bool {
 		session.ActionThreadDifferentAngle,
 		session.ActionThreadNoSell,
 		session.ActionThreadPublish,
-		session.ActionThreadCancel:
+		session.ActionThreadCancel,
+		session.ActionThreadUseImage,
+		session.ActionThreadUseText,
+		session.ActionThreadKeepImage:
 		return true
 	default:
 		return false

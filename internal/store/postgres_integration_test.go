@@ -327,8 +327,11 @@ func TestPostgresIntegration(t *testing.T) {
 		if err := postgres.FailThreadDraft(ctx, secondID, ownerID, "second-claim", "temporary", false); err != nil {
 			t.Fatal(err)
 		}
-		if retried, claimed, err := postgres.ClaimThreadDraft(ctx, secondID, ownerID, 2, "retry-claim", now, 5*time.Minute); err != nil || !claimed || retried.ErrorCode != "" || retried.ContainerID != "container-2" {
+		if retried, claimed, err := postgres.ClaimThreadDraft(ctx, secondID, ownerID, 2, "retry-claim", now, 5*time.Minute); err != nil || !claimed || retried.ErrorCode != "" || retried.ContainerID != "" {
 			t.Fatalf("retry claim = %+v, %v, %v", retried, claimed, err)
+		}
+		if err := postgres.SetThreadContainer(ctx, secondID, ownerID, "retry-claim", "container-2-retry"); err != nil {
+			t.Fatal(err)
 		}
 		if err := postgres.BeginThreadPublish(ctx, secondID, ownerID, "retry-claim", now, 5*time.Minute); err != nil {
 			t.Fatal(err)
@@ -408,6 +411,144 @@ func TestPostgresIntegration(t *testing.T) {
 		published, err := postgres.GetThreadDraft(ctx, draftID, recoveryOwner)
 		if err != nil || published.State != domain.ThreadDraftPublished || published.PublishedAt == nil || published.ClaimToken != "" {
 			t.Fatalf("reconciled = %+v, %v", published, err)
+		}
+	})
+
+	t.Run("thread media is revisioned owned replay safe and deleted", func(t *testing.T) {
+		const mediaOwner = int64(71006)
+		if _, err := postgres.UpsertUser(ctx, domain.User{TelegramID: mediaOwner, Language: "ru"}); err != nil {
+			t.Fatal(err)
+		}
+		draftID, err := postgres.CreateThreadDraft(ctx, testThreadDraft(mediaOwner, 1, "Пост с фотографией"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending, err := postgres.SetThreadDraftMediaMode(ctx, draftID, mediaOwner, 1, domain.ThreadMediaImagePending)
+		if err != nil || pending.Revision != 2 {
+			t.Fatalf("pending = %+v, %v", pending, err)
+		}
+		mediaValue := testThreadMedia(mediaOwner, 88001)
+		attached, err := postgres.AttachThreadDraftMedia(ctx, draftID, mediaOwner, pending.Revision, mediaValue)
+		if err != nil || attached.MediaMode != domain.ThreadMediaImage || attached.MediaID <= 0 || attached.Revision != 3 {
+			t.Fatalf("attached = %+v, %v", attached, err)
+		}
+		replayed, err := postgres.AttachThreadDraftMedia(ctx, draftID, mediaOwner, pending.Revision, mediaValue)
+		if err != nil || replayed.MediaID != attached.MediaID || replayed.Revision != attached.Revision {
+			t.Fatalf("replayed = %+v, %v", replayed, err)
+		}
+		if _, err := postgres.GetThreadMedia(ctx, attached.MediaID, otherID); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("cross-owner media read = %v", err)
+		}
+		byKey, err := postgres.GetThreadMediaByDeliveryKey(ctx, mediaValue.DeliveryKey)
+		if err != nil || byKey.ID != attached.MediaID || byKey.SourceUpdateID != mediaValue.SourceUpdateID {
+			t.Fatalf("delivery lookup = %+v, %v", byKey, err)
+		}
+		claimedDraft, claimed, err := postgres.ClaimThreadDraft(ctx, draftID, mediaOwner, attached.Revision, "media-claim", now, 5*time.Minute)
+		if err != nil || !claimed || claimedDraft.MediaRightsConfirmedAt == nil {
+			t.Fatalf("media claim = %+v, %v, %v", claimedDraft, claimed, err)
+		}
+		if err := postgres.FailThreadDraft(ctx, draftID, mediaOwner, "media-claim", "test", false); err != nil {
+			t.Fatal(err)
+		}
+		pending, err = postgres.SetThreadDraftMediaMode(ctx, draftID, mediaOwner, attached.Revision, domain.ThreadMediaImagePending)
+		if err != nil || pending.MediaID != attached.MediaID || pending.MediaRightsConfirmedAt != nil {
+			t.Fatalf("replacement pending = %+v, %v", pending, err)
+		}
+		kept, err := postgres.SetThreadDraftMediaMode(ctx, draftID, mediaOwner, pending.Revision, domain.ThreadMediaImage)
+		if err != nil || kept.MediaID != attached.MediaID {
+			t.Fatalf("kept image = %+v, %v", kept, err)
+		}
+		textOnly, err := postgres.SetThreadDraftMediaMode(ctx, draftID, mediaOwner, kept.Revision, domain.ThreadMediaText)
+		if err != nil || textOnly.MediaID != 0 {
+			t.Fatalf("text only = %+v, %v", textOnly, err)
+		}
+		if _, err := postgres.GetThreadMedia(ctx, attached.MediaID, mediaOwner); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("orphan media survived detach: %v", err)
+		}
+		if err := postgres.DeleteUser(ctx, mediaOwner); err != nil {
+			t.Fatal(err)
+		}
+		var drafts, mediaRows int
+		if err := postgres.pool.QueryRow(ctx, `
+			SELECT
+				(SELECT count(*) FROM thread_drafts WHERE telegram_id = $1),
+				(SELECT count(*) FROM thread_media WHERE telegram_id = $1)`, mediaOwner).Scan(&drafts, &mediaRows); err != nil {
+			t.Fatal(err)
+		}
+		if drafts != 0 || mediaRows != 0 {
+			t.Fatalf("delete user left drafts=%d media=%d", drafts, mediaRows)
+		}
+	})
+
+	t.Run("thread media stale fallbacks use one connection and never cross drafts", func(t *testing.T) {
+		const mediaOwner = int64(71007)
+		if _, err := postgres.UpsertUser(ctx, domain.User{TelegramID: mediaOwner}); err != nil {
+			t.Fatal(err)
+		}
+		firstID, err := postgres.CreateThreadDraft(ctx, testThreadDraft(mediaOwner, 1, "Первый media draft"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		firstPending, err := postgres.SetThreadDraftMediaMode(ctx, firstID, mediaOwner, 1, domain.ThreadMediaImagePending)
+		if err != nil {
+			t.Fatal(err)
+		}
+		firstMedia := testThreadMedia(mediaOwner, 88101)
+		firstAttached, err := postgres.AttachThreadDraftMedia(ctx, firstID, mediaOwner, firstPending.Revision, firstMedia)
+		if err != nil {
+			t.Fatal(err)
+		}
+		secondID, err := postgres.CreateThreadDraft(ctx, testThreadDraft(mediaOwner, 4, "Второй media draft"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		secondPending, err := postgres.SetThreadDraftMediaMode(ctx, secondID, mediaOwner, 4, domain.ThreadMediaImagePending)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		singleConfig := postgres.pool.Config()
+		singleConfig.MinConns = 0
+		singleConfig.MaxConns = 1
+		singlePool, err := pgxpool.NewWithConfig(ctx, singleConfig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer singlePool.Close()
+		single := &Postgres{pool: singlePool}
+		fallbackCtx, fallbackCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer fallbackCancel()
+
+		if _, err := single.SetThreadDraftMediaMode(
+			fallbackCtx, secondID, mediaOwner, secondPending.Revision-1, domain.ThreadMediaText,
+		); !errors.Is(err, ErrThreadDraftState) {
+			t.Fatalf("single-connection stale mode fallback = %v", err)
+		}
+		newButStale := testThreadMedia(mediaOwner, 88102)
+		if _, err := single.AttachThreadDraftMedia(
+			fallbackCtx, secondID, mediaOwner, secondPending.Revision-1, newButStale,
+		); !errors.Is(err, ErrThreadDraftState) {
+			t.Fatalf("single-connection stale attach fallback = %v", err)
+		}
+		if _, err := single.AttachThreadDraftMedia(
+			fallbackCtx, secondID, mediaOwner, secondPending.Revision, firstMedia,
+		); !errors.Is(err, ErrThreadDraftState) {
+			t.Fatalf("cross-draft media replay = %v", err)
+		}
+		secondAfter, err := postgres.GetThreadDraft(ctx, secondID, mediaOwner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if secondAfter.MediaMode != domain.ThreadMediaImagePending || secondAfter.MediaID != 0 ||
+			secondAfter.Revision != secondPending.Revision {
+			t.Fatalf("stale fallback mutated second draft: %+v", secondAfter)
+		}
+		firstAfter, err := postgres.GetThreadDraft(ctx, firstID, mediaOwner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if firstAfter.MediaID != firstAttached.MediaID {
+			t.Fatalf("cross-draft replay detached first media: %+v", firstAfter)
 		}
 	})
 
@@ -708,7 +849,94 @@ func TestPostgresIntegration(t *testing.T) {
 	})
 }
 
+func TestPostgresMediaMigrationUpgradesLegacyThreadDrafts(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	postgres := newIsolatedPostgresWithoutMigration(t, ctx, databaseURL)
+
+	// This is the deployed pre-media shape at the parent commit. Keeping a
+	// representative row proves that the additive migration backfills existing
+	// drafts instead of validating only a freshly created schema.
+	if _, err := postgres.pool.Exec(ctx, `
+		CREATE TABLE users (
+			telegram_id BIGINT PRIMARY KEY,
+			language_code TEXT NOT NULL DEFAULT 'ru',
+			default_tone TEXT NOT NULL DEFAULT 'mix',
+			consented_at TIMESTAMPTZ,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+		CREATE TABLE thread_drafts (
+			id BIGSERIAL PRIMARY KEY,
+			telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+			voice TEXT NOT NULL CHECK (voice IN ('belcanto', 'alisher')),
+			goal TEXT NOT NULL,
+			preview_text TEXT NOT NULL,
+			provider TEXT NOT NULL,
+			model TEXT NOT NULL,
+			revision BIGINT NOT NULL,
+			state TEXT NOT NULL DEFAULT 'draft',
+			is_current BOOLEAN NOT NULL DEFAULT TRUE,
+			container_id TEXT NOT NULL DEFAULT '',
+			post_id TEXT NOT NULL DEFAULT '',
+			permalink TEXT NOT NULL DEFAULT '',
+			error_code TEXT NOT NULL DEFAULT '',
+			claim_token TEXT NOT NULL DEFAULT '',
+			claim_expires_at TIMESTAMPTZ,
+			publish_started_at TIMESTAMPTZ,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			published_at TIMESTAMPTZ
+		);
+		INSERT INTO users (telegram_id) VALUES (72001);
+		INSERT INTO thread_drafts (
+			telegram_id, voice, goal, preview_text, provider, model, revision
+		) VALUES (72001, 'belcanto', 'discussion', 'Старый текстовый пост', 'legacy', 'legacy', 7);`); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if err := postgres.Migrate(ctx); err != nil {
+		t.Fatalf("upgrade legacy schema: %v", err)
+	}
+	if err := postgres.Migrate(ctx); err != nil {
+		t.Fatalf("rerun upgraded migration: %v", err)
+	}
+	legacy, err := postgres.GetCurrentThreadDraft(ctx, 72001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.MediaMode != domain.ThreadMediaText || legacy.MediaID != 0 || legacy.MediaRightsConfirmedAt != nil {
+		t.Fatalf("legacy media backfill = %+v", legacy)
+	}
+	pending, err := postgres.SetThreadDraftMediaMode(ctx, legacy.ID, 72001, legacy.Revision, domain.ThreadMediaImagePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attached, err := postgres.AttachThreadDraftMedia(ctx, legacy.ID, 72001, pending.Revision, testThreadMedia(72001, 99001))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimedDraft, claimed, err := postgres.ClaimThreadDraft(
+		ctx, legacy.ID, 72001, attached.Revision, "legacy-media-claim", time.Now().UTC(), time.Minute,
+	)
+	if err != nil || !claimed || claimedDraft.MediaRightsConfirmedAt == nil {
+		t.Fatalf("upgraded image claim = %+v, %v, %v", claimedDraft, claimed, err)
+	}
+}
+
 func newIsolatedPostgres(t *testing.T, ctx context.Context, databaseURL string) *Postgres {
+	t.Helper()
+	postgres := newIsolatedPostgresWithoutMigration(t, ctx, databaseURL)
+	if err := postgres.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate(): %v", err)
+	}
+	return postgres
+}
+
+func newIsolatedPostgresWithoutMigration(t *testing.T, ctx context.Context, databaseURL string) *Postgres {
 	t.Helper()
 	admin, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
@@ -735,12 +963,6 @@ func newIsolatedPostgres(t *testing.T, ctx context.Context, databaseURL string) 
 		t.Fatalf("open isolated integration pool: %v", err)
 	}
 	postgres := &Postgres{pool: pool}
-	if err := postgres.Migrate(ctx); err != nil {
-		pool.Close()
-		_, _ = admin.Exec(context.Background(), "DROP SCHEMA "+identifier+" CASCADE")
-		admin.Close()
-		t.Fatalf("Migrate(): %v", err)
-	}
 	t.Cleanup(func() {
 		pool.Close()
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

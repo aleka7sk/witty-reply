@@ -64,10 +64,15 @@ const (
 	ActionThreadNoSell
 	ActionThreadPublish
 	ActionThreadCancel
+	// Media actions are appended to preserve every previously issued signed
+	// callback's numeric action value.
+	ActionThreadUseImage
+	ActionThreadUseText
+	ActionThreadKeepImage
 )
 
 func (a Action) Valid() bool {
-	return a >= ActionFeedbackUp && a <= ActionThreadCancel
+	return a >= ActionFeedbackUp && a <= ActionThreadKeepImage
 }
 
 type CallbackPayload struct {

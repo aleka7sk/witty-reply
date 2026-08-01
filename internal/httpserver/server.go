@@ -20,7 +20,7 @@ type Config struct {
 
 type Readiness func(context.Context) error
 
-func New(config Config, webhook http.Handler, metrics http.Handler, readiness Readiness, logger *slog.Logger) *http.Server {
+func New(config Config, webhook http.Handler, threadsMedia http.Handler, metrics http.Handler, readiness Readiness, logger *slog.Logger) *http.Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -46,6 +46,9 @@ func New(config Config, webhook http.Handler, metrics http.Handler, readiness Re
 	}
 	if webhook != nil && config.WebhookPath != "" {
 		mux.Handle(config.WebhookPath, webhook)
+	}
+	if threadsMedia != nil {
+		mux.Handle("/threads/media/", threadsMedia)
 	}
 
 	handler := securityHeaders(mux, config.Environment)
